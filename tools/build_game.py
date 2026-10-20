@@ -224,8 +224,8 @@ def check_tools(fetch=True):
 
 def windows_compiler_problem(cc):
     """Why cc's compiler can't build the game, or None (and its lines logged): it is tried on a
-    test program now, as the generated C is compiled long after the build starts, with every
-    library the game links (cc.link's), and the program is run."""
+    test program now, as the generated C is compiled long after the build starts: compiled as the
+    game's C is, linked with cc.link's command (every library the game links), and run."""
     clang = cc.CLANG if os.path.isfile(cc.CLANG) else shutil.which(cc.CLANG)
     if not clang:
         return ("No compiler (clang-cl.exe) was found. launchers\\Build WindowSmash.bat gets one by itself (or python "
@@ -237,12 +237,15 @@ def windows_compiler_problem(cc):
         fix = ("Check that Visual Studio has Desktop development with C++ (with a Windows SDK) and C++ Clang tools "
                "for Windows (setup guide step 4).")
     with tempfile.TemporaryDirectory(prefix="windowsmash-check-") as tmp:
-        src, exe = os.path.join(tmp, "check.c"), os.path.join(tmp, "check.exe")
+        src, obj, rsp, exe = (os.path.join(tmp, "check" + ext) for ext in (".c", ".obj", ".rsp", ".exe"))
         with open(src, "w") as f:
             f.write("#include <windows.h>\n#include <stdio.h>\n#include <d3d11.h>\n#include <d3dcompiler.h>\n"
                     "int main(void) { printf(\"%lu %d\\n\", GetCurrentProcessId(), D3DCompile != 0); return 0; }\n")
-        r = subprocess.run([clang, *cc.LINK_FLAGS, *cc.CFLAGS, src, "/Fo" + os.path.join(tmp, "check.obj"), "/Fe" + exe,
-                            "/link", *cc.LINK_OPTIONS, *cc.SYSTEM_LIBS], capture_output=True, text=True)
+        r = subprocess.run([clang, "/c", *cc.CFLAGS, src, "/Fo" + obj], capture_output=True, text=True)
+        if not r.returncode:
+            with open(rsp, "w") as f:
+                f.write(f'"{obj}"')
+            r = subprocess.run(cc.link_command(rsp, exe), capture_output=True, text=True)
         if r.returncode:
             return f"{clang} could not build a test program. {fix}\n" + (r.stdout + r.stderr)[-2000:]
         r = subprocess.run([exe], capture_output=True, text=True)

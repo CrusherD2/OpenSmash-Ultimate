@@ -59,11 +59,21 @@ BASE_CFLAGS = ["/nologo", "/arch:AVX2", "-mfma", "-mf16c", "-fno-strict-aliasing
                *(["/winsysroot", WINSYSROOT] if WINSYSROOT else [])]
 CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
 # Linking through clang-cl: with lld-link when it is next to clang-cl (else Visual Studio's link.exe),
-# and LINK_OPTIONS after /link. clang-cl hands lld-link the system root's library folders but not
-# the root itself, and lld-link adds those of a Visual Studio it finds on its own: /winsysroot:
-# keeps it to deps\msvc.
-LINK_FLAGS = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
-LINK_OPTIONS = ["/winsysroot:" + WINSYSROOT] if WINSYSROOT else []
+# and LINK_OPTIONS after /link. With deps\msvc both are given the system root. clang-cl, given
+# /winsysroot, hands lld-link the root's library folders (-libpath:). lld-link, given /winsysroot:,
+# does not add the folders of a Visual Studio it finds on its own. Without the root, clang-cl hands
+# lld-link no library folders on a PC without Visual Studio. lld-link would then add the root's
+# folders only once an object file has told it the machine type, and clang-cl puts the libraries
+# named after /link before the objects. So none of SYSTEM_LIBS was found (players' builds stopped
+# at the link; on a PC with Visual Studio, clang-cl hands lld-link VS's folders instead, which
+# hides this).
+def link_flags(root):
+    """(LINK_FLAGS, LINK_OPTIONS) for a system root, or for None."""
+    lld = ["-fuse-ld=lld"] if os.path.exists(os.path.join(os.path.dirname(CLANG), "lld-link.exe")) else []
+    return (lld + (["/winsysroot", root] if root else []), ["/winsysroot:" + root] if root else [])
+
+
+LINK_FLAGS, LINK_OPTIONS = link_flags(WINSYSROOT)
 # the Windows libraries the game links (all from the Windows SDK)
 SYSTEM_LIBS = ("winmm.lib", "user32.lib", "gdi32.lib", "d3d11.lib", "dxgi.lib", "d3dcompiler.lib", "dxguid.lib",
                "ws2_32.lib", "ole32.lib", "oleaut32.lib")
@@ -193,6 +203,13 @@ def _compile_again(job, code, out, log):
                  "on where it stopped.\n" + crash_report(out))
 
 
+def link_command(rsp, exe, options=(), libs=()):
+    """clang-cl's command that links the objects listed in the response file `rsp` into `exe`, with
+    SYSTEM_LIBS and `libs`; `options` go to the linker. (build_game.py's compiler check links its
+    test program with it too, so that the check tries what the build does.)"""
+    return [CLANG, "/nologo", *LINK_FLAGS, "@" + rsp, "/Fe" + exe, "/link", *LINK_OPTIONS, *options, *SYSTEM_LIBS, *libs]
+
+
 def link(objs, exe, options=()):
     """Link objects into an executable; `options` go to the linker. The codec libraries built
     from third_party/ are made first if they are missing or stale (a few seconds)."""
@@ -201,8 +218,7 @@ def link(objs, exe, options=()):
     rsp = exe + ".rsp"
     with open(rsp, "w") as f:
         f.write("\n".join(f'"{o}"' for o in objs))
-    r = subprocess.run([CLANG, "/nologo", *LINK_FLAGS, "@" + rsp, "/Fe" + exe, "/link", "/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map",
-                        *LINK_OPTIONS, *options, *SYSTEM_LIBS, *EXTRA_LIBS],
+    r = subprocess.run(link_command(rsp, exe, ["/HIGHENTROPYVA:NO", "/MAP:" + exe[:-4] + ".map", *options], EXTRA_LIBS),
                        capture_output=True, text=True)
     if r.returncode:
         lines = (r.stdout + r.stderr).splitlines()
