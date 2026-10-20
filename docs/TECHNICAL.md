@@ -144,7 +144,7 @@ This is a targeted mitigation, not a claim of driver-independent behavior. Rende
 
 ### Audio and video
 
-`ipc_audio.c` supplies the audio-service path; `ipc_opus.c` uses a statically linked libopus. The video path reconstructs VP9 frame information and decodes with libvpx. [`gpu_vp9.c`](../runtime/gpu_vp9.c) contains frame/header logic; its default probability tables carry [libvpx attribution](../NOTICE.md).
+`ipc_audio.c` supplies the audio-service path. The game appends short buffers (10.67 ms each, about five at a time) and mixes the next one when one is reported played; the runtime copies them into its own queue, the output device (WASAPI on Windows, waveOut if WASAPI cannot start; SDL on Linux and macOS) takes from that queue at its own pace, and a buffer is reported played once the device is within 20 ms of its end, so a late report never leaves the device without sound. `SSBU_AUDIO_LATENCY_MS` changes those 20 ms, `SSBU_AUDIO=waveout` picks waveOut, `SSBU_AUDIO_LOG=1` logs every buffer, and the log says when the game's sound ran out. `ipc_opus.c` uses a statically linked libopus. The video path reconstructs VP9 frame information and decodes with libvpx. [`gpu_vp9.c`](../runtime/gpu_vp9.c) contains frame/header logic; its default probability tables carry [libvpx attribution](../NOTICE.md).
 
 Both codecs are built from the sources in [`third_party/`](../third_party/README.md) by [`codec_libs.py`](../tools/codec_libs.py) when the program is linked (`cc.py` adds `SSBU_HAVE_OPUS` and `SSBU_HAVE_VPX`); a developer's own builds take their place through `SSBU_OPUS_LIBS` and `SSBU_VPX_DIR`. Without either, the game builds and runs with that codec silent.
 
