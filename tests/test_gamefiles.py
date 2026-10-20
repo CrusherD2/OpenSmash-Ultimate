@@ -51,6 +51,11 @@ class PickProgramTests(unittest.TestCase):
                                       record('base.nca', 'base')])
         self.assertEqual(got['name'], 'u13.nca')
 
+    def test_13_0_5_of_several_updates(self):
+        got = gamefiles.pick_program([record('u13.nca', 'update', version=2031616), record('u14.nca', 'update', version=32 << 16),
+                                      record('base.nca', 'base')])
+        self.assertEqual(got['name'], 'u13.nca')
+
     def test_several_updates_without_versions(self):
         with self.assertRaises(gamefiles.Error):
             gamefiles.pick_program([record('a.nca', 'update'), record('b.nca', 'update')])
@@ -115,7 +120,7 @@ class MetadataTests(unittest.TestCase):
 
 class SummaryTests(unittest.TestCase):
     def test_lines(self):
-        contents = [record('base.nca', 'base'), record('update.nca', 'update', version=14 << 16),
+        contents = [record('base.nca', 'base'), record('update.nca', 'update', version=2031616),
                     record('dlc1.nca', 'dlc', type='data'), record('other.nca', 'base', app=OTHER)]
         contents[1]['display_version'] = '13.0.5'
         contents[2]['title_id'] = f'{APP + 0x1002:016X}'
