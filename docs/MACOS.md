@@ -239,7 +239,7 @@ everything it showed.
 | The build stops after a long time, the Mac very slow | It may have run out of memory: run the installer again with fewer jobs, in Terminal: `./"Install WindowSmash.command" --jobs 4`. |
 | *The game data is not where it was when the game was built* | The game reads its data in place. Connect the disk it is on again, or run the installer to set it up from where it is now. |
 | *WindowSmash needs version 13.0.5* | Your game files are another version of the game. Put the game's 13.0.5 update `.nsp` in your game folder, next to the game (with Ryujinx or a yuzu fork, install the update there), then run the installer again ([which copies count](UPDATES.md#what-counts-as-1305)). |
-| *This folder was set up from version 11.0.0 of the game* (or another version) | An older WindowSmash built this folder from another game version. With the 13.0.5 update in your game folder, the installer sets it up again as 13.0.5; your save and settings stay ([more](UPDATES.md#a-folder-built-from-another-version)). |
+| *… set up from version 11.0.0 of the game* (or another version) | An older WindowSmash built this folder from another game version. With the 13.0.5 update in your game folder, the installer sets it up again as 13.0.5; your save and settings stay ([more](UPDATES.md#a-folder-built-from-another-version)). |
 | *The game isn't built here yet* | Run `Install WindowSmash.command`. |
 | The game window doesn't appear, or closes at once | Look at the end of `build/play.log` and at the newest file in `reports/`. Play SSBU says when the game stopped with an error. |
 | No sound, or a controller does nothing | Check the log's `[audio]` and `[input]` lines. Press <kbd>F2</kbd> to see the pads the game knows. |

@@ -86,7 +86,7 @@ A folder whose `dump/exefs/main` is another version's, set up before WindowSmash
 
 ### Code tied to the game version
 
-- **Debug hooks in the runtime** (`HLE_WRAP(<address>)` in `runtime/hle_net.c`) wrap a guest function that isn't exported, at its 13.0.5 address. Each has a code signature on the line above it: its first instructions, with addresses masked out. The recompiler checks that a function starts at that address and begins as its signature says; if not, the build stops rather than leave the hook out. `tools/recomp.py wrap-sig <module> <address>` prints a new hook's signature.
+- **Hooks in the runtime** (`HLE_WRAP(<address>)`, in `runtime/hle_fiber.c`, `hle_movie.c`, `hle_net.c` and `hle_online.c`) wrap a guest function that isn't exported, at its 13.0.5 address. Each has a code signature on the line above it: its first instructions, with addresses masked out. The recompiler checks that a function starts at that address and begins as its signature says; if not, the build stops rather than leave the hook out. `tools/recomp.py wrap-sig <module> <address>` prints a new hook's signature.
 - **Unlock All Fighters** writes at 13.0.5's save offsets. It reads main's build ID and changes nothing unless it is 13.0.5's (`LAYOUTS` in `tools/unlock_all.py`, `$knownLayouts` in `tools/Unlock-All-Fighters.ps1`).
 
 ### The imports check
