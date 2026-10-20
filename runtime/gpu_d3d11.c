@@ -546,6 +546,10 @@ static void driver_stacks(void) {
  * laptops for their chip too, for whatever else would take the default. */
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+/* IDXGIFactory6's interface ID (dxgi1_6.h's), here rather than IID_IDXGIFactory6 from dxguid.lib:
+ * older Windows SDKs' dxguid.lib lacks it though their dxgi1_6.h declares it, and players building
+ * with such an SDK had the link stop on "undefined symbol: IID_IDXGIFactory6". */
+static const IID IID_IDXGIFactory6_ = {0xC1B6694F, 0xFF09, 0x44A9, {0xB0, 0x3C, 0x77, 0x90, 0x0A, 0x0A, 0x1D, 0x17}};
 
 static void adapter_name(const DXGI_ADAPTER_DESC1 *d, char *out, size_t size) {
     size_t i = 0;
@@ -558,7 +562,7 @@ int gfx_adapter_names(char names[][64], int max) {
     IDXGIFactory1 *f1;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return 0;
     IDXGIFactory6 *f6 = NULL;
-    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6_, (void **)&f6))) f6 = NULL;
     int n = 0;
     for (UINT i = 0; n < max; i++) {
         IDXGIAdapter1 *a = NULL;
@@ -590,7 +594,7 @@ static IDXGIAdapter1 *pick_adapter(int *warp) {
     IDXGIFactory1 *f1;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return NULL;
     IDXGIFactory6 *f6 = NULL;
-    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) f6 = NULL;   /* (before Windows 10 1803: the system's order) */
+    if (FAILED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6_, (void **)&f6))) f6 = NULL;   /* (before Windows 10 1803: the system's order) */
     char w[64];
     size_t k = 0;
     for (; k + 1 < sizeof w && want[k]; k++) w[k] = (char)tolower((unsigned char)want[k]);
