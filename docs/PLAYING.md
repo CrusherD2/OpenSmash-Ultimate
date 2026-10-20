@@ -104,7 +104,11 @@ Up to **eight players** can use pads at once: Xbox, PlayStation, Switch Pro, Gam
 
 ### GameCube controllers
 
-GameCube controllers work through Nintendo's GameCube controller adapter (the one for Wii U and Switch), or another brand's adapter set to its **Wii U** mode. Each of the adapter's ports is its own player.
+These work, each port or controller as its own player:
+
+- **Nintendo's GameCube controller adapter** (the one for Wii U and Switch), or another brand's adapter (Mayflash and others) set to its **Wii U** mode. Windows' own driver and the WinUSB driver Dolphin's setup installs with Zadig both work.
+- Another brand's adapter in its **PC** mode.
+- The **Nintendo Switch Online GameCube controller** (the one for Switch 2), on a **USB cable**. Its Bluetooth doesn't work with WindowSmash.
 
 They play as GameCube controllers, as they do on a Switch:
 
@@ -113,7 +117,16 @@ They play as GameCube controllers, as they do on a Switch:
 - Rumble works when the adapter's second plug (the grey one on Nintendo's adapter) is in a USB port too. WaveBird controllers have no rumble.
 
 > [!NOTE]
-> WindowSmash reads the adapter through the driver Windows installs for it. If you swapped that driver for WinUSB with Zadig (as Dolphin's setup asks), WindowSmash can't see the adapter. To undo that, open Device Manager, right-click the adapter (**WUP-028**), choose **Uninstall device** and tick the box that removes its driver, then unplug the adapter and plug it back in.
+> **The Switch Online GameCube controller needs one more step on some PCs.** It only starts sending its buttons after the game talks to its second USB "interface", and Windows may not give that interface a driver. If the log (`build\play.log`) says *its interface 1 has no WinUSB driver*:
+>
+> 1. Plug the controller in with its cable and open [Zadig](https://zadig.akeo.ie).
+> 2. Choose **Options → List All Devices**.
+> 3. Pick the controller's **Interface 1**: the USB ID shows `057E 2073 01`. Not Interface 0, which Windows needs for the buttons.
+> 4. Choose **WinUSB** as the driver and click **Replace Driver** (or **Install Driver**).
+>
+> Start the game again. The log then says *Switch 2 GameCube controller started*.
+
+The log names what it finds, on lines that start with `[input]`: an adapter (*GameCube adapter found*), each controller that becomes a player, and anything that stopped one from working.
 
 Any other pad can use the game's GameCube controls too: set `style = gamecube` for it in `controllers.ini` (below). Its triggers become L and R, and its shoulder buttons become Z.
 
