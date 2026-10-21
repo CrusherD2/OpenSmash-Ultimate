@@ -19,6 +19,7 @@
 
 <p align="center">
   <a href="https://discord.gg/pkgyYGf3YB"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the community on Discord"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="License: GPL-3.0"></a>
 </p>
 
 ---
@@ -126,7 +127,7 @@ Compare your PC with [what you need](#what-you-need) above. (**Settings → Syst
 2. Right-click `WindowSmash-main.zip`, choose **Extract All…**, pick a drive with about 60 GB free (for example `C:\`), and click **Extract**. You get a folder named `WindowSmash-main`; rename it to `WindowSmash` if you like.
 
 > [!TIP]
-> Keep WindowSmash out of the Desktop and Documents folders: OneDrive may try to upload them, and the finished build is around 30 GB. With [Git](https://git-scm.com/download/win), `git clone https://github.com/SNO2207/WindowSmash.git` does the same as the download.
+> Keep WindowSmash out of the Desktop and Documents folders: OneDrive may try to upload them, and the finished build is around 30 GB. With [Git](https://git-scm.com/download/win), `git clone https://github.com/OpenSmash-Ultimate/WindowSmash.git` does the same as the download.
 
 ### Step 4: Start the installer
 
@@ -200,7 +201,7 @@ The installer stops with a message saying what went wrong and what to do; `insta
 You need Windows 10/11 x64. `Install WindowSmash.bat` installs Python 3.10 or newer and a compiler when they are missing: LLVM's clang-cl with Microsoft's C runtime and Windows SDK in `deps` (`tools\msvc_deps.py`, after you accept Microsoft's license terms), or the Visual Studio Build Tools with **C++ Clang tools for Windows** if that fails (`-BuildTools` goes straight to them). `-NoWizard` asks its questions in the console instead of the setup window, with the folders you give as the answers to accept. The example paths are your game files in `D:\MyDump` (the game with its 13.0.5 update), your keys in `D:\MyKeys` and your firmware in `D:\MyFirmware`.
 
 ```powershell
-git clone https://github.com/SNO2207/WindowSmash.git
+git clone https://github.com/OpenSmash-Ultimate/WindowSmash.git
 cd WindowSmash
 & ".\Install WindowSmash.bat" -Game "D:\MyDump" -Keys "D:\MyKeys" -Firmware "D:\MyFirmware" -NoWizard
 ```
@@ -348,4 +349,8 @@ Everything generated or personal stays out of Git: `build/`, `dump/`, `deps/`, `
 
 ## Legal
 
-No project-wide license has been chosen for the WindowSmash source yet; see the [third-party notices](NOTICE.md) for the parts that have their own. Super Smash Bros. Ultimate and related names belong to their respective owners. WindowSmash is an independent project and is not affiliated with or endorsed by Nintendo.
+WindowSmash is free software under the [GNU General Public License, version 3](LICENSE) (GPL-3.0). You may use, study, share and change it; if you pass on WindowSmash or a program based on it, you must do so under the same license and include the source. The [license text](LICENSE) has the full terms.
+
+The license covers WindowSmash's own source. The parts in `third_party/` keep their own licenses, listed in the [third-party notices](NOTICE.md). It gives no rights to Super Smash Bros. Ultimate, its files, or anything WindowSmash builds from them.
+
+Super Smash Bros. Ultimate and related names belong to their respective owners. WindowSmash is an independent project and is not affiliated with or endorsed by Nintendo.
