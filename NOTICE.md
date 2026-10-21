@@ -4,7 +4,7 @@
 
 ## WindowSmash's own source
 
-No project-wide license has been specified for the WindowSmash source outside the separately identified third-party material below.
+The WindowSmash source is licensed under the [GNU General Public License, version 3](LICENSE) (GPL-3.0), except for the separately identified third-party material below, which keeps its own license. The GPL covers WindowSmash only: it gives no rights to Super Smash Bros. Ultimate, its files, or anything WindowSmash builds from them.
 
 ## libvpx
 
