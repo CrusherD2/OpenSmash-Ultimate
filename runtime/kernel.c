@@ -197,6 +197,26 @@ static void query_memory(u64 info, u64 addr) {
     st64(info + 32, 0);
 }
 
+/* 8 bytes of guest memory at addr if a region holds them: 0 if that memory is not mapped (hle_fiber.c
+ * looks into fiber objects the game may have freed). Under the lock, so it cannot be unmapped
+ * between the look and the read. */
+int kernel_read64(u64 addr, u64 *out) {
+    int ok = 0;
+    EnterCriticalSection(&klock);
+    u32 i = 0, hi = region_count;
+    while (i < hi) {
+        u32 mid = (i + hi) / 2;
+        if (regions[mid].base + regions[mid].size <= addr) i = mid + 1;
+        else hi = mid;
+    }
+    if (i < region_count && regions[i].base <= addr && addr + 8 <= regions[i].base + regions[i].size && (regions[i].perm & 1)) {
+        *out = ld64(addr);
+        ok = 1;
+    }
+    LeaveCriticalSection(&klock);
+    return ok;
+}
+
 static void *commit(u64 at, u64 size, const char *what) {
     void *p = VirtualAlloc(G2H(at), size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, (unsigned long)GetLastError());
