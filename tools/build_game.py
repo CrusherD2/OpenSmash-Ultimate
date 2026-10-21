@@ -673,16 +673,35 @@ def write_game_source(rec):
         f.write(f"{rec['display_version'] or ''}\t{rec['path']}\t{rec['name'] if rec['container'] else ''}\n")
 
 
-def upgrade_old_folder(old, game, program):
+def upgrade_old_folder(old, game, program, keys):
     """This folder was set up from another game version (old): with 13.0.5 in the game folder,
-    clear what the old one made (reset_game_files) and go on; else stop before clearing anything."""
+    clear what the old one made (reset_game_files) and go on; else stop before clearing anything.
+    When the game folder's files don't say their version (renamed ones), its program is copied
+    out on the side first and its main module looked at."""
     import game_version
+    import gamefiles
     problem = game_version.scan_problem(program)
+    if not problem and game_version.program_version(program) is None:
+        probe = os.path.join(DUMP, "exefs.probe")
+        shutil.rmtree(probe, ignore_errors=True)
+        try:
+            run([sys.executable, os.path.join("tools", "nca.py"), "exefs", *nca_ref(program), "--keys", keys,
+                 "--out", os.path.join("dump", "exefs.probe")],
+                f"Could not copy the program out of {gamefiles.where(program)} (see above).")
+            problem = program_problem(program, game, os.path.join(probe, "main"))
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
     if problem:
         raise Failed(f"This WindowSmash folder was set up from {old} of the game. {problem}")
+    if in_use(EXE):
+        raise Failed(f"The game is running from {shown(os.path.relpath(EXE, ROOT))}: close it, then run this again.")
     log(f"\n  This folder was set up from {old} of the game. WindowSmash needs {game_version.REQUIRED} now: "
         f"setting it up again from {game}. Your save, settings and prepared shaders stay.")
-    reset_game_files()
+    try:
+        reset_game_files()
+    except OSError as e:
+        raise Failed(f"The old game files could not all be cleared ({e}). Close the game and anything else using "
+                     "this folder's files, then run this again: it carries on where it stopped.")
     trees = sorted(n for n in os.listdir(ROOT) if re.fullmatch(r"v\d+(\.\d+)*", n) and os.path.isdir(os.path.join(ROOT, n)))
     for tree in trees:   # (made by the version tool WindowSmash had before)
         log(f"  {tree}{os.sep} is not used any more. To play on from the save in it, copy {os.path.join(tree, 'save')} "
@@ -738,21 +757,32 @@ def missing_fonts(folder):
     return [n for n in FONT_FILES if not os.path.isfile(os.path.join(folder, n))]
 
 
+def program_problem(rec, game, main):
+    """None when the main module at `main` (copied out of the program `rec`) is 13.0.5's, else
+    what to say. A build id it doesn't know is named by the files' metadata, unless that says
+    13.0.5 (then it is "another version": a changed or mislabelled program)."""
+    import game_version
+    import gamefiles
+    if game_version.main_build_id(main) == game_version.MAIN_BUILD_ID:
+        return None
+    said = rec and game_version.program_version(rec)
+    name = game_version.build_name(game_version.main_build_id(main)) or (said if said != game_version.REQUIRED else None)
+    where = gamefiles.where(rec) if rec else shown("dump\\exefs")
+    return game_version.needs(f"the program in {where} is " + (f"version {name}" if name else "another version"), game)
+
+
 def check_program(rec, game):
     """The program step 4 copied out is 13.0.5's (its main module's build id). One that isn't is
     removed again, so that the folder isn't left set up from it."""
     import game_version
-    import gamefiles
-    build_id = game_version.main_build_id(os.path.join(EXEFS, "main"))
-    if build_id == game_version.MAIN_BUILD_ID:
-        log(f"  game version {game_version.REQUIRED} (main module {build_id[:16]})")
+    problem = program_problem(rec, game, os.path.join(EXEFS, "main"))
+    if not problem:
+        log(f"  game version {game_version.REQUIRED} (main module {game_version.MAIN_BUILD_ID[:16]})")
         return
-    name = game_version.build_name(build_id) or (rec and game_version.program_version(rec))
     shutil.rmtree(EXEFS, ignore_errors=True)
     if os.path.exists(SOURCE):
         os.remove(SOURCE)
-    where = gamefiles.where(rec) if rec else shown("dump\\exefs")
-    raise Failed(game_version.needs(f"the program in {where} is " + (f"version {name}" if name else "another version"), game))
+    raise Failed(problem)
 
 
 def check_game_data(cfg, game):
@@ -984,7 +1014,7 @@ def build(a):
         return found
 
     if old:
-        upgrade_old_folder(old, game, the_program()[2])
+        upgrade_old_folder(old, game, the_program()[2], keys)
 
     log(shown("\n[4/9] Copy the game's program (dump\\exefs)"))
     if exefs_done:

@@ -228,9 +228,9 @@ def scan(folder, keys, depth=1):
 def pick_program(contents, app=APP_ID):
     """The program record to build from, among a scan's contents: a Program NCA, as a file of its
     own or inside a package (.nsp); of the game's (`app`) when the folder holds several games';
-    the update's rather than the base's; of several updates, 13.0.5's, else the newest the
-    metadata knows; of the same program twice, the file of its own; else the choice must be made
-    by hand."""
+    the update's rather than the base's - but a base with 13.0.5 merged in rather than updates the
+    metadata says are other versions; of several updates, 13.0.5's, else the newest the metadata
+    knows; of the same program twice, the file of its own; else the choice must be made by hand."""
     programs = [c for c in contents if c["type"] == "program"]
     if not programs:
         raise Error("there is no Program NCA among them")
@@ -241,6 +241,10 @@ def pick_program(contents, app=APP_ID):
         raise Error("they are the programs of several games (" + ", ".join(sorted({c["app"] for c in programs}))
                     + "), none of them Super Smash Bros. Ultimate's")
     updates = [c for c in programs if c["kind"] == "update"]
+    merged = [c for c in programs if c["kind"] == "base" and c.get("data_version") == game_version.REQUIRED]
+    if updates and merged and all(c["version"] is not None and c["version"] != game_version.UPDATE_TITLE_VERSION
+                                  for c in updates):
+        updates, programs = [], merged   # (a leftover older update next to a 13.0.5 dump)
     if updates:
         programs = updates
         wanted = [c for c in updates if c["version"] == game_version.UPDATE_TITLE_VERSION]

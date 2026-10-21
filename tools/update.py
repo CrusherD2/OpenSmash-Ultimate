@@ -131,7 +131,6 @@ class Patch:
         if ivfc[:4] != b"IVFC":
             raise SystemExit("no hash tree (IVFC) on the update's RomFS")
         self.levels = [struct.unpack_from("<QQI", ivfc, 0x10 + i * 0x18) for i in range(6)]   # (offset, size, block size log2)
-        self.master = ivfc[0xC0:0xE0]                    # level 1's hash: the top of the tree
         self.l6, self.l6size, blocklog = self.levels[5]
         self.block = 1 << blocklog
         self.blocks = (self.l6size + self.block - 1) // self.block

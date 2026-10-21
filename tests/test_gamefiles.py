@@ -56,6 +56,18 @@ class PickProgramTests(unittest.TestCase):
                                       record('base.nca', 'base')])
         self.assertEqual(got['name'], 'u13.nca')
 
+    def test_a_dump_with_13_0_5_merged_in_over_an_older_update(self):
+        merged = dict(record('merged.nca', 'base'), data_version='13.0.5')
+        got = gamefiles.pick_program([merged, record('u12.nca', 'update', version=12 << 16)])
+        self.assertEqual(got['name'], 'merged.nca')
+        # (an update that is 13.0.5, or that doesn't say, still goes first)
+        got = gamefiles.pick_program([merged, record('u13.nca', 'update', version=2031616)])
+        self.assertEqual(got['name'], 'u13.nca')
+        got = gamefiles.pick_program([merged, record('program.nca', 'update')])
+        self.assertEqual(got['name'], 'program.nca')
+        older = dict(record('base.nca', 'base'), data_version='11.0.0')
+        self.assertEqual(gamefiles.pick_program([older, record('u12.nca', 'update', version=12 << 16)])['name'], 'u12.nca')
+
     def test_several_updates_without_versions(self):
         with self.assertRaises(gamefiles.Error):
             gamefiles.pick_program([record('a.nca', 'update'), record('b.nca', 'update')])

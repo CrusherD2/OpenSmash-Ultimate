@@ -265,6 +265,48 @@ class BuildStepsTests(unittest.TestCase):
                      'dump/fonts/a.bfttf', 'dump/shadercache/v1_ps_a.dxbc', 'display.ini', 'v13.0.5/save/x.bin'):
             self.assertTrue((port / kept).exists(), kept)
 
+    def test_an_old_folder_is_left_as_it_is_while_the_game_runs(self):
+        port = self.old_folder()
+        before = sorted(str(p) for p in port.rglob('*'))
+        self.ns['in_use'] = lambda path: True
+        with self.assertRaises(self.ns['Failed']) as e:
+            self.ns['build'](self.args)
+        self.assertIn('close it, then run this again', str(e.exception))
+        self.assertEqual(sorted(str(p) for p in port.rglob('*')), before)
+
+    def test_an_old_folder_with_unlabelled_files_is_checked_first(self):
+        """Renamed files (no metadata): the program is copied out on the side and looked at before
+        anything is cleared."""
+        port = self.old_folder()
+        self.program.update(version=None)
+        probe = self.top / 'port' / 'dump' / 'exefs.probe'
+        for build_id, refused in (('1234567890ABCDEF1234567890ABCDEF12345678', True), (MAIN_13, False)):
+            def run(args, failure, build_id=build_id):
+                self.calls.append([str(a) for a in args])
+                if 'exefs.probe' in ' '.join(map(str, args)):
+                    write_main(probe / 'main', build_id)
+            self.ns['run'] = run
+            self.ns['extract_exefs'] = self.extracted(MAIN_13)
+            self.ns['write_romfs_cfg'] = lambda game, keys, the_program: None
+            before = sorted(str(p) for p in port.rglob('*'))
+            if refused:
+                with self.assertRaises(self.ns['Failed']) as e:
+                    self.ns['build'](self.args)
+                self.assertIn('the program in prog.nca in update.nsp is another version', str(e.exception))
+                self.assertEqual(sorted(str(p) for p in port.rglob('*')), before)   # (nothing cleared)
+            else:
+                self.ns['build'](self.args)
+                self.assertFalse((port / 'dump' / 'modules' / 'romfs_patch.bin').exists())   # (set up again)
+            self.assertFalse(probe.exists())
+
+    def test_a_program_labelled_13_0_5_that_is_not(self):
+        for n in os.listdir(self.exefs):
+            os.remove(self.exefs / n)
+        self.ns['extract_exefs'] = self.extracted('1234567890ABCDEF1234567890ABCDEF12345678')
+        with self.assertRaises(self.ns['Failed']) as e:   # (the metadata says v31; the program isn't 13.0.5's)
+            self.ns['build'](self.args)
+        self.assertIn('the program in prog.nca in update.nsp is another version', str(e.exception))
+
     def test_an_old_folder_without_13_0_5_is_left_as_it_is(self):
         port = self.old_folder()
         self.program.update(kind='base', version=0, data_version='11.0.0', romfs='plain')

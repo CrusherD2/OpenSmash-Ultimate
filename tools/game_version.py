@@ -46,11 +46,6 @@ def main_build_id(path):
     return head[0x40:0x60].hex().rstrip("0").upper() or "0"
 
 
-def is_required(path):
-    """Whether the main module at `path` is 13.0.5's."""
-    return main_build_id(path) == MAIN_BUILD_ID
-
-
 def needs(what, where=None):
     """The one message for a game that isn't 13.0.5: what was found, and what to do."""
     place = f"in {where}, next to the game" if where else "next to the game"

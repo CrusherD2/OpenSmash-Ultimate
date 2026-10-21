@@ -70,8 +70,7 @@ class BuildIdTests(unittest.TestCase):
     def test_main_build_id(self):
         with tempfile.TemporaryDirectory(prefix='game-version-test-') as tmp:
             self.assertEqual(gv.main_build_id(self.main(tmp, gv.MAIN_BUILD_ID)), gv.MAIN_BUILD_ID)
-            self.assertTrue(gv.is_required(self.main(tmp, gv.MAIN_BUILD_ID)))
-            self.assertFalse(gv.is_required(self.main(tmp, MAIN_11)))
+            self.assertEqual(gv.main_build_id(self.main(tmp, MAIN_11)), MAIN_11)
             self.assertIsNone(gv.main_build_id(self.main(tmp, MAIN_11, magic=b'NRO0')))
             self.assertIsNone(gv.main_build_id(Path(tmp) / 'none'))
             (Path(tmp) / 'short').write_bytes(b'NSO0')
