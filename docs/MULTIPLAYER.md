@@ -226,6 +226,8 @@ The lobby checks where messages come from, limits how fast each player can send,
 
 The launchers write `build\play.log`. For more network detail, set `SSBU_NET_LOG=1` before starting the game (`2` logs every call). Logs and the overlay can show player names, folder names and internet addresses, so read any excerpt before you share it. With Online mode, the lobby's game server also keeps your player name and ratings.
 
+The game server's log (`--nex-log`: `0` quiet, `1` each call, `2` every packet, `3` also a copy of each call's parameters in `<state>/requests`, never a login's; `ssbu-online` runs at `1`) names players by name, player ID and account tag: the first 8 hex digits of a SHA-256 of their account id. At no level does it hold the account id itself or the login token. The account id is what logs a player in, so anyone who has it can play as them. The accounts file in the `--state` folder does hold every player's account id, so keep that folder private. Game server logs from before this change hold each player's account id in full: delete them.
+
 ## Reference: environment variables
 
 | Variable | Meaning |
