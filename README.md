@@ -263,7 +263,6 @@ Looking for people to play with? Ask on the [Discord server](https://discord.gg/
 | [The 13.0.5 update](docs/UPDATES.md) | see which copies of the game count as 13.0.5, how the update is applied, and what happens to a folder built from another version. |
 | [Linux](docs/LINUX.md) | install, build and run the experimental Linux version. |
 | [macOS](docs/MACOS.md) | install, build and run the experimental version for Macs with Apple silicon. |
-| [Runtime packages](docs/RUNTIME-SETUP.md) | set up a ready-built runtime package with your own game data. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 | [Third-party notices](NOTICE.md) | see attributions and licenses. |
 
