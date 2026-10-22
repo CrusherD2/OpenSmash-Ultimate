@@ -620,6 +620,20 @@ class CodecBuildTests(unittest.TestCase):
 
 
 # ---- tools/mac's test programs, built as their first lines say and run ---------------------------
+# The default Metal device as gpu_metal.m's init sees it: its name, and whether it is a Metal 3 GPU (the
+# renderer takes no other). Nothing printed without one.
+METAL_DEVICE = r"""#import <Metal/Metal.h>
+#include <stdio.h>
+int main(void) {
+    @autoreleasepool {
+        id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+        if (d) printf("%s\n%d\n", d.name.UTF8String, (int)[d supportsFamily:MTLGPUFamilyMetal3]);
+    }
+    return 0;
+}
+"""
+
+
 @unittest.skipUnless(DARWIN, 'needs the Command Line Tools, and Metal')
 class TestProgramTests(unittest.TestCase):
     """shimtest.c (the platform layer, and the loader and kernel on a made-up game), msltest.m (the
@@ -633,12 +647,24 @@ class TestProgramTests(unittest.TestCase):
         r = subprocess.run(['clang', *cmd], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def run_program(self, exe, *args, cwd=None, env=None):
-        r = subprocess.run([exe, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600)
+    def run_program(self, exe, *args, cwd=None, env=None, timeout=600):
+        try:
+            r = subprocess.run([exe, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:   # (what it wrote before it was stopped - bytes here, text=True or not - says where it was)
+            said = ''.join(s.decode(errors='replace') if isinstance(s, bytes) else s for s in (e.stdout, e.stderr) if s)
+            raise self.failureException(f'{os.path.basename(exe)} still running after {timeout} s; what it wrote:\n{said[-6000:]}') from None
         if 'no Metal device' in r.stderr:
             self.skipTest('no Metal device')
         self.assertEqual(r.returncode, 0, (r.stdout + r.stderr)[-6000:])
         return r.stdout
+
+    def metal_device(self, tmp):
+        """(the default Metal device's name, whether it is a Metal 3 GPU), or None without one."""
+        src, exe = os.path.join(tmp, 'device.m'), os.path.join(tmp, 'device')
+        write(src, METAL_DEVICE)
+        self.build(*self.F, '-fobjc-arc', src, '-framework', 'Metal', '-framework', 'Foundation', '-o', exe)
+        lines = subprocess.run([exe], capture_output=True, text=True, timeout=60).stdout.splitlines()
+        return (lines[0], lines[1] == '1') if len(lines) == 2 else None
 
     def test_shimtest(self):
         with tempfile.TemporaryDirectory(prefix='shimtest ') as tmp:
@@ -652,6 +678,9 @@ class TestProgramTests(unittest.TestCase):
             with open(os.path.join(tmp, 'ssbu.syms'), 'w') as syms:   # (the profiler's names)
                 subprocess.run(['nm', '-n', '--defined-only', exe], stdout=syms, check=True)
             out = self.run_program(exe, cwd=tmp)
+            for line in out.splitlines():   # (a known runtime bug, let through only in the layout that shows it: shimtest.c)
+                if line.startswith('KNOWN BUG '):
+                    print(f'::warning title=shimtest: known runtime bug::{line}', flush=True)
             self.assertRegex(out, r'\n\d+ checks, 0 failed\n$')
 
     def test_msltest(self):
@@ -665,6 +694,15 @@ class TestProgramTests(unittest.TestCase):
 
     def test_gfxtest(self):
         with tempfile.TemporaryDirectory(prefix='gfxtest ') as tmp:
+            device = self.metal_device(tmp)
+            if not device:
+                self.skipTest('no Metal device')
+            name, metal3 = device
+            if not metal3:   # (gpu_metal.m's init refuses it, and then each of gfxtest's draws waits 20 s for nothing)
+                self.skipTest(f'{name} is not a Metal 3 GPU: the renderer refuses it')
+            if 'Paravirtual' in name and not os.environ.get('GFXTEST_ON_VM'):
+                self.skipTest(f"{name}: a macOS virtual machine (GitHub's macOS runners), where gfxtest did not finish in 600 s; "
+                              'the renderer is checked on a Mac with Apple silicon (GFXTEST_ON_VM=1: run it anyway)')
             font, exe = os.path.join(tmp, 'font'), os.path.join(tmp, 'gfxtest')
             self.build(*self.F, '-fobjc-arc', '-O1', 'tools/mac/make_overlay_font.m', '-framework', 'CoreText', '-framework', 'CoreGraphics',
                        '-framework', 'Foundation', '-o', font)
@@ -676,7 +714,7 @@ class TestProgramTests(unittest.TestCase):
                        '-framework', 'QuartzCore', '-framework', 'CoreGraphics', '-framework', 'Foundation', '-o', exe)
             work = os.path.join(tmp, 'work')
             os.makedirs(work)
-            out = self.run_program(exe, cwd=tmp, env={**os.environ, 'GFXTEST_DIR': work})
+            out = self.run_program(exe, cwd=tmp, env={**os.environ, 'GFXTEST_DIR': work}, timeout=300)   # (seconds on a Mac)
             self.assertRegex(out, r'\d+ checks, 0 failed')
 
 

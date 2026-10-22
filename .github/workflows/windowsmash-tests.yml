@@ -65,8 +65,12 @@ jobs:
           echo "c1adf3da91108dbc3e4205da5dacebc203085d283fa89e86eb2c889abd03a853  deps/downloads/SDL3-3.4.18.dmg" | shasum -a 256 -c
           python -c "import sys; sys.path.insert(0, 'tools/mac'); import install_mac; install_mac.install_sdl3_framework('deps/downloads/SDL3-3.4.18.dmg', 'deps/SDL3')"
 
+      # gfxtest (the Metal renderer) skips on the runner's paravirtual GPU, where it never finished; a manual run
+      # (workflow_dispatch) runs it anyway and shows what it printed before its 300 s timeout
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+        env:
+          GFXTEST_ON_VM: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
 
       - name: NEX server self-test
         working-directory: tools
