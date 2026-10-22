@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 WORK = Path(__file__).resolve().parent
-PS = Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+PS = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
 SCRIPT = WORK.parent / 'tools/Unlock-All-Fighters.ps1'
 ORIGINAL = runpy.run_path(str(WORK.parent / 'tools/unlock_all.py'), run_name='unlock_reference')
 # The tools check the game version by its main module: 13.0.5's build ID.
@@ -27,6 +27,7 @@ def write_main(tree, build_id):
     path.write_bytes(head)
 
 
+@unittest.skipUnless(PS.exists(), 'Windows PowerShell only')
 class UnlockTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='unlock-test-', dir=WORK)

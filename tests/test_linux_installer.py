@@ -516,6 +516,8 @@ class LauncherTests(unittest.TestCase):
         fake.mkdir()
         (fake / 'ldd').write_text('#!/usr/bin/env bash\necho "libSDL2-2.0.so.0 => /usr/lib/libSDL2-2.0.so.0"\n', newline='\n')
         (fake / 'ldconfig').write_text('#!/usr/bin/env bash\necho "libvulkan.so.1 (libc6,x86-64) => /usr/lib/libvulkan.so.1"\n', newline='\n')
+        for tool in ('ldd', 'ldconfig'):   # (executable, or PATH skips them outside Windows)
+            (fake / tool).chmod(0o755)
         self.env = {**os.environ, 'VK_ICD_FILENAMES': 'icd.json'}
         self.path = fake
 

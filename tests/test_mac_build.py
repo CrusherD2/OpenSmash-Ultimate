@@ -429,7 +429,7 @@ class BuildMacOnMacTests(unittest.TestCase):
         self.ns = load_build_mac(['--port', str(self.tree)], self.tc)
 
     def test_overlay_font(self):
-        """make_overlay_font.m's header: gpu_overlay.c's atlas, in make_overlay_font.py's layout."""
+        """make_overlay_font.m's header: gpu_metal_overlay.m's atlas, in make_overlay_font.py's layout."""
         with contextlib.redirect_stdout(io.StringIO()):
             self.ns['overlay_font']()
         lines = (Path(self.ns['GEN']) / 'overlay_font.h').read_text().splitlines()
@@ -441,7 +441,7 @@ class BuildMacOnMacTests(unittest.TestCase):
         values = [int(v) for row in rows for v in row.rstrip(',').split(',')]
         self.assertEqual(len(values), 27648)
         self.assertTrue(all(0 <= v <= 255 for v in values))
-        overlay = (ROOT / 'runtime' / 'gpu_overlay.c').read_text()
+        overlay = (ROOT / 'runtime' / 'macos' / 'gpu_metal_overlay.m').read_text()   # (its reader on the Mac)
         for name, value in (('CELL_W', 12), ('CELL_H', 24), ('COLS', 16)):
             self.assertIn(f'#define {name} {value}\n', overlay)
 

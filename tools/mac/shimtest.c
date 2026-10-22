@@ -1240,6 +1240,8 @@ u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches, gfx_s
 u64 present_frames(void) { return 0; }
 void gpu_memory_unmapping(u64 addr, u64 size) { (void)addr; (void)size; }   /* (hle_nv.c's: no GPU here) */
 void gfx_report_compiles(void (*line)(const char *text)) { line("(shimtest: no shaders)\n"); }
+void gfx_status_lines(void) {}   /* (the renderer's [status] lines: none here) */
+void settings_args(int argc, char **argv) { (void)argc; (void)argv; }   /* (hle_settings.c's --online: no netplay here) */
 void display_dpi_aware(void) {}
 void fiber_counts(u32 *slots, u32 *finalized, u64 *made) { *slots = *finalized = 0; *made = 0; }
 void *ipc_connect(const char *port) { return !strcmp(port, "sm:") ? (void *)&checks : NULL; }
@@ -1370,7 +1372,9 @@ static const RtFunc main_funcs[] = {{MAIN + 0x100, g_init}, {MAIN + 0x200, g_wai
 static const char *const main_imports[] = {"sdk_value", "hle_test_native"};
 static const u8 main_weak[] = {0, 0};
 static const RtReloc main_relocs[] = {{0x9000, 8, 0}, {0x9008, 0, 1}};
-const RtModule rt_module_main = {"main", MAIN, 0x20000, 0x8000, MAIN + 0x100, main_funcs, 6, NULL, 0, main_imports, main_weak, 2, main_relocs, 2, ""};
+/* (build id: 13.0.5's, which host.c requires of the main module before it starts the game) */
+const RtModule rt_module_main = {"main", MAIN, 0x20000, 0x8000, MAIN + 0x100, main_funcs, 6, NULL, 0, main_imports, main_weak, 2, main_relocs, 2,
+                                 "21450C647B8C5940ED5B68218EA128FD3C5D597D"};
 static const RtFunc subsdk_funcs[] = {{SUBSDK + 0x100, g_init}};
 const RtModule rt_module_subsdk0 = {"subsdk0", SUBSDK, 0x20000, 0x8000, SUBSDK + 0x100, subsdk_funcs, 1, NULL, 0, NULL, NULL, 0, NULL, 0, ""};
 static const RtFunc sdk_funcs[] = {{SDK + 0x100, g_init}, {SDK + 0x200, g_start}};
