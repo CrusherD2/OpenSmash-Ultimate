@@ -120,8 +120,6 @@ was not reproduced in long runs; its cause is **not established**.
      from Nintendo. Ideas: a fight with the F2 overlay, the F1 settings menu, the installer window, the menus.
      Example: ![The settings menu](media/settings.png) -->
 
-![The menus running natively](media/menus.webp)
-
 ## How it works
 
 ```
