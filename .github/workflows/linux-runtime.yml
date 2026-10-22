@@ -1,18 +1,21 @@
 # Linux build (BUILDING_LINUX.md): compile and link the host runtime alone and run the platform self-test. Only the runtime's
 # own sources: no dump, no game files, nothing derived from the game (none is ever on a runner).
-name: Linux runtime
+name: ssbu-recomp Linux runtime
 
 on:
   push:
-    paths: ['runtime/**', 'fighter_sdk/**', 'tests/plat_selftest.c', 'tools/lifter/build.py', 'tools/lifter/build_nro.py', 'scripts/macos/**', 'tools/lifter/**', 'tests/build_opt_sched_test.py', 'scripts/setup.py', 'scripts/linux/**', 'BUILDING_LINUX.md', '.github/workflows/linux-runtime.yml']
+    paths: ['ssbu-recomp/runtime/**', 'ssbu-recomp/fighter_sdk/**', 'ssbu-recomp/tests/plat_selftest.c', 'ssbu-recomp/tools/lifter/build.py', 'ssbu-recomp/tools/lifter/build_nro.py', 'ssbu-recomp/scripts/macos/**', 'ssbu-recomp/tools/lifter/**', 'ssbu-recomp/tests/build_opt_sched_test.py', 'ssbu-recomp/scripts/setup.py', 'ssbu-recomp/scripts/linux/**', 'ssbu-recomp/BUILDING_LINUX.md', '.github/workflows/linux-runtime.yml']
   pull_request:
-    paths: ['runtime/**', 'fighter_sdk/**', 'tests/plat_selftest.c', 'tools/lifter/build.py', 'tools/lifter/build_nro.py', 'scripts/macos/**', 'tools/lifter/**', 'tests/build_opt_sched_test.py', 'scripts/setup.py', 'scripts/linux/**', 'BUILDING_LINUX.md', '.github/workflows/linux-runtime.yml']
+    paths: ['ssbu-recomp/runtime/**', 'ssbu-recomp/fighter_sdk/**', 'ssbu-recomp/tests/plat_selftest.c', 'ssbu-recomp/tools/lifter/build.py', 'ssbu-recomp/tools/lifter/build_nro.py', 'ssbu-recomp/scripts/macos/**', 'ssbu-recomp/tools/lifter/**', 'ssbu-recomp/tests/build_opt_sched_test.py', 'ssbu-recomp/scripts/setup.py', 'ssbu-recomp/scripts/linux/**', 'ssbu-recomp/BUILDING_LINUX.md', '.github/workflows/linux-runtime.yml']
   workflow_dispatch:
 
 jobs:
   host:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: ssbu-recomp   # (the project sits there in this repository)
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +52,7 @@ jobs:
           python scripts/macos/difftest_synthetic.py --work build-linux/work --clang clang-19 --opt=-O1 --cflags=-mcx16
 
       - name: Build and run the platform self-test
-        working-directory: runtime
+        working-directory: ssbu-recomp/runtime
         run: |
           clang-19 -O1 -w -include plat/plat_pre.h -I plat $(pkg-config --cflags sdl3 openssl) ../tests/plat_selftest.c plat_posix.c \
             -o plat_selftest $(pkg-config --libs sdl3 openssl) -lpthread -ldl -lm

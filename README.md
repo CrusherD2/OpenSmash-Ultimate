@@ -75,7 +75,7 @@ CI runs these workflows from [`.github/workflows/`](.github/workflows/):
 | WindowSmash tests | Windows, Linux, macOS | The unit tests and the NEX server self-test. |
 | ssbu-recomp Linux runtime | Linux | ssbu-recomp's host runtime compiles; the synthetic differential test and platform self-test pass; its installer's tools step and log collector work without game files. |
 | ssbu-recomp macOS runtime | macOS (Apple silicon) | The same for macOS, plus what MoltenVK offers on the runner. |
-| No game data | Linux | No Switch files (`.nca`, `.nsp`, `.nsz`, `.xci`, `.nso`, `.nro`, `.arc`), no key files, and no file over 10 MB. |
+| No game data | Linux | No Switch files (`.nca`, `.nsp`, `.nsz`, `.xci`, `.nso`, `.nro`, `.arc`), no key files, and no file over 10 MB, in any commit. |
 
 ## License
 
