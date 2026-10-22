@@ -148,8 +148,8 @@ your dump --> tools/extract --> main executable, SDK, script modules, data
 
 ### Readable source where people edit
 
-A fighter's moves are small scripts. `fighter_sdk/tools` decompiles them into C++ like this (generated on your PC from
-your dump; not stored in this repository):
+A fighter's moves are small scripts. `fighter_sdk/tools` decompiles them into C++ of this shape (generated on your PC
+from your dump; not stored in this repository; the game's values are left out here):
 
 ```cpp
 ACMD(mario, game_attack11) {

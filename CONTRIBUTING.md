@@ -40,7 +40,7 @@ The README and the guides say what was tested and what was not. Keep it that way
 
 ## Using AI
 
-Both projects were built largely with AI coding agents, and say so. AI-assisted contributions are welcome on the same terms as any other: you understand what you submit, you ran it, and the three rules hold. Tell us in the pull request what was AI-written and how you checked it. An unverified AI answer about how the game or the console works is not evidence; a test is.
+Both projects were built largely with AI coding agents: ssbu-recomp's README says so, and almost every WindowSmash commit names Claude as co-author. AI-assisted contributions are welcome on the same terms as any other: you understand what you submit, you ran it, and the three rules hold. Tell us in the pull request what was AI-written and how you checked it. An unverified AI answer about how the game or the console works is not evidence; a test is.
 
 ## Ways to help
 
@@ -64,13 +64,14 @@ Both builds generate several gigabytes of files that git ignores.
 
 The base's source-only tests use made-up data, need no game files and run in CI on Windows, Linux and macOS. Run them before you open a pull request:
 
-```bash
+```
 python -m pip install -r tests/requirements-dev.txt
 python -m unittest discover -s tests -v
-cd tools && python -m nex.selftest
+cd tools
+python -m nex.selftest
 ```
 
-Tests that start the game should use the test modes instead of real-time play: speed-up, movie skip, direct choice of fighters and stage, a fixed end after a number of fight frames. Frame-time measurements are the exception and run at normal speed.
+Tests that start the game should be scripted, not played by hand. The base presses buttons on a timetable (`SSBU_INPUT`), saves frames (`SSBU_CAPTURE`) and has run scripts in `tools/dev/` such as `autobattle.sh` and `menurun.sh` (see the [tool reference](docs/TECHNICAL.md#7-tool-reference)). ssbu-recomp also has test modes the base doesn't have yet: speed-up, movie skip, direct choice of fighters and stage, and a fixed end after a number of fight frames (`ssbu-recomp/tests/DEBUG_MODE.md`). Frame-time measurements run at normal speed.
 
 Two checks carry most of the weight:
 
@@ -94,7 +95,7 @@ Before attaching a log, check that it contains nothing personal (user names in p
 
 ## Code
 
-- **Languages.** The runtime is C (C11), the tools are Python 3.10 or newer, ssbu-recomp's fighter SDK is C++. No new dependencies without discussion; the runtime builds with clang and a handful of official libraries.
+- **Languages.** The runtime is mostly C, in clang's default GNU dialect (it uses GNU builtins and extensions). The macOS window and Metal renderer are Objective-C, the macOS fiber switch is assembly, and Linux exception handling (`runtime/linux/eh.cpp`) and ssbu-recomp's settings menu are C++. ssbu-recomp's Linux build needs clang 19 or newer, for C23's `typeof_unqual`. The tools are Python 3.10 or newer; ssbu-recomp's fighter SDK is C++. No new dependencies without discussion; the runtime builds with clang and a handful of official libraries.
 - **Style.** Match the file you are editing: its naming, its comment density, its layout. Comments explain *why* and record what was measured, not what the next line does.
 - **Switches.** Anything experimental or test-only goes behind an option or an environment variable that defaults to the old behaviour, with one line of documentation where the other switches are listed.
 - **Game-specific knowledge** (an address, a structure layout, a table size) is written with how it was found: seen in the binary at an address, taken from a public source, or inferred. An inference is marked as one.
@@ -105,7 +106,7 @@ Before attaching a log, check that it contains nothing personal (user names in p
 
 - Write commit messages that say what changed and why. Mention the test you ran.
 - By contributing you agree that your contribution is licensed under the project's licence, the GNU General Public License version 3 or later (GPL-3.0-or-later, see [`LICENSE`](LICENSE)), and that you have the right to contribute it.
-- Keep personal data out of commits: no local paths with user names, no e-mail addresses in files.
+- Keep personal data out of commits: no local paths with user names, and no e-mail addresses in code, docs, tests or logs. The exceptions are `.mailmap`, which joins one person's commit identities, and the unchanged `AUTHORS` files of the libraries in `third_party/`.
 
 ## Conduct
 

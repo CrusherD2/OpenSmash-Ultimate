@@ -21,7 +21,7 @@ Anything that could harm a player or their computer, for example:
 - the online services: the lobby, the relay and the game server (NEX), and anything they log or expose about players;
 - a way for this repository, its CI or its releases to end up holding game data or secrets.
 
-This covers this repository and, while players still use them, the WindowSmash and ssbu-recomp repositories and the servers they connect to.
+This covers the code, CI and releases of this repository and, while players still install from them, of the WindowSmash and ssbu-recomp repositories in the same organization. It also covers the public lobby and game servers the project's maintainers run. Problems in services the installers, builds or CI download from (GitHub, MSYS2, eden, Microsoft and others) belong to those services: please report them there.
 
 ## What happens next
 

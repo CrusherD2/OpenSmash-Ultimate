@@ -14,7 +14,7 @@ Both projects' full histories are in this repository. WindowSmash's recompiler a
 | Where | What it is | State |
 | :--- | :--- | :--- |
 | Repository root | WindowSmash: recompiler, runtime, installer, tests and guides, at their original paths | Builds and plays today. Its unit tests run in CI on Windows, Linux and macOS. |
-| [`ssbu-recomp/`](ssbu-recomp/) | ssbu-recomp's whole tree, with its history | Staged, waiting to be ported. The root build and installer don't use it. Its runtime still compiles in CI on Linux and macOS. |
+| [`ssbu-recomp/`](ssbu-recomp/) | ssbu-recomp's tree, with its history | Staged, waiting to be ported. The root build and installer don't use it. Its runtime still compiles in CI on Linux and macOS. |
 
 This first step changes nothing about how either project builds or runs. Later steps bring in ssbu-recomp's Vulkan renderer, installer and prebuilt runtime, settings menu, modding and rollback netcode, and move files into their final places as each area is ported.
 
@@ -37,14 +37,14 @@ You need game version 13.0.5 and a 64-bit Windows 10 or 11 PC with an AVX2 proce
 
 ## `ssbu-recomp/`: staged code
 
-[`ssbu-recomp/`](ssbu-recomp/) holds ssbu-recomp as it was when it was imported, with its history, so `git log` and `git blame` still show who wrote what. Each part moves out of the folder when it is ported, and the folder goes when it is empty.
+[`ssbu-recomp/`](ssbu-recomp/) holds ssbu-recomp as it was when it was imported, with its history, so `git log` and `git blame` still show who wrote what. Since then, its two CI workflows have moved to [`.github/workflows/`](.github/workflows/), where GitHub runs them, and its README has lost two things taken from the game: the image line for the removed `media/menus.webp`, and the values in its example of a decompiled fighter script. Each part moves out of the folder when it is ported, and the folder goes when it is empty.
 
-If you play ssbu-recomp, keep using [its own repository](https://github.com/OpenSmash-Ultimate/ssbu-recomp) for now: its installer, updates and prebuilt runtime still come from there.
+If you play ssbu-recomp, keep using [its own repository](https://github.com/OpenSmash-Ultimate/ssbu-recomp) for now: its installer, updates and prebuilt runtime still come from there. Its scripts still name the repository's old address, `Denkishi/ssbu-recomp`, which GitHub forwards to the same place.
 
 Three files were removed from ssbu-recomp's history on import because they hold material taken from the game:
 
-- `media/menus.webp`, a capture of the running game;
-- `tools/lifter/patches/kinds.txt` and `kinds_1305.txt`, instruction words from the game's code. `tools/lifter/patches/kinds_scan.py` makes them again from your own dump.
+- `ssbu-recomp/media/menus.webp`, a capture of the running game;
+- `ssbu-recomp/tools/lifter/patches/kinds.txt` and `kinds_1305.txt`: instruction words from the game's code, in patches for new fighter kinds that are off by default. [`kinds_scan.py`](ssbu-recomp/tools/lifter/patches/kinds_scan.py), in the same folder, makes `kinds.txt` again from your own 13.0.4 dump. Nothing makes `kinds_1305.txt` again yet.
 
 ## Getting help
 
@@ -60,12 +60,13 @@ Three files were removed from ssbu-recomp's history on import because they hold 
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. Its three rules hold for every change: nothing derived from the game goes into the repository, clean sources only, and every claim is measured.
 
-WindowSmash's source-only tests use made-up data and need no game files:
+WindowSmash's source-only tests use made-up data and need no game files. Run them from the repository root, in PowerShell or a Unix shell:
 
-```bash
+```
 python -m pip install -r tests/requirements-dev.txt
 python -m unittest discover -s tests -v
-cd tools && python -m nex.selftest
+cd tools
+python -m nex.selftest
 ```
 
 CI runs these workflows from [`.github/workflows/`](.github/workflows/):
@@ -73,8 +74,8 @@ CI runs these workflows from [`.github/workflows/`](.github/workflows/):
 | Workflow | Runs on | What it checks |
 | :--- | :--- | :--- |
 | WindowSmash tests | Windows, Linux, macOS | The unit tests and the NEX server self-test. |
-| ssbu-recomp Linux runtime | Linux | ssbu-recomp's host runtime compiles; the synthetic differential test and platform self-test pass; its installer's tools step and log collector work without game files. |
-| ssbu-recomp macOS runtime | macOS (Apple silicon) | The same for macOS, plus what MoltenVK offers on the runner. |
+| ssbu-recomp Linux runtime | Linux | ssbu-recomp's host runtime compiles; its synthetic differential test, platform self-test and compile-scheduler test pass; `setup.py --tools-only` finds every tool and library the build needs; its log collector leaves game files out of a report. Its installer script, `install_deps.sh`, is only checked for syntax: the workflow installs the packages itself. |
+| ssbu-recomp macOS runtime | macOS (Apple silicon) | The same on macOS, where `install_mac.sh` does run. It also builds the glslang shim, checks that `setup.py` stops at the dump check when given an empty dump, and reports what MoltenVK offers on the runner. |
 | No game data | Linux | No Switch files (`.nca`, `.nsp`, `.nsz`, `.xci`, `.nso`, `.nro`, `.arc`), no key files, and no file over 10 MB, in any commit. |
 
 ## License
