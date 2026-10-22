@@ -46,8 +46,6 @@ Without `aoc.cfg`, the game sees no DLC. To make one from your own DLC files:
 
 The next time the game starts, it may announce new fighters, stages, music or costumes. In multiplayer, every player should have the same DLC.
 
-**With a runtime package**, give `launchers\Configure Game Data.bat` an `aoc.cfg` you already have when it asks. Packages never include anyone's DLC list.
-
 ## Unlock every base-game fighter
 
 The game starts with only the original eight fighters unlocked. `launchers\Unlock All Fighters.bat` unlocks the rest of the base-game roster on your own save.
