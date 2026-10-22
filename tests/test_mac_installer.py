@@ -263,6 +263,7 @@ class UnlockTests(unittest.TestCase):
                       + ('launchers/Unlock All Fighters.command' if DARWIN else 'Unlock All Fighters') + ' again.', r.stderr)
 
 
+@unittest.skipUnless(DARWIN, "needs macOS's security tool and its root certificates")
 class CertificateTests(unittest.TestCase):
     def test_python_without_certificates(self):
         import ssl

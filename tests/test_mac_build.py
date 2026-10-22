@@ -815,6 +815,7 @@ class BuildGameMacTests(unittest.TestCase):
     def setUp(self):
         self.g = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_folders')['ask_folder'].__globals__
 
+    @unittest.skipIf(os.name == 'nt', "a Mac or Linux terminal's escaping, on real folders (this host's paths hold backslashes)")
     def test_dragged_folders(self):
         """A folder dragged into Terminal comes escaped as the shell would (My\\ Games, with a
         space after it); on Windows in quotes."""
