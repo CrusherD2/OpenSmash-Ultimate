@@ -37,14 +37,15 @@ You need game version 13.0.5 and a 64-bit Windows 10 or 11 PC with an AVX2 proce
 
 ## `ssbu-recomp/`: staged code
 
-[`ssbu-recomp/`](ssbu-recomp/) holds ssbu-recomp as it was when it was imported, with its history, so `git log` and `git blame` still show who wrote what. Since then, its two CI workflows have moved to [`.github/workflows/`](.github/workflows/), where GitHub runs them, and its README has lost two things taken from the game: the image line for the removed `media/menus.webp`, and the values in its example of a decompiled fighter script. Each part moves out of the folder when it is ported, and the folder goes when it is empty.
+[`ssbu-recomp/`](ssbu-recomp/) holds ssbu-recomp as it was when it was imported, with its history, so `git log` and `git blame` still show who wrote what. Since then, its two CI workflows have moved to [`.github/workflows/`](.github/workflows/), where GitHub runs them, and its README has lost the image line for the removed `media/menus.webp`. Each part moves out of the folder when it is ported, and the folder goes when it is empty.
 
 If you play ssbu-recomp, keep using [its own repository](https://github.com/OpenSmash-Ultimate/ssbu-recomp) for now: its installer, updates and prebuilt runtime still come from there. Its scripts still name the repository's old address, `Denkishi/ssbu-recomp`, which GitHub forwards to the same place.
 
-Three files were removed from ssbu-recomp's history on import because they hold material taken from the game:
+Material taken from the game was removed from every commit of ssbu-recomp's history on import:
 
-- `ssbu-recomp/media/menus.webp`, a capture of the running game;
-- `ssbu-recomp/tools/lifter/patches/kinds.txt` and `kinds_1305.txt`: instruction words from the game's code, in patches for new fighter kinds that are off by default. [`kinds_scan.py`](ssbu-recomp/tools/lifter/patches/kinds_scan.py), in the same folder, makes `kinds.txt` again from your own 13.0.4 dump. Nothing makes `kinds_1305.txt` again yet.
+- the file `ssbu-recomp/media/menus.webp`, a capture of the running game;
+- the files `ssbu-recomp/tools/lifter/patches/kinds.txt` and `kinds_1305.txt`: instruction words from the game's code, in patches for new fighter kinds that are off by default. [`kinds_scan.py`](ssbu-recomp/tools/lifter/patches/kinds_scan.py), in the same folder, makes `kinds.txt` again from your own 13.0.4 dump. Nothing makes `kinds_1305.txt` again yet;
+- in `ssbu-recomp/README.md`, the game's values in its example of a decompiled fighter script (Mario's `game_attack11`): its frame, wait and attack numbers are placeholders in every version.
 
 ## Getting help
 

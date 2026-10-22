@@ -100,6 +100,6 @@ None of these is in the repository. Their own licenses apply when you obtain, li
 
 ## Game content and names
 
-The Git source tree contains no Nintendo game binaries, translated game functions, assets, firmware fonts, keys, firmware or personal saves. Each player builds the game on their own PC from their own copy, and game-data archives, firmware fonts, keys and saves stay with the player. Three files with material from the game were stripped from ssbu-recomp's history when it was imported; [the README](README.md#ssbu-recomp-staged-code) names them.
+The Git source tree contains no Nintendo game binaries, translated game functions, assets, firmware fonts, keys, firmware or personal saves. Each player builds the game on their own PC from their own copy, and game-data archives, firmware fonts, keys and saves stay with the player. Material from the game was stripped from every commit of ssbu-recomp's history when it was imported (three files, and the game's values in an example in its README); [the README](README.md#ssbu-recomp-staged-code) names them.
 
 Super Smash Bros. Ultimate and associated names are the property of their respective owners. OpenSmash-Ultimate is an independent project and is not affiliated with Nintendo.
