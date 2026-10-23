@@ -65,6 +65,7 @@ static void test_parse(void) {
     bad("@", "a mark's name");
     bad("@draws", "expected ':'");
     bad("@draws:20-10", "low end is above");
+    bad("@draws:11-10", "low end is above");
     bad("@draws:10", "expected <lo>-<hi>");
     bad("@draws:1-2/0", "count of 1 or more");
     bad("@until:1-2:A/8", "period must be longer");
@@ -164,6 +165,25 @@ static void test_waits(void) {
     run(10, 0, k);  /* ticks 6-15, out of range again: the press ends after 8, the next at 13 */
     CHECK(k[2] == B && !k[3] && k[7] == B, "@until: the next press at its period");
 
+    parse("@until:5-5/3:B/10");
+    run(1, 5, k);
+    CHECK(!k[0], "@until: no press at once when the count is already in range");
+    run(2, 5, k);
+    CHECK(!k[0] && !k[1] && seq_finished(&s), "@until: and the wait ends after 3 ticks, with no press");
+
+    parse("@until:5-5/4:B/10 0:A/1");
+    run(10, 0, k);   /* ticks 1-10: B from 1 to 8 */
+    run(3, 5, k);    /* ticks 11-13: the next press is due at 11, but the count is in range (not yet for 4) */
+    CHECK(!k[0] && !k[1] && !k[2], "@until: no press due while the count is in range");
+    run(1, 0, k);    /* tick 14: out of range again */
+    CHECK(k[0] == B, "@until: the press due comes on the first tick out of range");
+    run(7, 0, k);    /* ticks 15-21: the rest of it */
+    CHECK(k[6] == B, "@until: that press held for 8 ticks");
+    run(4, 5, k);    /* ticks 22-25: in range for 4 (a press due at 24 does not come) */
+    CHECK(!k[0] && !k[1] && !k[2] && !k[3] && s.index == 1, "@until: no press due at 24, and the wait ends at 25");
+    run(1, 5, k);
+    CHECK(k[0] == A, "and the next step starts at 26");
+
     parse("@untilmark:ok:X/10/2 0:A/1");
     run(25, -1, k);
     ok = 1;
@@ -221,6 +241,7 @@ static void test_speed(void) {
     CHECK(speed_due(0, 1000, 10) == 1010, "the first refresh a step from now");
     CHECK(speed_due(1010, 1005, 10) == 1020, "a step after the last, when early");
     CHECK(speed_due(1020, 1055, 10) == 1030, "up to four steps behind: still one step on (catching up)");
+    CHECK(speed_due(1020, 1070, 10) == 1030, "exactly four steps behind: still one step on");
     CHECK(speed_due(1030, 1100, 10) == 1100, "further behind: from now, no burst");
 }
 

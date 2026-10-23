@@ -29,8 +29,9 @@ static Seq seq;
 static int seq_on, seq_keyboard, seq_log_every;
 static SeqStepsFn *volatile seq_steps;
 static volatile long seq_draws = -1;   /* draw calls of the last frame shown (-1: none yet) */
+enum { SEQ_MARKS = 512 };   /* (a mark per module the game loads, and a few more) */
 static SRWLOCK seq_marks_lock = SRWLOCK_INIT;
-static char seq_marks[128][SEQ_TEXT];
+static char seq_marks[SEQ_MARKS][SEQ_TEXT];
 static int seq_mark_count;
 
 static BOOL CALLBACK seq_start(PINIT_ONCE once, PVOID param, PVOID *ctx) {
@@ -43,6 +44,10 @@ static BOOL CALLBACK seq_start(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         fprintf(stderr, "[seq] SSBU_SEQ: %s\n", why);
         fflush(stderr);
         exit(2);
+    }
+    if (n == 0) {   /* (as an empty SSBU_SPEED: e.g. SSBU_SEQ="$(cat run.seq)" of a missing file) */
+        fprintf(stderr, "[seq] SSBU_SEQ has no steps: no sequence, player 1 plays as usual\n");
+        return TRUE;
     }
     seq_keyboard = (v = getenv("SSBU_SEQ_KEYBOARD")) && atoi(v) != 0;
     seq_log_every = (v = getenv("SSBU_SEQ_LOG")) ? atoi(v) : 0;
@@ -69,13 +74,13 @@ static int seq_seen(const char *mark, void *unused) {
 
 void input_seq_mark(const char *what) {
     if (!input_seq_on()) return;
-    int known = 0;
+    int known = 0, kept = 0;
     AcquireSRWLockExclusive(&seq_marks_lock);
     for (int i = 0; i < seq_mark_count && !known; i++) known = !strcmp(seq_marks[i], what);
-    if (!known && seq_mark_count < (int)(sizeof seq_marks / sizeof *seq_marks))
-        snprintf(seq_marks[seq_mark_count++], sizeof seq_marks[0], "%s", what);
+    if (!known && (kept = seq_mark_count < SEQ_MARKS)) snprintf(seq_marks[seq_mark_count++], sizeof seq_marks[0], "%s", what);
     ReleaseSRWLockExclusive(&seq_marks_lock);
-    if (!known) fprintf(stderr, "[seq] mark %s\n", what);
+    if (kept) fprintf(stderr, "[seq] mark %s\n", what);
+    else if (!known) fprintf(stderr, "[seq] mark %s not kept: %d marks already, so a step waiting for it waits for ever\n", what, SEQ_MARKS);
 }
 
 void input_seq_set_steps(SeqStepsFn *steps_per_poll) { seq_steps = steps_per_poll; }

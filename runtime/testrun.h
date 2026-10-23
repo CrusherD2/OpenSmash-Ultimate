@@ -1,6 +1,6 @@
 /* The arithmetic of two test-run switches (docs/TESTING-RUNS.md), apart from the runtime so that
  * tools/dev/testruntest.c can check it: SSBU_SPEED's pacing (gpu_display.c) and SSBU_SKIP_MOVIES'
- * sample budget (hle_movie.c). */
+ * sample budget (hle_movie_skip.c). */
 #pragma once
 #include <stdint.h>
 #include <stdlib.h>

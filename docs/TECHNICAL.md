@@ -301,9 +301,9 @@ Checked-in code defines the recompiler and native runtime. Local game inputs sup
 
 ## Test runs
 
-Switches for scripted runs. Each is off unless it is set, and the game then runs exactly as before. [TESTING-RUNS.md](TESTING-RUNS.md) says what each one guarantees and gives an example.
+Switches for scripted runs. Each is off unless it is set, and the game then runs exactly as before. They have been tested offline on made-up input only, and not yet run with the game. [TESTING-RUNS.md](TESTING-RUNS.md) says what each one is built to do, what rests on ssbu-recomp's measurements, and what a run still has to check. It also gives an example.
 
-- `SSBU_SPEED`: fast-forward. The game gets one refresh per frame shown, at n × 60 a second, or uncapped with 0. Audio is not touched.
+- `SSBU_SPEED`: fast-forward. The game gets one refresh per frame shown, at n × 60 a second, or uncapped with 0, and none while no frame is ready. Audio is not touched.
 - `SSBU_SEQ`: player 1's input as a sequence counted in the game's frames. It can wait for marks and for screens known by their draw count. `SSBU_SEQ_LOG` logs those counts, and `SSBU_SEQ_KEYBOARD` keeps the keyboard playing.
 - `SSBU_SKIP_MOVIES`: each movie's stream ends after a few samples, and the game ends the movie itself.
 

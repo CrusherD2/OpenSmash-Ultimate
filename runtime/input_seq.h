@@ -15,11 +15,14 @@
  *   @draws:<lo>-<hi>[/<n>]      wait until the frames shown had lo..hi draw calls each for n
  *                               ticks in a row (20 if not given): a screen known by its draw count
  *   @until:<lo>-<hi>[/<n>]:<keys>[/<p>]
- *                               press the keys (8 ticks) at once and again every p ticks (200
- *                               if not given) until the draw count has been in lo..hi for n
- *                               ticks in a row; a press under way is finished first
+ *                               press the keys (8 ticks) until the draw count has been in lo..hi
+ *                               for n ticks in a row: at once, and p ticks after a press began
+ *                               (200 if not given), each on a tick the count is out of range; a
+ *                               press under way is finished first
  *   @untilmark:<mark>:<keys>[/<p>[/<h>]]
- *                               the same until the mark has been raised, with presses of h ticks
+ *                               press the keys (h ticks, 8 if not given) at once and again every
+ *                               p ticks (200) until the mark has been raised; a press under way
+ *                               is finished first
  * A step that waits ends on the tick its condition is met, and the next step starts on the tick
  * after. Holds are exact: "0:A/3 2:B" is A for ticks 1-3, nothing for 4-5, B for 6-13. */
 #pragma once
@@ -55,7 +58,8 @@ typedef void SeqLogFn(const char *line, void *user);
 typedef int SeqStepsFn(void);                                /* ticks for this poll */
 enum { SEQ_MAX_TICKS = 1000 };
 
-/* Reads a sequence into s, ready to run. Returns its steps, or -1 with `why` naming the step. */
+/* Reads a sequence into s, ready to run. Returns its steps (0: none, as for NULL, "" or only
+ * comments), or -1 with `why` naming the step. */
 int seq_parse(Seq *s, const char *text, char *why, size_t why_size);
 /* One tick, with the draw calls of the last frame shown (-1: none yet). Returns 1 when s->said
  * says what it did (a press began, a wait ended). */
@@ -67,8 +71,9 @@ int seq_finished(const Seq *s);
 long seq_poll(Seq *s, SeqStepsFn *steps, long draws, SeqSeenFn *seen, SeqLogFn *log, void *user);
 
 /* ---- the runtime's side (hle_hid.c) ---------------------------------------------------- */
-/* SSBU_SEQ is set (and read: a sequence that does not parse stops the program at its first use,
- * which main makes at start-up through movie_test_start). */
+/* SSBU_SEQ is set and has steps (an empty one is as unset). It is read at the first call, which
+ * main makes at start-up through movie_test_start: a sequence that does not parse stops the
+ * program there. */
 int input_seq_on(void);
 /* Any thread: something the sequence can wait for happened (@<what>). "movie" when a movie's
  * stream is opened (hle_movie_skip.c), "module:<name>" when the game has loaded that module

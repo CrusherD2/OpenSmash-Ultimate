@@ -2,7 +2,8 @@
 and numbers: SSBU_SEQ's parser and step machine (runtime/hle_input_seq.c: parse errors, exact holds,
 waits, the steps hook, the end), SSBU_SPEED's pacing and SSBU_SKIP_MOVIES' count (runtime/testrun.h)
 and the game address mapping (runtime/game_addr.h); and the documentation's example sequence, which
-must parse. Plain C: clang-cl on Windows (skipped without it), clang elsewhere."""
+must parse; and that SSBU_SPEED gives a refresh only for a frame shown (runtime/ipc_vi.c). Plain
+C: clang-cl on Windows (skipped without it), clang elsewhere."""
 from pathlib import Path
 import os
 import re
@@ -66,6 +67,21 @@ class TestRunToolTests(unittest.TestCase):
         r = self.run_test(path)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout, '7 steps\n')
+
+
+class SpeedLoopTests(unittest.TestCase):
+    """SSBU_SPEED has no clock of refreshes (docs/TESTING-RUNS.md): runtime/ipc_vi.c's speed loop
+    signals the game's vsync event in one place only, right after it showed a frame. A refresh
+    with no frame (as an idle refresh after a stall would be) counts as a dropped frame in the
+    game and runs an extra logic frame."""
+
+    def test_one_refresh_per_frame_shown(self):
+        text = (ROOT / 'runtime' / 'ipc_vi.c').read_text(encoding='utf-8')
+        m = re.search(r'^static void speed_loop\(void\) \{\n(.*?)^\}\n', text, re.S | re.M)
+        self.assertIsNotNone(m, 'no speed_loop in runtime/ipc_vi.c')
+        body = m.group(1)
+        self.assertEqual(body.count('kernel_signal_event('), 1, body)
+        self.assertRegex(body, r'if \(oldest >= 0\) \{\s*show\(\);\s*frames\+\+;\s*kernel_signal_event\(queue\.vsync_event\);')
 
 
 class DocumentedTests(unittest.TestCase):

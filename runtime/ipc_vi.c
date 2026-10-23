@@ -92,41 +92,42 @@ static void show(void) {
 
 /* SSBU_SPEED (docs/TESTING-RUNS.md): no clock of refreshes. Each frame the game queues is shown
  * at its time - n x 60 a second, or at once when uncapped - and makes exactly one refresh, so
- * the game steps one frame per frame shown however fast this PC is. While nothing is queued for
- * IDLE_MS, one refresh is given anyway (and counted in the log), in case the game waits for one
- * before it draws. */
-#define IDLE_MS 100
+ * the game counts one refresh per frame shown however fast this PC is. With nothing queued there
+ * is no refresh, however long that lasts (a load, a shader compile): the game would count one as
+ * a dropped frame and run an extra logic frame. ssbu-recomp ran no vsync thread at all in this
+ * mode and the game still booted to a fight (ssbu-recomp/tests/DEBUG_MODE.md). Meanwhile the
+ * loop only wakes to write the second's line. */
 static void speed_loop(void) {
-    u64 frames = 0, idle = 0, second = GetTickCount64();
+    u64 frames = 0, second = GetTickCount64();
     for (;;) {
         queue_lock();
-        u64 since = GetTickCount64();
         int queued = 0;
         for (;;) {
             for (int i = 0; i < SLOTS && !queued; i++) queued = queue.slots[i].state == QUEUED;
-            u64 waited = GetTickCount64() - since;
-            if (queued || waited >= IDLE_MS) break;
+            u64 waited = GetTickCount64() - second;
+            if (queued || waited >= 1000) break;
             queue_holder = 0;   /* (asleep, not holding it) */
-            SleepConditionVariableSRW(&queue.queued, &queue.lock, (DWORD)(IDLE_MS - waited), 0);
+            SleepConditionVariableSRW(&queue.queued, &queue.lock, (DWORD)(1000 - waited), 0);
             queue_held_since = GetTickCount64();
             queue_holder = GetCurrentThreadId();
         }
         queue_unlock();
-        int oldest = -1;
         if (queued) {
             display_speed_tick();   /* (only this thread takes a queued buffer: it is still there) */
             queue_lock();
-            oldest = take_oldest();
+            int oldest = take_oldest();
             queue_unlock();
+            if (oldest >= 0) {
+                show();
+                frames++;
+                kernel_signal_event(queue.vsync_event);   /* the frame's one refresh */
+            }
         }
-        if (oldest >= 0) { show(); frames++; }
-        else idle++;
-        kernel_signal_event(queue.vsync_event);
         u64 now = GetTickCount64();
         if (now - second >= 1000) {
-            fprintf(stderr, "[display] speed: %llu frames shown in the last %.2f s (%.0f a second), %llu idle refreshes\n",
-                    (unsigned long long)frames, (now - second) / 1000.0, frames * 1000.0 / (double)(now - second), (unsigned long long)idle);
-            frames = idle = 0;
+            fprintf(stderr, "[display] speed: %llu frames shown in the last %.2f s (%.0f a second)\n", (unsigned long long)frames,
+                    (now - second) / 1000.0, frames * 1000.0 / (double)(now - second));
+            frames = 0;
             second = now;
         }
     }
@@ -157,7 +158,7 @@ static void start(void) {
     double speed = display_speed();
     speed_mode = speed != 1;
     report_draws = input_seq_on();
-    if (speed_mode) fprintf(stderr, "[display] SSBU_SPEED=%g: one refresh per frame shown, %s\n", speed, speed > 0 ? "paced at n x 60 a second" : "uncapped");
+    if (speed_mode) fprintf(stderr, "[display] SSBU_SPEED=%g: one refresh per frame shown and none without one, %s\n", speed, speed > 0 ? "paced at n x 60 a second" : "uncapped");
     CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
 }
 
