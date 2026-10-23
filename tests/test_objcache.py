@@ -30,9 +30,10 @@ REAL_RUN = subprocess.run
 # it is given (.c or .cpp) into the object named by -o or /Fo, as a line naming the source and the
 # rest of the command; a source with "#error" is an error in the code, one with "crash at /O2" makes
 # it crash at /O2 (as cc.py tells a crash), one with "half-written" leaves half an object and fails.
-# Each run is added to runs.txt beside it: "<source> <level>".
+# Each run leaves a file of its own in runs/ beside it: "<source> <level>". (One shared file would
+# lose lines when two compiles of a parallel build append at once: on Windows, appends aren't atomic.)
 FAKE_CC = r'''
-import os, sys
+import os, sys, tempfile
 here = os.path.dirname(os.path.abspath(__file__))
 args = sys.argv[1:]
 if args == ["--version"]:
@@ -42,7 +43,9 @@ if args == ["--version"]:
 src = next(a for a in args if a.endswith((".c", ".cpp")))
 obj = args[args.index("-o") + 1] if "-o" in args else next(a[3:] for a in args if a.startswith("/Fo"))
 level = next(a for a in args if a in ("/O1", "/O2", "-O0", "-O1", "-O2"))
-with open(os.path.join(here, "runs.txt"), "a") as f:
+os.makedirs(os.path.join(here, "runs"), exist_ok=True)
+fd, _ = tempfile.mkstemp(dir=os.path.join(here, "runs"), suffix=".txt")
+with os.fdopen(fd, "w") as f:
     f.write(os.path.basename(src) + " " + level + "\n")
 with open(src) as f:
     text = f.read()
@@ -88,10 +91,11 @@ class FakeCompiler:
 
     def runs(self):
         """The compiles since the last call, sorted: ["<source> <level>", ...]."""
-        path = self.folder / 'runs.txt'
-        text = path.read_text() if path.exists() else ''
-        path.write_text('')
-        return sorted(text.splitlines())
+        lines = []
+        for path in sorted((self.folder / 'runs').glob('*.txt')):
+            lines += path.read_text().splitlines()
+            path.unlink()
+        return sorted(lines)
 
     def patch(self):
         def run(args, **kw):
