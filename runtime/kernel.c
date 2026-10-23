@@ -217,6 +217,74 @@ int kernel_read64(u64 addr, u64 *out) {
     return ok;
 }
 
+/* ---- memory mappings (svcMapMemory) ------------------------------------------------
+ * On the console a mapping's pages appear at its destination, and its source is locked (no
+ * access at all) until the unmap. Here the destination is a copy, written back over the source
+ * at the unmap: the same to a game that keeps to the console's rules, for two copies and the
+ * destination's memory. (An alias needs the source in memory that can be mapped twice: a
+ * section on Windows, whose views cannot be decommitted with VirtualFree or write-watched; a
+ * shared mapping on Linux; on macOS anonymous memory will do, but in 16 KiB pages, not the
+ * guest's 4 KiB. The heap and the alias area would have to be allocated that way.) The status
+ * line says what the copies cost.
+ *
+ * SSBU_MAP_GUARD=1 makes the source inaccessible while it is mapped, as on the console, so that
+ * a stray access to it faults - and the crash report names the guest function - rather than
+ * read what the copy left there or write what the unmap overwrites. Guarded: a source that is
+ * read-write memory in the memory map, outside the alias area (where the write watch sets the
+ * pages' protection itself, on macOS and on Linux before 6.7); on macOS only the 16 KiB host
+ * pages wholly inside it (a host page it shares with other memory stays as it is). */
+#ifdef __APPLE__
+#define HOST_PAGE 0x4000ull
+#else
+#define HOST_PAGE 0x1000ull
+#endif
+static struct { u64 lo, hi; } guarded[1024];   /* (a slot of maps each) the source's pages made inaccessible */
+static int map_guard;
+static u64 maps_made, maps_guarded, map_bytes, map_copy_ns;
+static u32 maps_live, maps_peak;
+
+/* Whether the memory map has all of [base, base + size) as read-write memory. */
+static int read_write(u64 base, u64 size) {
+    u32 i = 0, hi = region_count;
+    while (i < hi) {
+        u32 mid = (i + hi) / 2;
+        if (regions[mid].base + regions[mid].size <= base) i = mid + 1;
+        else hi = mid;
+    }
+    for (u64 at = base; at < base + size; i++) {
+        if (i == region_count || regions[i].base > at || (regions[i].perm & 3) != 3) return 0;
+        at = regions[i].base + regions[i].size;
+    }
+    return 1;
+}
+
+static void guard_source(u32 i) {
+    u64 lo = (maps[i].src + HOST_PAGE - 1) & ~(HOST_PAGE - 1), hi = (maps[i].src + maps[i].size) & ~(HOST_PAGE - 1);
+    DWORD old;
+    if (lo >= hi || !read_write(maps[i].src, maps[i].size) || (maps[i].src < ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE < maps[i].src + maps[i].size) ||
+        !VirtualProtect(G2H(lo), hi - lo, PAGE_NOACCESS, &old))
+        return;
+    guarded[i].lo = lo; guarded[i].hi = hi;
+    maps_guarded++;
+}
+
+static void unguard_source(u32 i) {
+    DWORD old;
+    if (guarded[i].hi && !VirtualProtect(G2H(guarded[i].lo), guarded[i].hi - guarded[i].lo, PAGE_READWRITE, &old))
+        rt_fatal("kernel: cannot make the source of the mapping at %#llx accessible again (error %lu)", maps[i].dst, (unsigned long)GetLastError());
+    guarded[i].lo = guarded[i].hi = 0;
+}
+
+/* For the status lines: the mappings made and what their copies took. */
+void kernel_map_status(void) {
+    EnterCriticalSection(&klock);
+    fprintf(stderr, "[status] memory mappings: %llu made (%.1f MiB in all), %u mapped now (at most %u at once, of 1024); %.1f ms copying",
+            maps_made, (double)map_bytes / (1 << 20), maps_live, maps_peak, (double)map_copy_ns / 1e6);
+    if (map_guard) fprintf(stderr, "; %llu sources made inaccessible while mapped (SSBU_MAP_GUARD)", maps_guarded);
+    fprintf(stderr, "\n");
+    LeaveCriticalSection(&klock);
+}
+
 static void *commit(u64 at, u64 size, const char *what) {
     void *p = VirtualAlloc(G2H(at), size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) rt_fatal("kernel: cannot commit %llu KiB at %#llx for %s (error %lu)", size >> 10, at, what, (unsigned long)GetLastError());
@@ -515,25 +583,35 @@ void rt_svc(Cpu *c, u32 n) {
         break;
     }
     case 0x02: case 0x03: x[0] = R_OK; break;            /* SetMemoryPermission / SetMemoryAttribute */
-    case 0x04: {   /* MapMemory(dst, src, size): the pages appear at dst; here, as a copy */
+    case 0x04: {   /* MapMemory(dst, src, size): the pages appear at dst; here, as a copy (see "memory mappings") */
         u32 i = 0;
         while (i < 1024 && maps[i].size) i++;
         if (i == 1024) rt_fatal("kernel: too many memory mappings");
         commit(x[0], x[2], "a memory mapping");
+        u64 t0 = now_ns();
         memcpy(G2H(x[0]), G2H(x[1]), x[2]);
+        map_copy_ns += now_ns() - t0;
         maps[i].dst = x[0]; maps[i].src = x[1]; maps[i].size = x[2];
+        if (map_guard) guard_source(i);
         kernel_add_region(x[0], x[2], GM_STACK, 3);
+        maps_made++;
+        map_bytes += x[2];
+        if (++maps_live > maps_peak) maps_peak = maps_live;
         x[0] = R_OK;
         break;
     }
     case 0x05: {   /* UnmapMemory(dst, src, size) */
         for (u32 i = 0; i < 1024; i++)
             if (maps[i].size && maps[i].dst == x[0]) {
+                unguard_source(i);
+                u64 t0 = now_ns();
                 memcpy(G2H(maps[i].src), G2H(maps[i].dst), maps[i].size);
+                map_copy_ns += now_ns() - t0;
                 gpu_memory_unmapping(maps[i].dst, maps[i].size);   /* (queued GPU work and the renderer may read it) */
                 VirtualFree(G2H(maps[i].dst), maps[i].size, MEM_DECOMMIT);
                 unmap_range(maps[i].dst, maps[i].size);
                 maps[i].size = 0;
+                maps_live--;
             }
         x[0] = R_OK;
         break;
@@ -740,4 +818,6 @@ void kernel_init(void) {
     for (u32 i = 0; i < sizeof areas / sizeof *areas; i++)
         if (VirtualAlloc(G2H(areas[i].base), areas[i].size, MEM_RESERVE | areas[i].flags, PAGE_READWRITE) != G2H(areas[i].base))
             rt_fatal("kernel: cannot reserve the %s area at %#llx", areas[i].what, areas[i].base);
+    map_guard = getenv("SSBU_MAP_GUARD") && !strcmp(getenv("SSBU_MAP_GUARD"), "1");
+    if (map_guard) fprintf(stderr, "[kernel] a memory mapping's source is inaccessible while it is mapped (SSBU_MAP_GUARD=1)\n");
 }

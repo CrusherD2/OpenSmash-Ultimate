@@ -12,7 +12,7 @@ This document describes the checked-in implementation. Implemented paths and dev
 | :--- | :--- |
 | [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement, the game version, the imports check. |
 | [2. Loading, symbols, and guest execution](#2-loading-symbols-and-guest-execution) | Mapping, binding, native replacements, exceptions. |
-| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts. |
+| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts, memory mappings. |
 | [4. The graphics path](#4-the-graphics-path) | GPU commands, the D3D11 back end, shader compilation, audio and video. |
 | [5. Multiplayer transport](#5-multiplayer-transport) | The relay, the lobby and direct connections. |
 | [6. DLC and fighter unlocks](#6-dlc-and-fighter-unlocks) | Installed-content reporting and save editing. |
@@ -136,6 +136,14 @@ Save data and cache files are host directories. `SSBU_DATA_ROOT` can redirect th
 
 The font service loads six firmware font files, decodes their container format, and maps shared font memory. Fonts are user-supplied runtime inputs, not repository assets.
 
+### Memory mappings
+
+Thread stacks are mapped with `svcMapMemory`: the pages of memory the game allocated appear in the stack area, from `0x7700000000` up. On the console the source is then locked, with no access at all, until the unmap. The kernel copies instead: the destination gets a copy of the source, and the unmap writes it back over the source before the destination is decommitted (the renderer is told, as for any memory decommitted). A game that keeps to the console's rules cannot tell the difference; the cost is two copies and the destination's memory while the mapping lasts. On an M5 Pro (macOS), mapping and unmapping 1 MiB took some 60-70 and 20-30 µs (16 KiB: 2-3 µs each), and 64 mappings of 1 MiB with 16 KiB of each written added 64 MiB to the process's memory footprint. As aliases made with `mach_vm_remap` they added 1 MiB, and a 1 MiB alias made and removed took some 5 µs. Each status line (`--status`) gives the mappings made, how many are mapped and the most at once, and the time the copies took, so a session's log shows whether they matter.
+
+An alias, the same pages at both addresses, needs the source in memory that can be mapped twice. On Windows that is a pagefile-backed section mapped into placeholders (`MapViewOfFile3`, Windows 10 1803 and later), whose committed pages `VirtualFree` cannot decommit and `GetWriteWatch` does not watch; on Linux a shared mapping (a memfd); on macOS anonymous memory will do (`mach_vm_remap`), but in 16 KiB pages, so only where source and destination sit at the same offset in one. The heap and the alias area, where a stack's memory can come from, would have to be allocated that way. That has not been done.
+
+`SSBU_MAP_GUARD=1` makes a mapping's source inaccessible while it is mapped, as on the console, so that a stray access faults, and the crash report names the guest function, instead of reading the stale copy or writing what the unmap then overwrites. It guards a source that the memory map has as read-write memory, outside the alias area (where the write watch sets the pages' protection itself, on macOS and on Linux before 6.7), and on macOS only the 16 KiB host pages wholly inside it. It is off by default until a play session has been run with it. The log says when it is on, and the status line how many sources it guarded. [`maptest.c`](../tools/dev/maptest.c) checks both behaviours offline.
+
 ## 4. The graphics path
 
 ```mermaid
@@ -248,6 +256,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 | [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across sampled CPU states. |
 | [`functest.py`](../tools/dev/functest.py) | Compare selected whole leaf functions against Unicorn, including registers and memory writes. |
 | [`shadertest.c`](../tools/dev/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
+| [`maptest.c`](../tools/dev/maptest.c) | Check the kernel's memory mappings offline: a mapping's pages at its destination and written back to its source at the unmap, the destination freed and the renderer told, mappings side by side and from neighbouring sources, more mappings than slots, sources in the alias area and in a module, the status line's counts; with `SSBU_MAP_GUARD=1` the source inaccessible while mapped, where it should be (`tests/test_kernel_map_memory.py` builds and runs it on Windows, Linux and macOS). |
 | [`padtest.c`](../tools/dev/padtest.c) | Check the controller layer offline: configuration, button mapping, GameCube controllers, sticks, player slots, and rumble pacing. |
 | [`clocktest.c`](../tools/dev/clocktest.c) | Check the clock offline: the timer it picks (also with a system timer slowed to a microsecond a read), that it never goes back across threads, and its rate and cost (`tests/test_clock.py` builds and runs it). |
 | [`vp9test.c`](../tools/dev/vp9test.c) | Replay recorded NVDEC jobs through the VP9 path and libvpx. |
@@ -289,6 +298,8 @@ python tools/dev/functest.py dump/exefs/main --jobs 8
 Differential results apply to the sampled encodings, states, and functions. Whole-function tests deliberately skip reference runs that cannot complete in isolation; neither test is proof that every game path works.
 
 The overlay exposes frame/rendering counters. F1 toggles the overlay, F2 shows details (with the connected pads), F3 captures a frame, F4 requests draw diagnostics, F6 triggers a sampling profile, and F11 switches to full screen.
+
+A diagnostic switch of the kernel: `SSBU_MAP_GUARD=1` makes a memory mapping's source inaccessible while it is mapped, as on the console, so that a stray access to it is a crash with a report ([Memory mappings](#memory-mappings)); off by default.
 
 A host exception writes `reports/crash_<time>.txt` with a minidump, and a runtime stop writes `reports/stopped_<time>.txt`. The minidump is written by a second process (the same executable started with `--write-dump`), because a process that dumps itself can deadlock on a lock held by one of its suspended threads. A watchdog ([`debug_watchdog.c`](../runtime/debug_watchdog.c)) writes `reports/freeze_<time>.txt` and a minidump when no frame has been presented for 5 s (again at 30 s and 120 s): the owners of the renderer's, present queue's, kernel's, and GPU channel's locks, the shader compiles in flight, the guest threads' states, and every thread's stack, with guest functions named by module offset. `SSBU_WATCHDOG=0` turns the watchdog off; `SSBU_MINIDUMP=0` writes no minidumps and `SSBU_MINIDUMP=full` writes all memory. `SSBU_HITCH=<ms>` logs every frame longer than that with what the main, vsync, and renderer threads spent it on: the program's functions by name once its map has been read (a few seconds after start), and for a wait inside a driver or library, the program's function that called into it (`... via <function>`). Locally generated linker maps are useful to `hostsym.py` and profiling tools, but are not required to run a release build.
 
