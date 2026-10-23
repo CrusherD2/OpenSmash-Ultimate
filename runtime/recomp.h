@@ -124,6 +124,35 @@ u64 rt_ticks(void);                /* the 19.2 MHz system counter */
     static inline T lda##N(u64 a) { return __atomic_load_n((T *)RT_HOST(a), __ATOMIC_SEQ_CST); }
 RT_MEM(u8, 8) RT_MEM(u16, 16) RT_MEM(u32, 32) RT_MEM(u64, 64)
 
+/* ldxp / stxp of two X registers (tools/lift.py): the pair is one 16-byte location, read whole
+ * (single-copy atomic) and written by a 16-byte compare-and-swap, sequentially consistent. lda128
+ * is also ordered after an earlier sta (ldaxp after stlr, as lda after sta above). arm64: ldp,
+ * single-copy atomic at a 16-byte aligned address (FEAT_LSE2: every Apple CPU), and casp.
+ * x86-64: cmpxchg16b for both (the read swaps 0 for 0, so the memory must be writable, as for the
+ * stxp that follows), which every x86-64 CPU the builds run on has. Without -mcx16 (the Linux
+ * build has none) a 16-byte atomic is a call to libatomic, which nothing links: these functions
+ * have cx16 of their own, and are never inlined, since inlined into code without it they would
+ * be that call again. */
+typedef unsigned __int128 u128;
+#if defined(__x86_64__)
+#define RT_CX16 __attribute__((target("cx16"), noinline))
+static inline RT_CX16 u128 lda128(u64 a) { return __sync_val_compare_and_swap((u128 *)RT_HOST(a), (u128)0, (u128)0); }
+static inline RT_CX16 u128 ld128(u64 a) { return __sync_val_compare_and_swap((u128 *)RT_HOST(a), (u128)0, (u128)0); }
+static inline RT_CX16 u32 cas128(u64 a, u64 expect_lo, u64 expect_hi, u64 lo, u64 hi) {
+    return __sync_bool_compare_and_swap((u128 *)RT_HOST(a), (u128)expect_hi << 64 | expect_lo, (u128)hi << 64 | lo);
+}
+#else
+static inline u128 ld128(u64 a) { return __atomic_load_n((u128 *)RT_HOST(a), __ATOMIC_RELAXED); }
+static inline u128 lda128(u64 a) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* (a seq_cst ldp alone may pass an earlier stlr) */
+    return __atomic_load_n((u128 *)RT_HOST(a), __ATOMIC_SEQ_CST);
+}
+static inline u32 cas128(u64 a, u64 expect_lo, u64 expect_hi, u64 lo, u64 hi) {
+    u128 e = (u128)expect_hi << 64 | expect_lo;
+    return __atomic_compare_exchange_n((u128 *)RT_HOST(a), &e, (u128)hi << 64 | lo, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+#endif
+
 /* dc zva: zero the 64-byte block holding the address (DCZID_EL0 reads 4: tools/lift.py). */
 static inline void rt_zva(u64 a) { memset(RT_HOST(a & ~63ull), 0, 64); }
 

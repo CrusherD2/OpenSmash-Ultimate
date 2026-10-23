@@ -58,6 +58,8 @@ Fighter modules live inside `data.arc`. [`arc.py`](../tools/arc.py) resolves has
 
 Direct branches can target generated C labels/functions. Indirect calls resolve guest code addresses to native function pointers. Tail-call helpers keep supported guest tail transfers from accumulating unnecessary host stack frames. Unsupported instructions or unavailable targets can produce a trap; they do not establish complete instruction coverage.
 
+Exclusive loads and stores, of one register or a pair (`ldxr`/`stxr`, `ldxp`/`stxp` and their acquire/release forms), keep the address and the value the load read in locals of the function. The store is a compare-and-swap against that value, and succeeds only at the same address. Its status register is 0 on success, 1 on failure. A pair of W registers is one 8-byte location. A pair of X registers is one 16-byte location, read whole and written with a 16-byte compare-and-swap (`ld128`, `lda128`, `cas128` in `recomp.h`: `ldp` and `casp` on arm64, `cmpxchg16b` on x86-64). The ARMv8.1 atomics (`cas`, `casp`, `ldadd` and the rest) and ARMv8.3's `ldapr` trap: the console's Cortex-A57 is ARMv8.0 and has none of them.
+
 The build disables floating-point contraction and fast-math-style assumptions to preserve guest arithmetic behavior. `clang-cl` produces x64 object files, then links them with the native runtime and Windows libraries.
 
 ### Stable module placement
@@ -286,6 +288,8 @@ python tools/dev/difftest.py --synthetic --toolchain rosetta
 ```
 
 [`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one, else for CRC-32 tables made on first use) against the bitwise CRC and the standard check values.
+
+[`tests/test_exclusive_pairs.py`](../tests/test_exclusive_pairs.py) builds lifted `ldxp`/`stxp` sequences the same ways. It checks each sequence's registers, status and memory. Threads counting on one 16-byte and one 8-byte counter must lose no update, and a 16-byte read while other threads store must never return half of one store and half of another. On an arm64 Mac the same instruction words also run on the CPU, and the results must match.
 
 Game-backed checks after preparing local modules:
 
