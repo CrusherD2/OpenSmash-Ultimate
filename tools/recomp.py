@@ -493,6 +493,13 @@ def build(path, outdir, jobs, per_file):
           f"{imports:,} symbols referenced by {relocs:,} relocations")
 
 
+def built_for(outdir):
+    """The instruction set a module folder's objects are compiled for (tools/isa.py): what the record of
+    the build folder it is in says (build_all's <out>/<module> or <out>/nro/<module>; link writes it)."""
+    out = os.path.dirname(os.path.abspath(outdir))
+    return isa.built_for(os.path.dirname(out) if os.path.basename(out) == "nro" else out)
+
+
 def plan(outdir):
     """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
     one is). A generated file includes recomp.h, g_module.c module.h (_emit, module_table). The key's
@@ -501,8 +508,10 @@ def plan(outdir):
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
-    # (a folder an older version built, without a record: its objects that the date said were current are kept)
-    record = objcache.Record(outdir, adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"))
+    # (a folder an older version built, without a record: its objects that the date said were current are kept -
+    # if they are compiled for today's instruction set, which for every older version's was avx2)
+    adopt = objcache.header_files(cc.RUNTIME, "recomp.h", "module.h") if built_for(outdir) == cc.ISA else None
+    record = objcache.Record(outdir, adopt_by_date=adopt)
     compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, h)) for h in ("recomp.h", "module.h")}
     todo, keys, why = [], {}, Counter()

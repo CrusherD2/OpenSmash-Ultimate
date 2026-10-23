@@ -337,6 +337,7 @@ class WindowsBuildTests(Folder):
         self.flags = ['/nologo', '/arch:AVX2', '-mfma', '/I', str(self.runtime)]   # cc.GAME_CFLAGS
         self.rt_flags = list(self.flags)   # cc.CFLAGS: the runtime's, with its libraries' defines and folders
         for patch in (mock.patch.object(cc, 'CLANG', self.cc.name), mock.patch.object(cc, 'GAME_CFLAGS', self.flags),
+                      mock.patch.object(cc, 'ISA', 'avx2'),   # (what an older version's folder, without build/isa.txt, is for)
                       mock.patch.object(cc, 'CFLAGS', self.rt_flags), mock.patch.object(cc, 'RUNTIME', str(self.runtime)),
                       self.cc.patch()):
             patch.start()
@@ -404,6 +405,34 @@ class WindowsBuildTests(Folder):
         self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
         self.flags[1] = '/arch:SSE4.2'   # (with a record: by key alone)
         self.assertEqual(self.compile(), (True, every))
+
+    def test_a_folder_an_older_version_built_for_another_instruction_set(self):
+        """Every older version compiled for avx2 (and wrote no build/isa.txt). Built today for x86-64-v2, such a
+        folder's objects are all compiled again, none taken as current by date; built for what build/isa.txt
+        names, they are (a fighter module's folder, build/nro/<name>, goes by build/isa.txt too)."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.flags[1:3] = ['/clang:-march=x86-64-v2']
+        with mock.patch.object(cc, 'ISA', 'x86-64-v2'):
+            self.assertEqual(self.compile(), (True, every))
+            self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+            self.assertIn('-march=x86-64-v2', (self.module / 'g0000.obj').read_text())
+            record.unlink()
+            isa.record(str(self.module.parent), 'x86-64-v2', True)   # (what link writes)
+            self.assertEqual(self.compile(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
+            nro = self.module.parent / 'nro' / 'fighter'
+            write(nro / 'manifest.tsv', 'g0000.c\t40000\t5000\n')
+            write(nro / 'g0000.c', '#include "recomp.h"\nvoid f_7100002000(void) {}\n')
+            write(nro / 'g_module.c', '#include "module.h"\n')
+            self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
+            (nro / objcache.RECORD).unlink()
+            self.assertEqual(self.compile(nro), (True, []))
+            isa.record(str(self.module.parent), 'avx2', False)
+            (nro / objcache.RECORD).unlink()
+            self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
 
     def test_the_folder_spelled_another_way_or_moved(self):
         """The key names a file and its object by their names in the folder: build/main, ./build/main, the
@@ -550,6 +579,7 @@ class LinuxBuildTests(Folder):
             else:
                 sys.modules['toolchain'] = saved[0]
             sys.argv, sys.path[:] = saved[1], saved[2]
+        self.ns['ISA'] = 'avx2'   # (what an older version's folder, without build-linux/isa.txt, is for)
 
     def build(self, what='game'):
         out = io.StringIO()
@@ -591,6 +621,21 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (True, []))
         self.assertIn('3 objects an older version compiled taken as current', self.said)
         self.assertEqual(self.build(), (True, []))
+
+    def test_a_folder_an_older_version_built_for_another_instruction_set(self):
+        """As on Windows: built today for x86-64-v2, an older version's folder (avx2, no build-linux/isa.txt) is
+        compiled again whole; built for what build-linux/isa.txt names, its objects are taken as current."""
+        every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
+        self.build()
+        record = self.out / 'main' / objcache.RECORD
+        record.unlink()
+        self.ns['ISA'], self.tc.CFLAGS = 'x86-64-v2', self.tc.cflags('x86-64-v2')
+        self.assertEqual(self.build(), (True, every))
+        self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+        record.unlink()
+        isa.record(str(self.out), 'x86-64-v2', True)   # (what link writes)
+        self.assertEqual(self.build(), (True, []))
+        self.assertIn('3 objects an older version compiled taken as current', self.said)
 
     def test_landing_sites_found_once(self):
         """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""

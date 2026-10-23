@@ -19,7 +19,9 @@ folder's last choice if SSBU_ISA made it (told once, kept); else avx2 if the pro
 have it; else, when it cannot be asked, the folder's last choice, else x86-64-v2. A build writes
 what it compiled for into its folder's isa.txt (record): build/isa.txt on Windows, build-linux/isa.txt
 on Linux, which build_game.py compares with today's choice (another one builds again; tools/objcache.py
-then compiles every object again, their command having changed).
+then compiles every object again, their command having changed). A folder without one is avx2's
+(built_for), so the objects of a folder an older version built are kept by date only for avx2
+(tools/recomp.py's plan, tools/linux/build_linux.py's game_jobs).
 
 The program checks the processor itself before anything else of it runs (runtime/cpu_check.c): one
 built for AVX2 on a processor without it says what is missing and what to do, instead of crashing."""
@@ -33,9 +35,11 @@ ANY = "x86-64"   # (not a target: what runtime/cpu_check.c is compiled for, so t
 V2 = ("sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "cx16")
 NEEDS = {"avx2": V2 + ("avx", "avx2", "fma", "bmi1", "bmi2", "lzcnt"), "x86-64-v2": V2}
 # The compile flags of each. clang-cl's /arch:AVX2 is -march=haswell (AVX2, FMA, BMI1, BMI2, LZCNT,
-# MOVBE, F16C); its x64 default is x86-64 (SSE2). /clang: hands -march to clang itself: a clang-cl
-# that does not know -march as its own would leave it out with a warning that -w hides.
-CLANG_CL = {"avx2": ("/arch:AVX2", "-mfma"), "x86-64-v2": ("/clang:-march=x86-64-v2",), ANY: ()}
+# MOVBE, F16C); without MOVBE and F16C, which the compiler would use unasked (a load and byte swap is
+# MOVBE), it needs what NEEDS says, as on Linux. Its x64 default is x86-64 (SSE2). /clang: hands -march
+# to clang itself: a clang-cl that does not know -march as its own would leave it out with a warning
+# that -w hides.
+CLANG_CL = {"avx2": ("/arch:AVX2", "-mfma", "-mno-movbe", "-mno-f16c"), "x86-64-v2": ("/clang:-march=x86-64-v2",), ANY: ()}
 CLANG = {"avx2": ("-mavx2", "-mfma", "-mbmi", "-mbmi2", "-mlzcnt", "-mpopcnt"), "x86-64-v2": ("-march=x86-64-v2",),
          ANY: ("-march=x86-64",)}
 RECORD = "isa.txt"

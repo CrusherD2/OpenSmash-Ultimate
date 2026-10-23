@@ -14,9 +14,10 @@ Steps, each skipped when it is already done, so running it again carries on wher
                (another branch, a commit GitHub does not have, no internet) is left as it is.
   2. check     64-bit Windows 10 or 11, a processor with SSE4.2 (x86-64-v2; with AVX2 the game
                is built for AVX2, without it for older processors, expected to be slower: tools\
-               isa.py; when Windows cannot be asked and the processor's name says AVX2, SSBU_ISA=avx2
-               is set for the build), the installed RAM, the free space on this drive (about 60 GB
-               for the build). A failed check stops with a plain message.
+               isa.py; when Windows cannot be asked, the processor's name: SSBU_ISA=avx2 is set for
+               the build when it says AVX2, and a family without SSE4.2 stops it), the installed
+               RAM, the free space on this drive (about 60 GB for the build). A failed check stops
+               with a plain message.
   3. python    a Python 3.10 or newer with the packages (deps\python, then python on the PATH, then
                the py launcher); otherwise python.org's embeddable Python 3.14 into deps\python, with
                pip and requirements.txt. Every later Python call uses the one found.
@@ -348,6 +349,15 @@ function Test-Avx2ByName {
     return $null
 }
 
+function Test-Sse42ByName {
+    <# Whether a processor has SSE4.2 (x86-64-v2, what the game needs at the least), from its name, when
+       Windows cannot be asked (before 20H1): $false for the families known to lack it (Core 2, Phenom,
+       Athlon 64 and II, the Atoms before Silvermont, the A-series of 2011), else $null. #>
+    param([string]$Name)
+    if ($Name -match 'Core\(TM\)2|Phenom|Athlon(\(tm\))?\s+(64|II)\b|Atom\(TM\)\s+CPU\s+[NDZ]2?\d{3}\b|\bA[468]-3\d{3}') { return $false }
+    return $null
+}
+
 function Test-CpuFeature {
     <# Windows' IsProcessorFeaturePresent(feature): $true, $false, or $null when it cannot be asked.
        The call is declared with Reflection.Emit, not Add-Type -MemberDefinition: Add-Type runs the
@@ -666,12 +676,15 @@ function Step-CheckPc {
 
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
     $name = ($cpu.Name -replace '\s+', ' ').Trim()
+    $sse42 = $null
     $avx2 = $null
     if ($build -ge 19041) {   # Windows 10 version 2004 and later can be asked about SSE4.2 and AVX2 (features 38 and 40)
-        if ((Test-CpuFeature 38) -eq $false) {
-            throw "The processor ($name) has no SSE4.2, which the game needs at the least (x86-64-v2: Intel processors since 2008, AMD since 2011): WindowSmash cannot run on it."
-        }
+        $sse42 = Test-CpuFeature 38
         $avx2 = Test-CpuFeature 40
+    }
+    if ($null -eq $sse42) { $sse42 = Test-Sse42ByName $name }
+    if ($sse42 -eq $false) {
+        throw "The processor ($name) has no SSE4.2, which the game needs at the least (x86-64-v2: Intel processors since 2008, AMD since 2011): WindowSmash cannot run on it."
     }
     $byName = $null -eq $avx2
     if ($byName) { $avx2 = Test-Avx2ByName $name }

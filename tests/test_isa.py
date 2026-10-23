@@ -209,7 +209,7 @@ class FlagTests(unittest.TestCase):
     def test_flag_sets(self):
         every = [f for flags in (*isa.CLANG_CL.values(), *isa.CLANG.values()) for f in flags]
         self.assertNotIn('-mf16c', every)   # (half floats are done in software: runtime/recomp.h)
-        self.assertEqual(isa.CLANG_CL['avx2'], ('/arch:AVX2', '-mfma'))
+        self.assertEqual(isa.CLANG_CL['avx2'], ('/arch:AVX2', '-mfma', '-mno-movbe', '-mno-f16c'))
         self.assertEqual(isa.CLANG['avx2'], ('-mavx2', '-mfma', '-mbmi', '-mbmi2', '-mlzcnt', '-mpopcnt'))
         self.assertEqual(isa.CLANG_CL['x86-64-v2'], ('/clang:-march=x86-64-v2',))
         self.assertEqual(isa.CLANG['x86-64-v2'], ('-march=x86-64-v2',))
@@ -228,7 +228,8 @@ class FlagTests(unittest.TestCase):
 
     def test_what_the_compilers_make_of_them(self):
         """Each target's macros as clang (Linux) and clang-cl (Windows) define them, and the processor check's
-        bits (runtime/cpu_check.h) they make: x86-64-v2 exactly RT_CPU_V2; nothing for the check itself."""
+        bits (runtime/cpu_check.h) they make: x86-64-v2 exactly RT_CPU_V2; avx2 what isa.NEEDS says, on both;
+        nothing for the check itself."""
         if not CLANG and not HAVE_CLANG_CL:
             self.skipTest('no clang')
         by_macro, bits = cpu_bits()
@@ -250,9 +251,10 @@ class FlagTests(unittest.TestCase):
                         if target == 'x86-64-v2':
                             self.assertEqual(needs, v2)
                         elif target == 'avx2':
+                            # (on Windows the CX16 and LAHF-SAHF of every AVX2 processor too: /arch:AVX2 is Haswell's,
+                            # less MOVBE and F16C, which isa.NEEDS and Windows' answer do not cover)
                             self.assertEqual(needs & avx, avx)
-                            # clang-cl's /arch:AVX2 is Haswell's, F16C and MOVBE with it; Linux's flags name no F16C
-                            self.assertEqual(bool(needs & bits['F16C']), driver == 'clang-cl')
+                            self.assertEqual(needs & ~(avx | v2), 0)
                         else:
                             self.assertEqual(needs, 0)
                             self.assertIn('__SSE2__', defined)
@@ -440,7 +442,7 @@ class CpuCheckTests(unittest.TestCase):
         self.assertEqual((code, out), (5, ''))   # (stopped before main)
         self.assertTrue(err.startswith('[boot] This copy of WindowSmash was built for processors with AVX2, and this processor '
                                        'lacks AVX, AVX2, FMA'), err)
-        self.assertIn('SSBU_ISA=x86-64-v2', err)
+        self.assertIn('If this message comes back, build it with SSBU_ISA=x86-64-v2 set', err)
         self.assertEqual(self.run_check('check_everything', 'avx2'), (0, 'main', ''))
         self.assertEqual(self.run_check('check_v2', 'x86-64-v2'), (0, 'main', ''))
         code, out, err = self.run_check('check_old', 'x86-64-v2')

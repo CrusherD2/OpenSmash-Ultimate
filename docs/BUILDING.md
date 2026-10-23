@@ -593,7 +593,7 @@ The game is compiled for one of two instruction sets ([`tools/isa.py`](../tools/
 
 `x86-64-v2` is expected to run slower: the Switch's fused multiply-add is a call into the C runtime there (`fma()`), and nothing is vectorised wider than 128 bits. How much slower is not measured. Below x86-64-v2 the game can't run.
 
-The build takes `avx2` when this PC's processor has AVX2, else `x86-64-v2`. It asks Windows which extensions the processor has (Windows 10 version 2004 or later; on Linux, `/proc/cpuinfo`); when Windows can't be asked, it takes `x86-64-v2`, unless the installer, going by the processor's name, tells it `avx2`. To choose yourself, for example to build for another PC, set `SSBU_ISA` to `avx2` or `x86-64-v2` before building; the choice is kept for later builds (unless the processor is known to lack what it needs), and `SSBU_ISA=auto` goes back to choosing by the processor:
+The build takes `avx2` when this PC's processor has AVX2, else `x86-64-v2`. It asks Windows which extensions the processor has (Windows 10 version 2004 or later; on Linux, `/proc/cpuinfo`); when Windows can't be asked, it takes `x86-64-v2`, unless the installer, going by the processor's name, tells it `avx2` (the installer also stops for a processor family whose name says it has no SSE4.2). To choose yourself, for example to build for another PC, set `SSBU_ISA` to `avx2` or `x86-64-v2` before building; the choice is kept for later builds (unless the processor is known to lack what it needs), and `SSBU_ISA=auto` goes back to choosing by the processor:
 
 ```powershell
 $env:SSBU_ISA = 'x86-64-v2'
@@ -602,7 +602,7 @@ $env:SSBU_ISA = 'x86-64-v2'
 
 `build\isa.txt` (on Linux, `build-linux/isa.txt`) says what the game was built for. When today's choice is another, the game is built again, all of it: every object's compile command changed ([incremental builds](TECHNICAL.md#incremental-builds)). libopus is compiled for the same one, its AVX2 code for `avx2` only.
 
-The game checks the processor as it starts, before any of its own code runs. One built for AVX2, started on a processor without it, stops with a message box saying what the processor lacks and to run `Install WindowSmash.bat` again (or build with `SSBU_ISA=x86-64-v2`), instead of crashing at its first AVX instruction.
+The game checks the processor as it starts, before any of its own code runs. One built for AVX2, started on a processor without it, stops with a message box saying what the processor lacks and to run `Install WindowSmash.bat` again, instead of crashing at its first AVX instruction. If the message comes back (a Windows older than 10 version 2004, where the installer goes by the processor's name, and the name says AVX2 where the PC, a virtual machine say, has none), set `SSBU_ISA=x86-64-v2` as above and run `Install WindowSmash.bat` again.
 
 ### What the build does
 

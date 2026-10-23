@@ -123,10 +123,11 @@ def game_jobs():
     # what the generated files include: recomp.h, g_module.c module.h (tools/recomp.py)
     headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, h)) for h in ("recomp.h", "module.h")}
     jobs, why = [], Counter()
+    # (a folder an older version built, without a record: its objects that the date said were current are kept -
+    # if they are compiled for today's instruction set, which for every older version's was avx2)
+    adopt = objcache.header_files(RUNTIME, "recomp.h", "module.h") if isa.built_for(OUT) == ISA else None
     for name, src_dir, out_dir in modules():
-        # (a folder an older version built, without a record: its objects that the date said were current are kept)
-        record = objcache.Record(out_dir, scan=(LANDING_SITES,),
-                                 adopt_by_date=objcache.header_files(RUNTIME, "recomp.h", "module.h"))
+        record = objcache.Record(out_dir, scan=(LANDING_SITES,), adopt_by_date=adopt)
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:

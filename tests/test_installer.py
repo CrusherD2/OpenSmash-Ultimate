@@ -168,6 +168,29 @@ class InstallerDecisionTests(unittest.TestCase):
         for name, want in cases.items():
             self.assertEqual(got[name], want, name)
 
+    def test_sse42_by_processor_name(self):
+        cases = {   # (below x86-64-v2: no SSE4.2; else not known by name)
+            'Intel(R) Core(TM)2 Duo CPU E8400 @ 3.00GHz': False,
+            'AMD Phenom(tm) II X4 965 Processor': False,
+            'AMD Athlon(tm) II X2 250 Processor': False,
+            'AMD Athlon(tm) 64 X2 Dual Core Processor 4200+': False,
+            'Intel(R) Atom(TM) CPU N270 @ 1.60GHz': False,
+            'Intel(R) Atom(TM) CPU D2700 @ 2.13GHz': False,
+            'AMD A8-3850 APU with Radeon(tm) HD Graphics': False,
+            'AMD A6-3420M APU with Radeon(tm) HD Graphics': False,
+            'Intel(R) Atom(TM) CPU Z3735F @ 1.33GHz': None,   # (Silvermont: SSE4.2)
+            'AMD A10-7850K Radeon R7, 12 Compute Cores 4C+8G': None,
+            'AMD Athlon(tm) X4 860K Quad Core Processor': None,
+            'Intel(R) Core(TM) i7 CPU 920 @ 2.67GHz': None,
+            'Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz': None,
+            'AMD Ryzen 5 3600 6-Core Processor': None,
+            'Intel(R) Celeron(R) N4000 CPU': None,
+        }
+        names = '; '.join(f"'{n}' = (Test-Sse42ByName '{n}')" for n in cases)
+        got = ps('@{ ' + names + ' }')
+        for name, want in cases.items():
+            self.assertEqual(got[name], want, name)
+
     def test_pc_check_without_csharp_compiler(self):
         # a PC whose .NET C# compiler is broken: Add-Type -MemberDefinition stopped step 2 with
         # "Unable to find messages file 'cscui.dll'"; the AVX2 question must not need the compiler
@@ -201,6 +224,16 @@ class InstallerDecisionTests(unittest.TestCase):
         self.assertNotIn('STOPPED', out)
         out = ps_text(mocks + "function Test-CpuFeature { $false }; " + step)   # below x86-64-v2: stopped
         self.assertIn('STOPPED: The processor (AMD Ryzen 7 3700X 8-Core Processor) has no SSE4.2', out)
+        # Windows before 10 version 2004 (build 19041) cannot be asked: the name, which stops a family without SSE4.2
+        older = mocks.replace('19045', '18363')
+        for name, said in (('Intel(R) Core(TM)2 Duo CPU E8400', 'STOPPED: The processor (Intel(R) Core(TM)2 Duo CPU E8400) '
+                                                                 'has no SSE4.2'),
+                           ('Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz', 'Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz - has no AVX2: '
+                                                                        'the game is built for older processors (x86-64-v2)')):
+            with self.subTest(name):
+                out = ps_text(older.replace('AMD Ryzen 7 3700X 8-Core Processor', name) + "$env:SSBU_ISA = $null; " + step + isa)
+                self.assertIn(said, out)
+                self.assertNotIn('isa=avx2', out)
 
     def test_source_version(self):
         sha = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'

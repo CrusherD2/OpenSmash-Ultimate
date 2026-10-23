@@ -98,10 +98,13 @@ int rt_cpu_message(unsigned needs, unsigned has, char *out, size_t size) {
 #else
 #define RT_CPU_AGAIN "Run install-windowsmash.sh again: it builds the game for this processor"
 #endif
+    /* (the second sentence for when the first does not help: a Windows older than 10 version 2004 cannot be asked
+     * about AVX2, and the installer then goes by the processor's name, which may say AVX2 where a virtual machine
+     * has none) */
     if ((has & RT_CPU_V2) == RT_CPU_V2)
         snprintf(out, size, "This copy of WindowSmash was built for processors with AVX2, and this processor lacks %s. "
-                 RT_CPU_AGAIN " (the build for older processors, x86-64-v2), or build it again with SSBU_ISA=x86-64-v2 "
-                 "set (docs/BUILDING.md).", list);
+                 RT_CPU_AGAIN " (the build for older processors, x86-64-v2). If this message comes back, build it with "
+                 "SSBU_ISA=x86-64-v2 set (docs/BUILDING.md, The instruction set).", list);
     else
         snprintf(out, size, "This processor lacks %s, which WindowSmash needs (at the least SSE4.2 and POPCNT: "
                  "x86-64-v2, Intel processors since 2008 and AMD since 2011). It cannot run on this PC.", list);
