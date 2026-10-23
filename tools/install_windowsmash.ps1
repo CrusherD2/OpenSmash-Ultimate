@@ -12,8 +12,11 @@ Steps, each skipped when it is already done, so running it again carries on wher
                removed, and online_server.txt keeps a lobby code or address you set. A git checkout
                of main with no changes of its own is fast-forwarded with git pull. Anything else
                (another branch, a commit GitHub does not have, no internet) is left as it is.
-  2. check     64-bit Windows 10 or 11, a processor with AVX2, the installed RAM, the free space
-               on this drive (about 60 GB for the build). A failed check stops with a plain message.
+  2. check     64-bit Windows 10 or 11, a processor with SSE4.2 (x86-64-v2; with AVX2 the game
+               is built for AVX2, without it for older processors, expected to be slower: tools\
+               isa.py; when Windows cannot be asked and the processor's name says AVX2, SSBU_ISA=avx2
+               is set for the build), the installed RAM, the free space on this drive (about 60 GB
+               for the build). A failed check stops with a plain message.
   3. python    a Python 3.10 or newer with the packages (deps\python, then python on the PATH, then
                the py launcher); otherwise python.org's embeddable Python 3.14 into deps\python, with
                pip and requirements.txt. Every later Python call uses the one found.
@@ -664,11 +667,21 @@ function Step-CheckPc {
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
     $name = ($cpu.Name -replace '\s+', ' ').Trim()
     $avx2 = $null
-    if ($build -ge 19041) { $avx2 = Test-CpuFeature 40 }   # Windows 10 version 2004 and later can be asked about AVX2 (feature 40)
-    if ($null -eq $avx2) { $avx2 = Test-Avx2ByName $name }
+    if ($build -ge 19041) {   # Windows 10 version 2004 and later can be asked about SSE4.2 and AVX2 (features 38 and 40)
+        if ((Test-CpuFeature 38) -eq $false) {
+            throw "The processor ($name) has no SSE4.2, which the game needs at the least (x86-64-v2: Intel processors since 2008, AMD since 2011): WindowSmash cannot run on it."
+        }
+        $avx2 = Test-CpuFeature 40
+    }
+    $byName = $null -eq $avx2
+    if ($byName) { $avx2 = Test-Avx2ByName $name }
     if ($avx2 -eq $true) { Write-Info "$name - has AVX2" }
-    elseif ($avx2 -eq $false) { throw "The processor ($name) has no AVX2, which the game needs: WindowSmash cannot run on it." }
-    else { Write-Warn "$name - whether it has AVX2 is unknown; the game will only start if it does (the setup guide's step 1 says which do)" }
+    elseif ($avx2 -eq $false) { Write-Info "$name - has no AVX2: the game is built for older processors (x86-64-v2), expected to be slower" }
+    else { Write-Warn "$name - whether it has AVX2 is unknown: the game is built for older processors (x86-64-v2), expected to be slower (with AVX2: docs\BUILDING.md, SSBU_ISA)" }
+    if ($byName -and $avx2 -eq $true -and -not $env:SSBU_ISA) {   # (the build cannot ask Windows either: it is told, tools\isa.py, and build\isa.txt keeps it)
+        $env:SSBU_ISA = 'avx2'
+        Write-Info 'the game is built for AVX2 (SSBU_ISA=avx2): Windows cannot be asked, the name says'
+    }
 
     $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
     if ($ramGb -lt $MinRamGb) { throw "This PC has $ramGb GB of RAM; WindowSmash needs at least $MinRamGb GB (16 GB is comfortable)." }

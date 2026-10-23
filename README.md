@@ -33,7 +33,7 @@ WindowSmash's install steps are the path that works today. Its installer still d
 | [macOS](docs/MACOS.md) | install, build and run the experimental version for Macs with Apple silicon. |
 | [How it works](docs/TECHNICAL.md) | understand the recompiler, the runtime and every tool. |
 
-You need game version 13.0.5 and a 64-bit Windows 10 or 11 PC with an AVX2 processor. Linux and macOS (Apple silicon) are experimental. The [setup guide](docs/BUILDING.md) lists everything.
+You need game version 13.0.5 and a 64-bit Windows 10 or 11 PC. A processor with AVX2 is recommended; one with only SSE4.2 (x86-64-v2: Intel since 2008, AMD since 2011) works too, with a build for it that is expected to run slower. Linux and macOS (Apple silicon) are experimental. The [setup guide](docs/BUILDING.md) lists everything.
 
 ## `ssbu-recomp/`: staged code
 

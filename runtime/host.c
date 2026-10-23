@@ -16,6 +16,9 @@
 #include "clock.h"
 #include "display.h"
 #include "settings.h"
+/* rt_cpu_needs: what this file was compiled for, which cpu_check.c checks the processor for first */
+#define RT_CPU_DEFINE_NEEDS
+#include "cpu_check.h"
 #ifdef _WIN32
 #include <dbghelp.h>
 #else

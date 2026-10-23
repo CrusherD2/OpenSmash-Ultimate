@@ -48,6 +48,7 @@ from multiprocessing import Pool
 # this folder, for the modules below: a Python with a ._pth file (the embeddable one the installer
 # sets up when the PC has none) does not put a script's own folder on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import isa  # noqa: E402
 import modcache  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
@@ -569,17 +570,21 @@ def link(dirs, exe, rt_dir=None):
     # changes (objcache.py): cc.CFLAGS change as SDL3, libopus or libvpx come and go.
     record, compiler = objcache.Record(rt_dir), objcache.compiler_id(cc.CLANG)
     headers = objcache.digest_files([os.path.join(cc.RUNTIME, n) for n in os.listdir(cc.RUNTIME) if n.endswith(".h")])
-    jobs, keys, why = [], {}, Counter()
+    jobs, keys, why = {}, {}, Counter()   # (jobs: by their flags, None for cc.CFLAGS)
+    print(f"instruction set: {cc.ISA} ({cc.ISA_WHY})")
 
-    def want(src, obj, opt):
-        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt), compiler, headers)
+    def want(src, obj, opt, flags=None):
+        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt, flags), compiler, headers)
         reason = record.check(obj, keys[obj])
         if reason:
             why[reason] += 1
-            jobs.append((src, obj, opt))
+            jobs.setdefault(None if flags is None else tuple(flags), []).append((src, obj, opt))
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
     for n in sources:
         want(os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj"), "/O2")
+    # the processor check, for any x64 processor (it runs before the rest: runtime/cpu_check.c)
+    check = os.path.join(rt_dir, "cpu_check.obj")
+    want(os.path.join(cc.RUNTIME, "cpu_check.c"), check, "/O2", cc.CHECK_CFLAGS)
     # Native implementations by name, for symbols no module defines.
     names = sorted(hle_names())
     table = os.path.join(rt_dir, "hle_table.c")
@@ -599,20 +604,25 @@ def link(dirs, exe, rt_dir=None):
     want(nro_table, nro_table[:-2] + ".obj", "/O1")
     if objcache.summary(why):
         print(f"runtime: {objcache.summary(why)}")
-    record.forget([obj for _src, obj, _opt in jobs])
-    for _src, obj, _opt in jobs:   # (as compile_dir: a file that fails to compile leaves no old object)
+    every = [job for group in jobs.values() for job in group]
+    record.forget([obj for _src, obj, _opt in every])
+    for _src, obj, _opt in every:   # (as compile_dir: a file that fails to compile leaves no old object)
         if os.path.exists(obj):
             os.remove(obj)
-    failures = cc.compile_each(jobs, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]))
+    failures = []
+    for flags, group in jobs.items():
+        failures += cc.compile_each(group, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]),
+                                    flags=None if flags is None else list(flags))
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
-    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
+    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [check, table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
     # a wrap no module has (a made-up game's modules, tools/mac/boottest): its original is a stub nothing calls
     cc.link(objs, exe, [f"/alternatename:f_{a:x}_orig=rt_wrap_missing" for a in sorted(hle_wraps())])
+    isa.record(os.path.dirname(os.path.abspath(exe)), cc.ISA, cc.ISA_TOLD)   # (what build_game.py's build_is_current compares)
     # the controllers' SDL3.dll, which the runtime loads from the exe's own folder
     if cc.SDL3_DLL:
         import shutil

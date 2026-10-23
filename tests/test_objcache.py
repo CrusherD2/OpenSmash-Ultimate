@@ -22,6 +22,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import cc  # noqa: E402
+import isa  # noqa: E402
 import objcache  # noqa: E402
 import recomp  # noqa: E402
 
@@ -470,17 +471,25 @@ class WindowsBuildTests(Folder):
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
         write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
         write(self.runtime / 'kernel.c', '#include "host.h"\nint kernel;\n')
+        write(self.runtime / 'cpu_check.c', '#include "cpu_check.h"\n')
         rt, exe = self.dir / 'build' / 'rt', self.dir / 'build' / 'ssbu.exe'
+        check_flags = ['/nologo', '/I', str(self.runtime)]   # cc.CHECK_CFLAGS: for any x64 processor
+        linked = []
 
         def link():
             out = io.StringIO()
-            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): Path(exe).write_bytes(b'MZ')), \
-                    mock.patch.object(cc, 'SDL3_DLL', None), contextlib.redirect_stdout(out):
+            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): linked.append(objs) or Path(exe).write_bytes(b'MZ')), \
+                    mock.patch.object(cc, 'SDL3_DLL', None), mock.patch.object(cc, 'CHECK_CFLAGS', check_flags), \
+                    contextlib.redirect_stdout(out):
                 ok = recomp.link([], str(exe), str(rt))
             self.said = out.getvalue()
             return ok, self.cc.runs()
-        every = ['hle_table.c /O1', 'host.c /O2', 'kernel.c /O2', 'nro_table.c /O1']
+        every = ['cpu_check.c /O2', 'hle_table.c /O1', 'host.c /O2', 'kernel.c /O2', 'nro_table.c /O1']
         self.assertEqual(link(), (True, every))
+        self.assertIn(str(rt / 'cpu_check.obj'), linked[-1])
+        self.assertNotIn('/arch:AVX2', (rt / 'cpu_check.obj').read_text())   # (its own flags, not the runtime's)
+        self.assertIn('/arch:AVX2', (rt / 'host.obj').read_text())
+        self.assertEqual(isa.recorded(str(exe.parent)), (cc.ISA, cc.ISA_TOLD))   # (build_game.py's build_is_current reads it)
         self.assertEqual(link(), (True, []))
         touch(self.runtime / 'host.h')
         self.assertEqual(link(), (True, []))
@@ -488,10 +497,12 @@ class WindowsBuildTests(Folder):
         self.assertEqual(link(), (True, ['host.c /O2']))
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\nint more;\n')
         self.assertEqual(link(), (True, every))
-        self.assertIn('runtime: 4 objects to compile again: the runtime headers changed', self.said)
+        self.assertIn('runtime: 5 objects to compile again: the runtime headers changed', self.said)
         self.rt_flags.append('/DSSBU_HAVE_OPUS')
-        self.assertEqual(link(), (True, every))
+        self.assertEqual(link(), (True, [j for j in every if not j.startswith('cpu_check')]))
         self.assertIn('runtime: 4 objects to compile again: the compile command changed', self.said)
+        check_flags.append('/DMORE')
+        self.assertEqual(link(), (True, ['cpu_check.c /O2']))
         self.cc.version('fake clang version 20.1.8')
         self.assertEqual(link(), (True, every))
         write(self.runtime / 'kernel.c', '#error made up\n')
@@ -516,6 +527,7 @@ class LinuxBuildTests(Folder):
         self.tc.RUNTIME = str(self.runtime)
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
         write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
+        write(self.runtime / 'cpu_check.c', '#include "cpu_check.h"\n')
         write(self.runtime / 'linux' / 'win32.c', '#include "host.h"\nint win32;\n')
         write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\n')
         self.tree, self.out = self.dir / 'tree', self.dir / 'build-linux'
@@ -597,14 +609,20 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (False, ['g0000.c -O2']))
 
     def test_runtime(self):
-        every = ['hle_table.c -O1', 'host.c -O2', 'nro_table.c -O1', 'win32.c -O2', 'wrap_missing.c -O1']
+        every = ['cpu_check.c -O2', 'hle_table.c -O1', 'host.c -O2', 'nro_table.c -O1', 'win32.c -O2', 'wrap_missing.c -O1']
         self.assertEqual(self.build('runtime'), (True, every))
+        check = (self.out / 'rt' / 'cpu_check.o').read_text().split()   # (for any x86-64 processor: not the game's flags)
+        self.assertIn('-march=x86-64', check)
+        self.assertNotIn('baseline', check)
+        self.assertEqual([f for f in self.tc.ARCH if f in check], [])
         self.assertEqual(self.build('runtime'), (True, []))
         write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\ntypedef int BOOL;\n')
         self.assertEqual(self.build('runtime'), (True, every))
-        self.assertIn('runtime: 5 objects to compile again: the runtime headers changed', self.said)
+        self.assertIn('runtime: 6 objects to compile again: the runtime headers changed', self.said)
         self.tc.CFLAGS = self.tc.CFLAGS + ['-DMORE']
-        self.assertEqual(self.build('runtime'), (True, every))
+        self.assertEqual(self.build('runtime'), (True, [j for j in every if not j.startswith('cpu_check')]))
+        self.tc.CHECK_CFLAGS = self.tc.CHECK_CFLAGS + ['-DMORE']
+        self.assertEqual(self.build('runtime'), (True, ['cpu_check.c -O2']))
 
 
 if __name__ == '__main__':

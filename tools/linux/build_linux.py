@@ -27,11 +27,12 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, LLVM, LLVM_NM, REPO, RUNTIME, SYSROOT, TARGET,
-                       TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each, default_port, read_port_stamp,
-                       run, same_path, write_port_stamp)
+from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, ISA, ISA_TOLD, ISA_WHY, LLVM, LLVM_NM, REPO,
+                       RUNTIME, SYSROOT, TARGET, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each,
+                       default_port, read_port_stamp, run, same_path, write_port_stamp)
 
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import isa  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
 
@@ -229,6 +230,8 @@ def runtime_jobs():
             jobs.append(job)
     for src in sources:
         want((src, os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o"), "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+    # the processor check, for any x86-64 processor (it runs before the rest: runtime/cpu_check.c)
+    want((os.path.join(RUNTIME, "cpu_check.c"), os.path.join(rt_out, "cpu_check.o"), "-O2", ["baseline"]))
     names = hle_names()
     table = os.path.join(GEN, "hle_table.c")
     write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
@@ -345,6 +348,7 @@ def link():
         errors = [l for l in out.splitlines() if "error" in l.lower()] or out.splitlines()
         print("link failed\n" + "\n".join(errors)[:6000])
         return False
+    isa.record(OUT, ISA, ISA_TOLD)   # (what build_game.py's build_is_current compares)
     syms = subprocess.run([LLVM_NM, "-n", "--defined-only", exe], capture_output=True, text=True)
     with open(os.path.join(OUT, "ssbu.syms"), "w", newline="\n") as f:
         f.write(syms.stdout)
@@ -385,6 +389,10 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")
+    if isa.built_for(os.path.join(VKD3D_BUILD, "linux")) != ISA:
+        raise SystemExit(f"vkd3d-shader is built for {isa.built_for(os.path.join(VKD3D_BUILD, 'linux'))}, the game for {ISA}: "
+                         "run tools/linux/build_vkd3d.py linux")
+    print(f"instruction set: {ISA} ({ISA_WHY})")
     dxvk_libs()
     if not modules():
         raise SystemExit(f"no recompiled game in {os.path.join(PORT, 'build')} (tools/recomp.py all)")

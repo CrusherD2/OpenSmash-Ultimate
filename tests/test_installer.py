@@ -185,11 +185,22 @@ class InstallerDecisionTests(unittest.TestCase):
         out = ps_text(mocks + step)
         self.assertNotIn('cscui', out)
         self.assertIn('AMD Ryzen 7 3700X 8-Core Processor - has', out)
-        out = ps_text(mocks + "function Test-CpuFeature { $null }; " + step)   # Windows cannot be asked: the name
+        isa = "; 'isa=' + $env:SSBU_ISA"   # what the build is told (the installer's environment is the build's)
+        unknown = "$env:SSBU_ISA = $null; function Test-CpuFeature { $null }; "   # Windows cannot be asked: the name
+        out = ps_text(mocks + unknown + step + isa)
         self.assertIn('AMD Ryzen 7 3700X 8-Core Processor - has AVX2', out)
+        self.assertIn('isa=avx2', out)   # (and the build is told: it cannot ask either)
         self.assertNotIn('STOPPED', out)
-        out = ps_text(mocks + "function Test-CpuFeature { $false }; " + step)
-        self.assertIn('STOPPED: The processor (AMD Ryzen 7 3700X 8-Core Processor) has no AVX2', out)
+        out = ps_text(mocks + unknown + "$env:SSBU_ISA = 'x86-64-v2'; " + step + isa)
+        self.assertIn('isa=x86-64-v2', out)   # what the person set stays
+        # SSE4.2 without AVX2: built for older processors (x86-64-v2), said, not stopped
+        out = ps_text(mocks + "$env:SSBU_ISA = $null; function Test-CpuFeature { param([int]$Feature) $Feature -ne 40 }; "
+                      + step + isa)
+        self.assertIn('AMD Ryzen 7 3700X 8-Core Processor - has no AVX2: the game is built for older processors (x86-64-v2)', out)
+        self.assertIn('isa=\n', out.replace('\r', '') + '\n')   # (the build asks Windows itself)
+        self.assertNotIn('STOPPED', out)
+        out = ps_text(mocks + "function Test-CpuFeature { $false }; " + step)   # below x86-64-v2: stopped
+        self.assertIn('STOPPED: The processor (AMD Ryzen 7 3700X 8-Core Processor) has no SSE4.2', out)
 
     def test_source_version(self):
         sha = '9fdc8fd21b3fde86c3e58a1e634a7e76a87220c7'

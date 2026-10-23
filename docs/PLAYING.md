@@ -227,6 +227,6 @@ When the game crashes, or freezes with no new picture for five seconds, WindowSm
 
 When you report a problem, attach the `.txt` report and the end of `build\play.log`. Read them first: they can contain folder names, player names and internet addresses. **Share a `.dmp` file only privately**, with someone who asked for it, because it contains part of the game's memory. [Getting help](../README.md#getting-help) lists what else to include.
 
-If the game doesn't start at all, check, in this order: the game data path ([step 10](BUILDING.md#step-10-connect-your-game-data)), that the game is version 13.0.5 (a game built from another version says so when it starts: [what to do](UPDATES.md#a-folder-built-from-another-version)), the six font files, that your processor has AVX2, and your graphics driver.
+If the game doesn't start at all, check, in this order: the game data path ([step 10](BUILDING.md#step-10-connect-your-game-data)), that the game is version 13.0.5 (a game built from another version says so when it starts: [what to do](UPDATES.md#a-folder-built-from-another-version)), the six font files, that your processor has SSE4.2 at the least (a game built for AVX2 says so when it starts on a processor without it, and what to do: [the instruction set](BUILDING.md#the-instruction-set)), and your graphics driver.
 
 WindowSmash is experimental. That it starts doesn't mean every fighter, stage, mode or online match works.
