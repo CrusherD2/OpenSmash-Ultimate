@@ -894,6 +894,15 @@ static void test_files(void) {
     snprintf(other, sizeof other, "%s\\sub", dir);
     CHECK(CreateDirectoryA(other, NULL) && GetFileAttributesA(other) == FILE_ATTRIBUTE_DIRECTORY, "CreateDirectoryA with backslashes");
     CHECK(MoveFileExA(path, win, 0) && GetFileAttributesA(win) == FILE_ATTRIBUTE_NORMAL && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES, "MoveFileExA");
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE && WriteFile(h, "new", 3, &n, NULL) && FlushFileBuffers(h), "a second file");
+    CloseHandle(h);
+    CHECK(MoveFileExA(path, win, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES,
+          "MoveFileExA over a file, written through");
+    h = CreateFileA(win, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    memset(buf, 0, sizeof buf);
+    CHECK(h != INVALID_HANDLE_VALUE && ReadFile(h, buf, sizeof buf, &n, NULL) && n == 3 && !memcmp(buf, "new", 3), "the moved file replaced the other");
+    CloseHandle(h);
     for (int i = 0; i < 3; i++) {
         snprintf(path, sizeof path, "%s/sub/%c.dat", dir, 'x' + i);
         HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);

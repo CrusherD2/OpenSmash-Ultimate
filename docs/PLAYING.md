@@ -211,6 +211,8 @@ All of these are in the WindowSmash folder:
 | Your online name, lobby and direct connections | `online_name.txt`, `online_server.txt`, `online_direct.txt` |
 | Your multiplayer identity | `netplay_id.txt`. Don't copy it to another PC: two PCs with the same one look like one player. |
 
+Your save is written as the console writes it: what the game saves reaches the `save` folder all at once, when the game finishes saving. A crash or a power cut while it saves leaves your last complete save, never half of one. While the game runs, the `save` folder also holds the changes not saved yet, in a folder ending in `.work.` and a number, beside your save's own folder; for a moment while it saves, a `.journal.` file and a `.commit` file too, and on Linux and macOS a `.lock` file. Leave them be: the next start finishes a save that was cut short and clears the rest.
+
 > [!TIP]
 > **Back up your save** now and then: copy the `save` folder somewhere safe while the game is closed. To restore it, close the game and copy it back.
 
