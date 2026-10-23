@@ -17,8 +17,12 @@ of (which say why an object is compiled again), and each source's SHA-256 with i
 recorded once it has compiled (Record.compiled) and forgotten before it is compiled again
 (Record.forget), the record written whole each time (a new file, then os.replace): a build that
 stops half-way, or a file that fails to compile, leaves no key for an object it did not make.
-No record, or one that cannot be read: its objects are compiled again. One there that cannot be
-opened (another program holding it) stops the build before anything is compiled or removed."""
+No record, or one that cannot be read: its objects are compiled again - except in a game folder an
+older version built, which has objects but has never had a record (adopt_by_date): there an object
+newer than its sources and than every runtime header is taken as current, as the old rule (by date)
+took it, and recorded, so updating to this version does not compile the whole game again. One
+there that cannot be opened (another program holding it) stops the build before anything is
+compiled or removed."""
 import functools
 import hashlib
 import json
@@ -134,12 +138,16 @@ class Record:
     save() keeps the objects and sources this Record looked at (check, compiled): a build looks at
     every object of its folder, and one it did not look at is no longer built there."""
 
-    def __init__(self, folder, scan=(), log=print):
+    def __init__(self, folder, scan=(), log=print, adopt_by_date=None):
+        """adopt_by_date: the runtime headers (paths) of a game folder. If the folder has no record at
+        all (an older version built it), an object there newer than its sources and these headers is
+        taken as current: what the old rule did. None: an object without a key is compiled again."""
         self.folder, self.path, self.scan, self.log = folder, os.path.join(folder, RECORD), tuple(scan), log
         self.lock = threading.Lock()
         self.objects, self.sources = {}, {}
         self.seen_objects, self.seen_sources, self.recent = set(), set(), set()
         self.unrecorded = UNRECORDED
+        self.adopt_ns, self.adopted, self.inputs = None, 0, {}
         try:
             with _retried(lambda: open(self.path, encoding="utf-8")) as f:
                 data = json.load(f)
@@ -148,7 +156,8 @@ class Record:
             self.objects = {k: v for k, v in data["objects"].items() if isinstance(v, dict)}
             self.sources = {k: v for k, v in data["sources"].items() if isinstance(v, list) and len(v) == 4}
         except FileNotFoundError:
-            pass
+            if adopt_by_date is not None:
+                self.adopt_ns = max((os.stat(h).st_mtime_ns for h in adopt_by_date), default=0)
         except OSError as e:   # there but not to be opened: not taken for no record, which compiles hours again
             raise SystemExit(f"{self.path} could not be opened ({e}). Build again once no other program holds it "
                              f"open; deleting it compiles the objects in {folder} again.") from e
@@ -184,7 +193,11 @@ class Record:
         `compiler` (compiler_id) and runtime headers whose digest_files is `headers`; with its parts."""
         parts = {"compiler": sha(compiler), "command": sha(*command), "headers": headers,
                  "source": sha(*(self.source(p)[0] for p in sources))}
-        return {"key": sha(*(parts[p] for p in PARTS)), **{p: parts[p][:16] for p in PARTS}}
+        entry = {"key": sha(*(parts[p] for p in PARTS)), **{p: parts[p][:16] for p in PARTS}}
+        if self.adopt_ns is not None:
+            with self.lock:
+                self.inputs[entry["key"]] = [os.path.abspath(p) for p in sources]
+        return entry
 
     def check(self, obj, entry):
         """None if the object is there and was compiled with this key, else why it is to be compiled."""
@@ -195,12 +208,29 @@ class Record:
         if not os.path.exists(obj):
             return NEW
         if not was:
+            if self.adopt_ns is not None and self._older_rule_kept(obj, entry):
+                with self.lock:
+                    self.objects[name] = entry
+                    self.adopted += 1
+                return None
             return self.unrecorded
         if was.get("key") == entry["key"]:
             return None
         if was.get("source") != entry["source"]:
             return CHANGED   # (the cause even when its level or language changed with it)
         return next((why for p, why in zip(PARTS, (COMPILER, COMMAND, HEADERS)) if was.get(p) != entry[p]), CHANGED)
+
+    def _older_rule_kept(self, obj, entry):
+        """Whether the rule before this record (by date) kept this object: newer than its sources and
+        the runtime headers."""
+        with self.lock:
+            sources = self.inputs.get(entry["key"])
+        if not sources:
+            return False
+        try:
+            return os.stat(obj).st_mtime_ns >= max([self.adopt_ns] + [os.stat(p).st_mtime_ns for p in sources])
+        except OSError:
+            return False
 
     def forget(self, objs):
         """Before these objects are compiled: their keys gone from the record on disk. A record that
@@ -224,6 +254,10 @@ class Record:
 
     def save(self):
         with self.lock:
+            if self.adopted:   # (said once: the record now holds them)
+                self.log(f"{self.folder}: {self.adopted} object{'s' if self.adopted != 1 else ''} an older version "
+                         "compiled taken as current (newer than their sources and the runtime headers) and recorded")
+                self.adopted = 0
             try:
                 self._save()
             except OSError as e:   # (the sources' digests: they are read again next time)

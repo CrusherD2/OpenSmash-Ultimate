@@ -375,6 +375,31 @@ class WindowsBuildTests(Folder):
         self.assertEqual(self.compile(), (True, ['g0000.c /O1']))
         self.assertNotIn('to compile again', self.said)
 
+    def test_a_folder_an_older_version_built_is_not_compiled_again(self):
+        """No record at all (built before objcache.py): an object newer than its C and the runtime headers is taken
+        as current, as the old rule (by date) took it, and recorded; an older one, or any after a header changed
+        since, is compiled. A record that is there is never second-guessed by date."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.compile(), (True, []))
+        self.assertIn('3 objects an older version compiled taken as current', self.said)
+        self.assertEqual(sorted(json.loads(record.read_text())['objects']), ['g0000.obj', 'g0001.obj', 'g_module.obj'])
+        self.assertEqual(self.compile(), (True, []))
+        self.assertNotIn('taken as current', self.said)
+        record.unlink()
+        old = time.time() - 7200   # (older than its C, written an hour ago)
+        os.utime(self.module / 'g0000.obj', (old, old))
+        self.assertEqual(self.compile(), (True, ['g0000.c /O2']))
+        self.assertIn('2 objects an older version compiled taken as current', self.said)
+        record.unlink()
+        touch(self.runtime / 'lanes.h')   # (a header newer than the objects: the old rule can't vouch for them)
+        self.assertEqual(self.compile(), (True, every))
+        self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+        self.flags[1] = '/arch:SSE4.2'   # (with a record: by key alone)
+        self.assertEqual(self.compile(), (True, every))
+
     def test_the_folder_spelled_another_way_or_moved(self):
         """The key names a file and its object by their names in the folder: build/main, ./build/main, the
         full path (build\\main on Windows), or the build folder moved, compile nothing again."""
@@ -542,6 +567,14 @@ class LinuxBuildTests(Folder):
         write(self.tree / 'build' / 'main' / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { __try { } }\n')
         self.assertEqual(self.build(), (True, ['g0000_cxx.cpp -O2']))   # (now C++: said as a change to its C)
         self.assertNotIn('to compile again', self.said)
+
+    def test_a_folder_an_older_version_built_is_not_compiled_again(self):
+        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept."""
+        self.build()
+        (self.out / 'main' / objcache.RECORD).unlink()
+        self.assertEqual(self.build(), (True, []))
+        self.assertIn('3 objects an older version compiled taken as current', self.said)
+        self.assertEqual(self.build(), (True, []))
 
     def test_landing_sites_found_once(self):
         """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""

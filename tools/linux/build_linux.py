@@ -123,7 +123,9 @@ def game_jobs():
     headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, h)) for h in ("recomp.h", "module.h")}
     jobs, why = [], Counter()
     for name, src_dir, out_dir in modules():
-        record = objcache.Record(out_dir, scan=(LANDING_SITES,))
+        # (a folder an older version built, without a record: its objects that the date said were current are kept)
+        record = objcache.Record(out_dir, scan=(LANDING_SITES,),
+                                 adopt_by_date=objcache.header_files(RUNTIME, "recomp.h", "module.h"))
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:

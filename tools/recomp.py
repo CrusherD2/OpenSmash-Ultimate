@@ -500,7 +500,9 @@ def plan(outdir):
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
-    record, compiler = objcache.Record(outdir), objcache.compiler_id(cc.CLANG)
+    # (a folder an older version built, without a record: its objects that the date said were current are kept)
+    record = objcache.Record(outdir, adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"))
+    compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, h)) for h in ("recomp.h", "module.h")}
     todo, keys, why = [], {}, Counter()
     for name, insns, biggest in rows + [["g_module.c", "0", "0"]]:
