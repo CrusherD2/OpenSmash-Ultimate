@@ -6,7 +6,7 @@ Usage:
   recomp.py emit     <nso> --roots <off>[,<off>...] --out <file.c> [--depth N]
   recomp.py emit     <nso> --sample N --out <file.c>
   recomp.py image    <nso> --out <file.bin>
-  recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS]
+  recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS] [--exefs <dir>]
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N] [--generate-only]
@@ -36,6 +36,8 @@ its guest address, so names are unique across modules. A module function whose e
 name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a forwarder to
 it, so the replacement is reached by every caller, including direct calls inside the module.
 tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list).
+When it has an exact-callee, build reads main, subsdk0 and sdk from --exefs (dump/exefs if not
+given) for the import stubs bound to it (hook_imports).
 """
 import bisect
 import hashlib
@@ -224,13 +226,14 @@ HOOK_KINDS = ("exact-callee", "exact-caller")
 # `<kind> <address> [<n> words, sha256 <16 hex digits>] <name>`
 HOOK_LINE = re.compile(r"(\S+)\s+(?:0x)?([0-9a-fA-F]+)(?:\s+(\d+) words?, sha256 ([0-9a-f]{16}))?\s+(\S+)")
 HOOK_NAME = re.compile(r"[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*")
+# 8 hex digits, maybe some masked as '.' (the form HLE_WRAP signatures once spelled the game's
+# code in), next to anything but another letter or digit (inside a longer run: an address, a hash)
+WORD_LIKE = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9A-Fa-f.]{8})(?![0-9A-Za-z])")
 
 
 def word_like(text):
-    """Whether text holds what could be an instruction word: 8 hex digits, maybe some masked as
-    '.' (the form HLE_WRAP signatures once spelled the game's code in)."""
-    return any(re.fullmatch(r"(?:0x)?[0-9a-fA-F.]{8}", t) and re.search(r"[0-9a-fA-F]", t.removeprefix("0x"))
-               for t in re.split(r"[\s,;:()\[\]{}<>=\"'`]+", text))
+    """Whether text holds what could be an instruction word (WORD_LIKE)."""
+    return any(re.search(r"[0-9A-Fa-f]", m.group(1)) for m in WORD_LIKE.finditer(text))
 
 
 def hook_list(path=None):
@@ -242,7 +245,7 @@ def hook_list(path=None):
     if not os.path.exists(path):
         return {}
     found = {}
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:   # (as some Windows editors save it: with a BOM)
         lines = f.read().splitlines()
     for n, line in enumerate(lines, 1):
         where = f"tools/hooks.txt line {n}"
@@ -272,10 +275,53 @@ def hook_list(path=None):
     return found
 
 
-def resolve_hooks(mod, base, sizes, name):
+def hook_imports(mods):
+    """{symbol: address} for each name the loader binds to an exact-callee of tools/hooks.txt:
+    the first of main, subsdk0 and sdk to export a name defines it (runtime/host.c
+    publish_exports; the NROs come later). Other modules call it by that name, through an
+    import stub. mods: name -> nso.Module."""
+    callees = {a for kind, a in hook_list() if kind == "exact-callee"}
+    bound = {}
+    for name in ("main", "subsdk0", "sdk") if callees else ():
+        if name in mods:
+            for n, v, _s, _info, _x in mods[name].exports:
+                bound.setdefault(n, MODULES[name] + v)
+    return {n: a for n, a in bound.items() if a in callees}
+
+
+def import_stub_symbols(mod):
+    """{import stub offset: the symbol its GOT slot is bound to}."""
+    from funcs import import_stubs
+    slots = {r[0]: mod.symbols[r[2]][0] for r in mod.relocs if r[2]}
+    return {stub: slots[slot] for stub, slot in import_stubs(mod).items() if slot in slots}
+
+
+def close_over_tail_calls(callees, tails):
+    """callees and every function that reaches one of them by tail calls ({function: the
+    functions it jumps to}, lift.tail_calls)."""
+    jumpers = {}
+    for f, targets in tails.items():
+        for t in targets:
+            jumpers.setdefault(t, set()).add(f)
+    out, work = set(callees), list(callees)
+    while work:
+        for f in jumpers.get(work.pop(), ()):
+            if f not in out:
+                out.add(f)
+                work.append(f)
+    return out
+
+
+def resolve_hooks(mod, base, sizes, name, entries=None, imports=None):
     """This module's entries of tools/hooks.txt: (exact-callee offsets, exact-caller offsets),
     for the Lifter. As with a wrap, each must be a function start that begins as its signature
-    (if any) says: one that isn't stops the build rather than leave a hook's registers stale."""
+    (if any) says: one that isn't stops the build rather than leave a hook's registers stale.
+
+    A hook's registers are those of the call it returns to (its LR), so exact-callees are also:
+    this module's import stubs bound to one (imports: hook_imports), which calls from another
+    module go through; and every function that reaches one by tail calls (lift.tail_calls, with
+    the Lifter's entries; by default the function starts), since what it reaches returns to the
+    caller of the function that jumped."""
     exact = {kind: set() for kind in HOOK_KINDS}
     for (kind, a), sig in sorted(hook_list().items()):
         if max((b for b in MODULES.values() if b <= a), default=None) != base:
@@ -288,7 +334,13 @@ def resolve_hooks(mod, base, sizes, name):
             raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: the function there does not begin as its "
                              "signature says (the list is for game version 13.0.5)")
         exact[kind].add(off)
-    return exact["exact-callee"], exact["exact-caller"]
+    callees = exact["exact-callee"]
+    if imports:
+        callees |= {stub for stub, sym in import_stub_symbols(mod).items() if sym in imports and stub in sizes}
+    if callees:
+        from lift import tail_calls
+        callees = close_over_tail_calls(callees, tail_calls(mod.image, sorted(sizes.items()), entries or set(sizes)))
+    return callees, exact["exact-caller"]
 
 
 def tools_fingerprint():
@@ -336,10 +388,8 @@ SETJMP_NAMES = {"setjmp", "_setjmp", "__setjmp"}
 
 def setjmp_targets(mod):
     """Where calls to setjmp land in this module: its own definitions and its import stubs."""
-    from funcs import import_stubs
     targets = {v for n, v, _s, info, _x in mod.exports if n in SETJMP_NAMES}
-    slots = {r[0]: mod.symbols[r[2]][0] for r in mod.relocs if r[2]}
-    targets |= {stub for stub, slot in import_stubs(mod).items() if slots.get(slot) in SETJMP_NAMES}
+    targets |= {stub for stub, sym in import_stub_symbols(mod).items() if sym in SETJMP_NAMES}
     return targets
 
 
@@ -560,7 +610,8 @@ def module_table(mod, name, base, funcs, missing):
     return "".join(out), len(imports), len(relocs)
 
 
-def build(path, outdir, jobs, per_file):
+def build(path, outdir, jobs, per_file, imports=None):
+    """imports: hook_imports, for this module's import stubs (none: the stubs are not exact)."""
     mod, found, funcs = load(path)
     name, base = module_key(path), base_of(path)
     os.makedirs(outdir, exist_ok=True)
@@ -569,7 +620,7 @@ def build(path, outdir, jobs, per_file):
     forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
     forward.update(unwind_jumpto(mod, found))
     forward.update(resolve_wraps(mod, base, dict(funcs), name))
-    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name)
+    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name, set(found), imports)
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -735,6 +786,7 @@ def build_all(exefs, out, jobs, compile_c=True):
         shown.module(name, (mod.text.end - mod.text.mem) // 4,
                      [(t[0], t[3]) for t in stale_files(targets[name])] if current else None)
     build_ids = {name: mod.build_id for name, mod in mods.items()}
+    imports = hook_imports(mods)
     del mods   # (the compilers want the memory)
     exe = os.path.join(out, "ssbu.exe")
     with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):
@@ -749,7 +801,7 @@ def build_all(exefs, out, jobs, compile_c=True):
                 print(f"{name}: C up to date (build id {build_id[:16]}, same tools)")
                 reused += 1
             else:
-                build(nso, target, jobs, 40000)
+                build(nso, target, jobs, 40000, imports)
             if not compile_c:
                 modcache.write_stamp(target, build_id, base, name, fp)
             shown.written(name, [(t[0], t[3]) for t in stale_files(target)])
@@ -784,7 +836,14 @@ if __name__ == "__main__":
     elif cmd == "image":
         image(nso, arg("--out"))
     elif cmd == "build":
-        build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")))
+        imports = None
+        if any(kind == "exact-callee" for kind, _a in hook_list()):   # (this module's import stubs: hook_imports)
+            exefs = arg("--exefs", os.path.join(ROOT, "dump", "exefs"))
+            if not all(os.path.isfile(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")):
+                sys.exit(f"tools/hooks.txt has exact-callees, and finding the import stubs bound to them needs "
+                         f"main, subsdk0 and sdk: not all in {exefs} (--exefs <dir>)")
+            imports = hook_imports({n: Module(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")})
+        build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")), imports)
     elif cmd in ("compile", "link") and sys.platform == "darwin":
         sys.exit(f"recomp.py {cmd} builds with clang-cl, for Windows: on macOS, tools/mac/build_mac.py compiles and links")
     elif cmd == "compile":

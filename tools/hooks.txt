@@ -13,9 +13,17 @@
 #   exact-caller <address> [<signature>] <name>
 #       every call the function makes (direct, indirect, svc) does the same
 #
-# A register the caller never writes holds what the context held when the caller was entered,
-# which is exact only if that call was too. A call through a pointer (blr) cannot be known to
-# reach an exact-callee: list its caller as an exact-caller. docs/TECHNICAL.md has the rest.
+# A hook's caller is the code it returns to (where its LR points), so an exact-callee also
+# makes exact, in every module:
+#   - the calls to a function that reaches it without a call of its own (by b, b.cond, cbz or
+#     tbz, or by running on into it), directly or through others that do
+#   - the calls through an import stub bound to its exported name (calls from another module
+#     go through these)
+# A call through a pointer (blr), or a jump through a register (br), cannot be known to reach
+# it: list the function such a call returns to as an exact-caller. (For the same reason, what
+# an exact-caller jumps to without a call sees registers only as exact as the call that reached
+# the exact-caller.) A register the caller never writes holds what the context held when the
+# caller was entered, which is exact only if that call was too. docs/TECHNICAL.md has the rest.
 #
 # <address>  where the function starts in game version 13.0.5, in main, subsdk0 or sdk (a
 #            fighter module's address is each install's own)

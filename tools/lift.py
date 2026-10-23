@@ -109,6 +109,45 @@ def mark_syncs(s, exact=False):
     return s
 
 
+def jump_target(w, pc):
+    """Where the b, b.cond, cbz/cbnz or tbz/tbnz at pc goes (the branches Lifter.goto lifts), or None."""
+    if w >> 26 == 5:
+        return pc + (sx(w & 0x3FFFFFF, 26) << 2)
+    if (w >> 25) & 0x3F == 0x1A or (w >> 24 == 0x54 and not (w >> 4) & 1):
+        return pc + (sx((w >> 5) & 0x7FFFF, 19) << 2)
+    if (w >> 25) & 0x3F == 0x1B:
+        return pc + (sx((w >> 5) & 0x3FFF, 14) << 2)
+    return None
+
+
+def tail_calls(image, funcs, entries):
+    """{function: the functions it jumps to without a call}, as the Lifter lifts them (TAIL): a
+    b, b.cond, cbz/cbnz or tbz/tbnz to another function's entry (goto), and a last instruction
+    that runs on into the next function (lift_function). funcs: [(offset, size)]; entries: the
+    Lifter's. Not a br through a register: where that goes is known only when it runs."""
+    out = {}
+    for a, size in funcs:
+        end = a + size
+        code = bytes(image[a:end])
+        for m in re.finditer(rb"[\x14-\x17\x34-\x37\x54\xb4-\xb7]", code[3::4]):   # those branches' top bytes
+            t = jump_target(struct.unpack_from("<I", code, m.start() * 4)[0], a + m.start() * 4)
+            if t is not None and not a <= t < end and t in entries:
+                out.setdefault(a, set()).add(t)
+        if size < 4 or end not in entries:
+            continue
+        last = (size & ~3) - 4
+        w = struct.unpack_from("<I", code, last)[0]
+        if w >> 26 == 5 or (w >> 24 == 0x54 and not (w >> 4) & 1 and w & 15 >= 14):   # b, b.al
+            t = jump_target(w, a + last)
+            ends = a <= t < end or t in entries   # (into another function's body: a trap, which runs on)
+        else:   # ret, br, an exception-generating instruction, udf
+            ends = (w & 0xFFFFFC1F in (0xD65F0000, 0xD61F0000) or (w >> 24 == 0xD4 and w & 0xFFE0001F != 0xD4000001)
+                    or w >> 16 == 0 or w == 0xE7FFDEFE)
+        if not ends:
+            out.setdefault(a, set()).add(end)
+    return out
+
+
 def fp_imm8(imm8):
     b6 = (imm8 >> 6) & 1
     exp = ((b6 ^ 1) << 10) | ((0xFF if b6 else 0) << 2) | ((imm8 >> 4) & 3)
@@ -202,8 +241,9 @@ class Lifter(SimdMixin):
             return "if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;"
         self.callees.add(target)
         if target in self.exact_callees:
-            # (a call through rt_lookup cannot be known to reach one: list its caller as an
-            # exact-caller. A tail call is already exact: every exit stores every register.)
+            # (recomp.resolve_hooks adds the functions that reach one by a tail call and the
+            # import stubs other modules call it through. A call through rt_lookup cannot be
+            # known to reach one: its caller is listed as an exact-caller instead.)
             self.exact_sites.add(ret - 4)
         return self.landing(ret, f"X(30) = {const(self.base +ret)}; f_{self.base + target:x}(c);")
 
