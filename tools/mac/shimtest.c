@@ -1481,20 +1481,7 @@ static void test_host(void) {
     status = run_game(dir, "abort", out, sizeof out);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5 && strstr(out, "*** host exception (signal 6: abort) during SDK initialisation"),
           "an abort's report (status %#x):\n%s", status, out);
-    /* KNOWN RUNTIME BUG (runtime/host.c: guest_of, print_frames): a frame's return address is looked
-     * up as it is, not as the call before it. g_abort's last instruction is its call to abort()
-     * (noreturn), so that call returns to the first instruction of whatever the linker put next.
-     * Where that is g_start (as built on GitHub's macos-15 runner, whose clang keeps g_abort in its
-     * place before g_start; Apple clang 21 marks it cold and the linker moves it to the end of __text), the report
-     * names sdk+0x200 in main+0x600's place. Only that layout is let through, and loudly; any other
-     * report without main+0x600 fails. Remove this once guest_of is given ra - 1 for return addresses. */
-    char after_abort[160];
-    snprintf(after_abort, sizeof after_abort, "] abort\n  host frame [%s +%#llx] g_start\n", strrchr(rt_exe_path(), '/') + 1,
-             (unsigned long long)((uintptr_t)g_start - (uintptr_t)&_mh_execute_header));
-    if (!strstr(out, "main+0x600") && strstr(out, after_abort))
-        printf("KNOWN BUG %s:%d: an abort's guest backtrace names sdk+0x200, not main+0x600 (g_abort's call returns to g_start's first instruction; runtime/host.c looks up return addresses as they are)\n",
-               __FILE__, __LINE__);
-    else CHECK(strstr(out, "main+0x600"), "an abort's guest backtrace (want main+0x600):\n%s", out);
+    CHECK(strstr(out, "main+0x600"), "an abort's guest backtrace (want main+0x600):\n%s", out);
 
     /* started as `open` starts the app: from /, output to SSBU_LOG, no directory given - the
      * tree's modules (<tree>/build-mac/WindowSmash.app/Contents/MacOS/ssbu), the root (the
