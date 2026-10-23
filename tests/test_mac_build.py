@@ -678,9 +678,6 @@ class TestProgramTests(unittest.TestCase):
             with open(os.path.join(tmp, 'ssbu.syms'), 'w') as syms:   # (the profiler's names)
                 subprocess.run(['nm', '-n', '--defined-only', exe], stdout=syms, check=True)
             out = self.run_program(exe, cwd=tmp)
-            for line in out.splitlines():   # (a known runtime bug, let through only in the layout that shows it: shimtest.c)
-                if line.startswith('KNOWN BUG '):
-                    print(f'::warning title=shimtest: known runtime bug::{line}', flush=True)
             self.assertRegex(out, r'\n\d+ checks, 0 failed\n$')
 
     def test_msltest(self):
