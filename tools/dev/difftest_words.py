@@ -285,6 +285,22 @@ def data_processing(rng):
     return out
 
 
+def crc32(rng):
+    """crc32b/h/w/x and crc32cb/ch/cw/cx with distinct registers, rd = rn, rd = rm, rn = rm, and wzr / xzr
+    as operands; and the unallocated pairings of sf and size (x with a byte, half or word; w with x)."""
+    out = []
+    for c in (0, 1):
+        for sz in range(4):
+            for sf in (0, 1):
+                rd, rn, rm = regs(rng, 3)
+                cases = [(rd, rn, rm)]
+                if sf == (sz == 3):
+                    cases += [(rd, rd, rm), (rd, rn, rd), (rd, rn, rn), (rd, 31, rm), (rd, rn, 31)]
+                for d, n, m in cases:
+                    out.append(sf << 31 | 0x1AC04000 | m << 16 | c << 12 | sz << 10 | n << 5 | d)
+    return out
+
+
 def loads_stores(rng):
     """Register-offset forms with every extend and scale, for every size, sign and register file."""
     out = []
@@ -424,6 +440,7 @@ EDGES = [
     ("move wide", move_wide),
     ("conditional select / compare", conditionals),
     ("data processing", data_processing),
+    ("crc32", crc32),
     ("register offset", loads_stores),
     ("fp scalar", fp_scalar),
     ("advsimd shift by immediate", simd_shifts),

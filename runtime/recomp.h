@@ -167,6 +167,43 @@ static inline u64 rev32_64(u64 v) { return ((u64)__builtin_bswap32((u32)(v >> 32
 static inline u64 umulh64(u64 a, u64 b) { return (u64)(((unsigned __int128)a * b) >> 64); }
 static inline u64 smulh64(u64 a, u64 b) { return (u64)(((__int128)(i64)a * (i64)b) >> 64); }
 
+/* crc32b/h/w/x and crc32cb/ch/cw/cx: the reflected CRC of the low 8, 16, 32 or 64 bits of v,
+ * least significant bit first, continuing acc, with no inversion before or after. The bitwise
+ * form is the definition; the host's instruction where it has one (x86's crc32 is CRC-32C only). */
+#define RT_CRC32_POLY 0xEDB88320u    /* 0x04C11DB7, reflected */
+#define RT_CRC32C_POLY 0x82F63B78u   /* 0x1EDC6F41 (Castagnoli), reflected */
+static inline u32 rt_crc32_bits(u32 acc, u64 v, int bits, u32 poly) {
+    u64 x = acc ^ v;
+    for (int i = 0; i < bits; i++) x = (x >> 1) ^ (poly & (0u - (u32)(x & 1)));
+    return (u32)x;
+}
+#if defined(__ARM_FEATURE_CRC32)
+static inline u32 rt_crc32b(u32 acc, u8 v)  { return __builtin_arm_crc32b(acc, v); }
+static inline u32 rt_crc32h(u32 acc, u16 v) { return __builtin_arm_crc32h(acc, v); }
+static inline u32 rt_crc32w(u32 acc, u32 v) { return __builtin_arm_crc32w(acc, v); }
+static inline u32 rt_crc32x(u32 acc, u64 v) { return __builtin_arm_crc32d(acc, v); }
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return __builtin_arm_crc32cb(acc, v); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_arm_crc32ch(acc, v); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return __builtin_arm_crc32cw(acc, v); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return __builtin_arm_crc32cd(acc, v); }
+#else
+static inline u32 rt_crc32b(u32 acc, u8 v)  { return rt_crc32_bits(acc, v, 8, RT_CRC32_POLY); }
+static inline u32 rt_crc32h(u32 acc, u16 v) { return rt_crc32_bits(acc, v, 16, RT_CRC32_POLY); }
+static inline u32 rt_crc32w(u32 acc, u32 v) { return rt_crc32_bits(acc, v, 32, RT_CRC32_POLY); }
+static inline u32 rt_crc32x(u32 acc, u64 v) { return rt_crc32_bits(acc, v, 64, RT_CRC32_POLY); }
+#if defined(__SSE4_2__)
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return __builtin_ia32_crc32qi(acc, v); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_ia32_crc32hi(acc, v); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return __builtin_ia32_crc32si(acc, v); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return (u32)__builtin_ia32_crc32di(acc, v); }
+#else
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return rt_crc32_bits(acc, v, 8, RT_CRC32C_POLY); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return rt_crc32_bits(acc, v, 16, RT_CRC32C_POLY); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return rt_crc32_bits(acc, v, 32, RT_CRC32C_POLY); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return rt_crc32_bits(acc, v, 64, RT_CRC32C_POLY); }
+#endif
+#endif
+
 /* ---- floating point: AArch64 semantics where they differ from x86 -------------- */
 static inline i32 f2i32(f64 v) { return v != v ? 0 : v >= 2147483648.0 ? INT32_MAX : v <= -2147483649.0 ? INT32_MIN : (i32)v; }
 static inline u32 f2u32(f64 v) { return v != v ? 0 : v >= 4294967296.0 ? UINT32_MAX : v <= -1.0 ? 0 : (u32)v; }
