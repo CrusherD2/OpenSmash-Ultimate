@@ -48,6 +48,7 @@ u64 rt_clock_ns(void);                                 /* monotonic time on the 
 u64 rt_guest_copy(const void *data, size_t size);      /* permanent guest-visible copy (e.g. a string) */
 u64 rt_native(GuestFn *fn, const char *name);          /* guest address for a native function */
 u64 rt_symbol(const char *name);                       /* guest address of an exported symbol, or 0 */
+const char *rt_symbol_at(u64 addr, const char *prefix);   /* a name exported at that address starting so, or NULL */
 const char *rt_describe(u64 guest_addr, char *buf, size_t n);   /* "module+0x1234" */
 void rt_backtrace(void);
 void rt_backtrace_thread(HANDLE thread, int max_frames);   /* another thread's guest frames */

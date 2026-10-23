@@ -1246,6 +1246,9 @@ void gfx_report_compiles(void (*line)(const char *text)) { line("(shimtest: no s
 void gfx_status_lines(void) {}   /* (the renderer's [status] lines: none here) */
 void settings_args(int argc, char **argv) { (void)argc; (void)argv; }   /* (hle_settings.c's --online: no netplay here) */
 void display_dpi_aware(void) {}
+int input_seq_on(void) { return 0; }   /* (hle_hid.c's SSBU_SEQ, and hle_movie_skip.c's movies: none here) */
+void input_seq_mark(const char *what) { (void)what; }
+void movie_test_start(void) {}
 void fiber_counts(u32 *slots, u32 *finalized, u64 *made) { *slots = *finalized = 0; *made = 0; }
 void *ipc_connect(const char *port) { return !strcmp(port, "sm:") ? (void *)&checks : NULL; }
 u32 ipc_request(Cpu *c, void *session, u64 message, u64 size) { (void)c; (void)session; (void)message; (void)size; return 0; }

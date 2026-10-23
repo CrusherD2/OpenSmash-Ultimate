@@ -19,6 +19,7 @@ This document describes the checked-in implementation. Implemented paths and dev
 | [7. Tool reference](#7-tool-reference) | Every tool in `tools/`. |
 | [Verification and debugging](#verification-and-debugging) | Tests, the overlay, reports and diagnostic switches. |
 | [Build boundaries](#build-boundaries) | What is source, and what stays local. |
+| [Test runs](#test-runs) | Fast-forward, input counted in frames, movie skip, and the game addresses the test modes use. |
 
 ## 1. From extracted modules to a Windows executable
 
@@ -297,3 +298,13 @@ Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSB
 ## Build boundaries
 
 Checked-in code defines the recompiler and native runtime. Local game inputs supply the guest program and assets. A runtime release contains the compiled executable/module images but still requires separately supplied game data and fonts. Generated C, binaries, caches, captures, and personal data stay out of the Git source tree.
+
+## Test runs
+
+Switches for scripted runs. Each is off unless it is set, and the game then runs exactly as before. [TESTING-RUNS.md](TESTING-RUNS.md) says what each one guarantees and gives an example.
+
+- `SSBU_SPEED`: fast-forward. The game gets one refresh per frame shown, at n × 60 a second, or uncapped with 0. Audio is not touched.
+- `SSBU_SEQ`: player 1's input as a sequence counted in the game's frames. It can wait for marks and for screens known by their draw count. `SSBU_SEQ_LOG` logs those counts, and `SSBU_SEQ_KEYBOARD` keeps the keyboard playing.
+- `SSBU_SKIP_MOVIES`: each movie's stream ends after a few samples, and the game ends the movie itself.
+
+[`game_addr.h`](../runtime/game_addr.h) holds the 13.0.5 game addresses that the test modes ported from ssbu-recomp use, each with 13.0.4's beside it. `tests/test_game_addr.py` checks them against ssbu-recomp's table. [`testruntest.c`](../tools/dev/testruntest.c) checks the sequence parser and step machine on made-up input.
