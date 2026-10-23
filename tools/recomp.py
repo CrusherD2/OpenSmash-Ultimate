@@ -29,11 +29,13 @@ all       image + build + compile every module of an ExeFS, then link; a module 
           macOS all always stops there)
 check     list each module's imports that no module exports and the runtime does not implement
 wrap-sig  print the code signature (a hash) of a guest function, for an HLE_WRAP (see hle_wraps)
+          or a tools/hooks.txt entry
 
 Each module is recompiled for a fixed load address (see MODULES); a function is named after
 its guest address, so names are unique across modules. A module function whose exported
 name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a forwarder to
 it, so the replacement is reached by every caller, including direct calls inside the module.
+tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list).
 """
 import bisect
 import hashlib
@@ -193,6 +195,11 @@ def signature_comment(words):
     return f"/* signature: {len(words)} word{'s' if len(words) != 1 else ''}, sha256 {signature_hash(words)} */"
 
 
+def signature_matches(mod, off, size, sig):
+    """Whether the function at module offset `off` begins as sig, (word count, hash), says. None: no check."""
+    return sig is None or (len(words := signature(mod, off, size, sig[0])) == sig[0] and signature_hash(words) == sig[1])
+
+
 def resolve_wraps(mod, base, sizes, name):
     """This module's wraps: {offset: ("wrap", wrapper)}. Each wrapped function must start at its
     address and begin as its signature says: the addresses are 13.0.5's, and one that isn't there
@@ -205,19 +212,92 @@ def resolve_wraps(mod, base, sizes, name):
         if off not in sizes:
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): no function starts there in this module "
                              "(the runtime's hooks are for game version 13.0.5)")
-        if sig is not None and (len(words := signature(mod, off, sizes[off], sig[0])) != sig[0]
-                                or signature_hash(words) != sig[1]):
+        if not signature_matches(mod, off, sizes[off], sig):
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): the function there does not begin as its signature says "
                              "(the runtime's hooks are for game version 13.0.5)")
         forward[off] = ("wrap", f"hle_wrap_{a:x}")
     return forward
 
 
+HOOKS = os.path.join(ROOT, "tools", "hooks.txt")
+HOOK_KINDS = ("exact-callee", "exact-caller")
+# `<kind> <address> [<n> words, sha256 <16 hex digits>] <name>`
+HOOK_LINE = re.compile(r"(\S+)\s+(?:0x)?([0-9a-fA-F]+)(?:\s+(\d+) words?, sha256 ([0-9a-f]{16}))?\s+(\S+)")
+HOOK_NAME = re.compile(r"[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*")
+
+
+def word_like(text):
+    """Whether text holds what could be an instruction word: 8 hex digits, maybe some masked as
+    '.' (the form HLE_WRAP signatures once spelled the game's code in)."""
+    return any(re.fullmatch(r"(?:0x)?[0-9a-fA-F.]{8}", t) and re.search(r"[0-9a-fA-F]", t.removeprefix("0x"))
+               for t in re.split(r"[\s,;:()\[\]{}<>=\"'`]+", text))
+
+
+def hook_list(path=None):
+    """tools/hooks.txt: {(kind, address): (word count, hash) of its signature, or None}. The
+    functions whose callers' whole register state a hook needs (resolve_hooks); see the file.
+    Read strictly: a line that isn't an entry, a comment or blank, or that holds anything like
+    an instruction word (CONTRIBUTING.md, rule 1), stops the build."""
+    path = path or HOOKS
+    if not os.path.exists(path):
+        return {}
+    found = {}
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    for n, line in enumerate(lines, 1):
+        where = f"tools/hooks.txt line {n}"
+        if word_like(line):
+            raise SystemExit(f"{where}: an 8-digit hex number, which could be one of the game's instruction words: "
+                             "those never go in the repository (CONTRIBUTING.md, rule 1). An address is 13.0.5's, "
+                             "71xxxxxxxx; a signature is a hash (`tools/recomp.py wrap-sig <module> <address>`)")
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        m = HOOK_LINE.fullmatch(text)
+        if not m or m.group(1) not in HOOK_KINDS:
+            raise SystemExit(f"{where}: not `exact-callee|exact-caller <address> [<n> words, sha256 <16 hex digits>] "
+                             f"<name>`: {text}")
+        kind, a, count, digest, name = m.groups()
+        a = int(a, 16)
+        if not MODULES["main"] <= a < modcache.NRO_BASE or a & 3:
+            raise SystemExit(f"{where}: {a:#x} is not a function address in main, subsdk0 or sdk (a fighter "
+                             "module's address is each install's own: dump/nro/bases.txt)")
+        if count is not None and int(count) < 1:
+            raise SystemExit(f"{where}: a signature covers at least one word")
+        if not HOOK_NAME.fullmatch(name) or re.fullmatch(r"[0-9a-fA-F]{8,}", name):
+            raise SystemExit(f"{where}: `{name}` is not a function name")
+        if (kind, a) in found:
+            raise SystemExit(f"{where}: {kind} {a:x} is listed twice")
+        found[(kind, a)] = (int(count), digest) if count else None
+    return found
+
+
+def resolve_hooks(mod, base, sizes, name):
+    """This module's entries of tools/hooks.txt: (exact-callee offsets, exact-caller offsets),
+    for the Lifter. As with a wrap, each must be a function start that begins as its signature
+    (if any) says: one that isn't stops the build rather than leave a hook's registers stale."""
+    exact = {kind: set() for kind in HOOK_KINDS}
+    for (kind, a), sig in sorted(hook_list().items()):
+        if max((b for b in MODULES.values() if b <= a), default=None) != base:
+            continue   # another module's
+        off = a - base
+        if off not in sizes:
+            raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: no function starts there in this module "
+                             "(the list is for game version 13.0.5)")
+        if not signature_matches(mod, off, sizes[off], sig):
+            raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: the function there does not begin as its "
+                             "signature says (the list is for game version 13.0.5)")
+        exact[kind].add(off)
+    return exact["exact-callee"], exact["exact-caller"]
+
+
 def tools_fingerprint():
     """What the generated C depends on besides the module and its address (modcache)."""
     import lift
     wraps = sorted(hle_wraps().items())
-    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + f"\nregcache {int(lift.REGCACHE)}")
+    hooks = sorted(hook_list().items())
+    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + "\n" + repr(hooks)
+                                + f"\nregcache {int(lift.REGCACHE)}")
 
 
 def write_if_changed(path, text):
@@ -231,10 +311,10 @@ def write_if_changed(path, text):
     return True
 
 
-def _init(image_path, entries, base, forward, setjmp=None, pads=None):
+def _init(image_path, entries, base, forward, setjmp=None, pads=None, exact_callees=None, exact_callers=None):
     f = open(image_path, "rb")
     _state["img"] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    _state["args"] = (entries, base, forward, setjmp, pads)
+    _state["args"] = (entries, base, forward, setjmp, pads, exact_callees, exact_callers)
 
 
 def unwind_jumpto(mod, found):
@@ -489,6 +569,7 @@ def build(path, outdir, jobs, per_file):
     forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
     forward.update(unwind_jumpto(mod, found))
     forward.update(resolve_wraps(mod, base, dict(funcs), name))
+    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name)
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -502,7 +583,8 @@ def build(path, outdir, jobs, per_file):
         chunks.append(cur)
     defined = {a for a, _ in funcs}
     missing, manifest, bad, unresolved = set(), [], 0, []
-    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp_targets(mod), pads)) as pool:
+    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp_targets(mod), pads, exact_callees,
+                            exact_callers)) as pool:
         tasks = [(i, c, outdir) for i, c in enumerate(chunks)]
         for fname, ext, insns, biggest, b, unres in pool.imap_unordered(_emit, tasks):
             missing |= ext - defined
