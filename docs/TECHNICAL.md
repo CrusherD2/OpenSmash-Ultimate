@@ -86,7 +86,7 @@ A folder whose `dump/exefs/main` is another version's, set up before WindowSmash
 
 ### Code tied to the game version
 
-- **Hooks in the runtime** (`HLE_WRAP(<address>)`, in `runtime/hle_fiber.c`, `hle_movie.c`, `hle_net.c` and `hle_online.c`) wrap a guest function that isn't exported, at its 13.0.5 address. Each has a code signature on the line above it: its first instructions, with addresses masked out. The recompiler checks that a function starts at that address and begins as its signature says; if not, the build stops rather than leave the hook out. `tools/recomp.py wrap-sig <module> <address>` prints a new hook's signature.
+- **Hooks in the runtime** (`HLE_WRAP(<address>)`, in `runtime/hle_fiber.c`, `hle_movie.c`, `hle_net.c` and `hle_online.c`) wrap a guest function that isn't exported, at its 13.0.5 address. Each has a code signature on the line above it: a hash (SHA-256, first 16 hex digits) of its first instructions, with addresses masked out, and how many instructions that is. The instructions themselves never go in the source, since they are the game's code; the recompiler stops at a signature that spells them out. It checks that a function starts at that address and that its first instructions hash to the signature; if not, the build stops rather than leave the hook out. `tools/recomp.py wrap-sig <module> <address>` prints a new hook's signature.
 - **Unlock All Fighters** writes at 13.0.5's save offsets. It reads main's build ID and changes nothing unless it is 13.0.5's (`LAYOUTS` in `tools/unlock_all.py`, `$knownLayouts` in `tools/Unlock-All-Fighters.ps1`).
 
 ### The imports check
@@ -217,7 +217,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 | [`modcache.py`](../tools/modcache.py) | Keep fighter module addresses (`dump/nro/bases.txt`), the stamp that says a module's build folder is current, and the imports check. |
 | [`nso.py`](../tools/nso.py) | Read NSO/NRO images and dynamic metadata; inspect modules and export ELF representations. |
 | [`funcs.py`](../tools/funcs.py) | Discover functions and optionally write a function inventory. |
-| [`recomp.py`](../tools/recomp.py) | Run `coverage`, `emit`, `image`, `build`, `compile`, `link`, the end-to-end `all` driver, the `check` of unresolved imports, or `wrap-sig` for a hook's code signature. |
+| [`recomp.py`](../tools/recomp.py) | Run `coverage`, `emit`, `image`, `build`, `compile`, `link`, the end-to-end `all` driver, the `check` of unresolved imports, or `wrap-sig` for a hook's code signature (a hash). |
 | [`lift.py`](../tools/lift.py) | AArch64 integer/control-flow lifting implementation. |
 | [`lift_simd.py`](../tools/lift_simd.py) | NEON/AdvSIMD lifting implementation. |
 | [`a64.py`](../tools/a64.py) | Shared instruction-emission helpers, register expressions, types, and unsupported-operation handling. |
