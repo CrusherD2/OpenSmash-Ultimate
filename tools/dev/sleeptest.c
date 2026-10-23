@@ -1,17 +1,20 @@
 /* Offline checks of the sleep behind the guest's svcSleepThread (runtime/sleep.h): that it never
- * ends before the time asked, on one thread or on several at once, and that a sleep of 200 us
- * takes well under the millisecond the old one rounded it up to.
+ * ends before the time asked, on one thread or on several at once, that a sleep of 200 us takes
+ * well under the millisecond the old one rounded it up to, and that SSBU_SLEEP=ms brings that back.
  *
  *   Windows: python -c "import sys; sys.path.insert(0,'tools'); import cc, subprocess; subprocess.run([cc.CLANG, '/nologo', '/O2', *cc.BASE_CFLAGS, 'tools/dev/sleeptest.c', '/Febuild/sleeptest.exe'], check=True)"
  *   Linux:   clang -O2 tools/dev/sleeptest.c -o build/sleeptest -pthread
  *   macOS:   clang -O2 -I runtime/macos/include -I runtime/linux/include tools/dev/sleeptest.c runtime/macos/platform.c -o build/sleeptest
- *   sleeptest early|fine
+ *   sleeptest early|fine, SSBU_SLEEP=ms sleeptest ms
  *
  * early: every sleep at least as long as asked, from 1 us to 2.5 ms, and on four threads at once.
  * fine: the median of 401 sleeps of 200 us under 900 us; on a Windows without high-resolution
  * timers (before 10 1803) it prints "skipped:" and why. Both print what they measured, fine also
- * the old whole-millisecond sleep beside it. Exit code 0 when every check passes.
- * tests/test_sleep.py runs both. */
+ * the old whole-millisecond sleep beside it. Both want SSBU_SLEEP unset.
+ * ms: with SSBU_SLEEP=ms, sleeps of 1 us, 200 us and 1.5 ms are whole milliseconds again: on Linux
+ * and macOS each at least the milliseconds rounded up; on Windows by Sleep(), without a timer
+ * (Sleep() may end early by its own rules: only printed there).
+ * Exit code 0 when every check passes. tests/test_sleep.py runs all three. */
 #define _CRT_SECURE_NO_WARNINGS
 #ifdef _WIN32
 #include <windows.h>
@@ -135,6 +138,7 @@ static void on_threads(void) {
 
 /* ---- the checks --------------------------------------------------------------------------- */
 static void never_early(void) {
+    CHECK(!sleep_whole_ms(), "SSBU_SLEEP=ms is set: this mode wants it unset");
     static const struct { uint64_t ns; int n; } spans[] = {{1000, 200}, {50000, 200}, {200000, 200}, {1000000, 100}, {2500000, 40}};
     for (size_t i = 0; i < sizeof spans / sizeof spans[0]; i++) {
         Stats s = measure(sleep_ns, spans[i].ns, spans[i].n);
@@ -146,6 +150,7 @@ static void never_early(void) {
 }
 
 static int fine(void) {
+    CHECK(!sleep_whole_ms(), "SSBU_SLEEP=ms is set: this mode wants it unset");
     sleep_ns(1000);   /* (this thread's timer made) */
 #ifdef _WIN32
     if (sleep_untimed) {
@@ -169,11 +174,30 @@ static int fine(void) {
     return 1;
 }
 
+static void whole_ms(void) {
+    const char *e = getenv("SSBU_SLEEP");
+    CHECK(sleep_whole_ms(), "SSBU_SLEEP=ms not taken up (SSBU_SLEEP=%s)", e ? e : "(unset)");
+    static const uint64_t spans[] = {1000, 200000, 1500000};
+    for (size_t i = 0; i < sizeof spans / sizeof spans[0]; i++) {
+        Stats s = measure(sleep_ns, spans[i], 10);
+        show("SSBU_SLEEP=ms", spans[i], 10, s);
+#ifndef _WIN32
+        uint64_t ms = (spans[i] + 999999) / 1000000;
+        CHECK(s.min >= ms * 1000000, "a sleep of %llu ns took %llu ns, under the whole %llu ms", (unsigned long long)spans[i],
+              (unsigned long long)s.min, (unsigned long long)ms);
+#endif
+    }
+#ifdef _WIN32
+    CHECK(!sleep_timer && !sleep_untimed, "SSBU_SLEEP=ms slept on the high-resolution timer");
+#endif
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "early";
     if (!strcmp(mode, "early")) never_early();
     else if (!strcmp(mode, "fine")) { if (!fine()) return 0; }
-    else { fprintf(stderr, "usage: sleeptest early|fine\n"); return 2; }
+    else if (!strcmp(mode, "ms")) whole_ms();
+    else { fprintf(stderr, "usage: sleeptest early|fine|ms\n"); return 2; }
     printf("%d checks, %d failed\n", checks, failures);
     return failures != 0;
 }

@@ -1,8 +1,8 @@
 """The sleep behind the guest's svcSleepThread (runtime/sleep.h) through tools/dev/sleeptest.c, built with
-the platform's compiler and run: never shorter than asked, and a sleep of 200 us well under the
-millisecond it used to be rounded up to. Windows: clang-cl (skipped without it); Linux: clang; macOS
-(arm64, as the port): clang, with runtime/macos/platform.c, whose timer it sleeps on. What it measured
-is printed, for the CI logs."""
+the platform's compiler and run: never shorter than asked, a sleep of 200 us well under the
+millisecond it used to be rounded up to, and SSBU_SLEEP=ms bringing the whole milliseconds back.
+Windows: clang-cl (skipped without it); Linux: clang; macOS (arm64, as the port): clang, with
+runtime/macos/platform.c, whose timer it sleeps on. What it measured is printed, for the CI logs."""
 from pathlib import Path
 import os
 import platform
@@ -49,17 +49,17 @@ class SleepTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dir = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls.dir, ignore_errors=True)   # (also when the build fails)
         cmd, cls.exe = build(cls.dir)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             raise AssertionError('sleeptest.c did not build:\n' + r.stdout + r.stderr)
 
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.dir, ignore_errors=True)
-
-    def run_test(self, mode):
-        r = subprocess.run([self.exe, mode], capture_output=True, text=True, timeout=120)
+    def run_test(self, mode, whole_ms=False):
+        env = {k: v for k, v in os.environ.items() if k != 'SSBU_SLEEP'}
+        if whole_ms:
+            env['SSBU_SLEEP'] = 'ms'
+        r = subprocess.run([self.exe, mode], capture_output=True, text=True, timeout=120, env=env)
         print('\nsleeptest %s:\n%s' % (mode, r.stdout), end='', flush=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout
@@ -77,6 +77,11 @@ class SleepTests(unittest.TestCase):
         if skipped:
             self.skipTest(skipped.group(1))
         self.assertIn(' 0 failed', out)
+
+    def test_whole_ms_switch(self):
+        """SSBU_SLEEP=ms: whole milliseconds, rounded up, as before (Linux, macOS: each sleep at least
+        that; Windows: by Sleep(), with no high-resolution timer made)."""
+        self.assertIn(' 0 failed', self.run_test('ms', whole_ms=True))
 
 
 if __name__ == '__main__':
