@@ -245,7 +245,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 
 | Tool | Role |
 | :--- | :--- |
-| [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across sampled CPU states. |
+| [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across random CPU states: instructions sampled from a module, or with `--synthetic` made from the A64 encoding classes without the game ([`difftest_words.py`](../tools/dev/difftest_words.py); CI runs it on Windows, Linux and macOS). |
 | [`functest.py`](../tools/dev/functest.py) | Compare selected whole leaf functions against Unicorn, including registers and memory writes. |
 | [`shadertest.c`](../tools/dev/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
 | [`padtest.c`](../tools/dev/padtest.c) | Check the controller layer offline: configuration, button mapping, GameCube controllers, sticks, player slots, and rumble pacing. |
@@ -276,6 +276,13 @@ Source-only checks:
 
 ```powershell
 python -m unittest discover -s tests -v
+```
+
+They include the lifter's differential test without the game ([`tests/test_difftest_synthetic.py`](../tests/test_difftest_synthetic.py)). `difftest.py --synthetic` assembles instruction words from the bit fields of the A64 encoding classes the lifter handles (random words inside each class, a few kept per C statement shape, plus edge cases and exclusive-monitor sequences), lifts them, compiles the C with the game build's compiler and flags for the OS (clang-cl on Windows, the Linux build's x86-64 flags, the macOS build's arm64 flags) at -O2 and -O0, and compares registers, flags, the next PC and memory writes with Unicorn from random states whose floating-point operands are often special values (signed zeros, infinities, quiet and signalling NaNs, denormals, conversion and rounding limits). NaN results that differ only in sign or payload are reported but not counted as mismatches unless `--exact-nan`. It also lists, per class, the instructions the lifter does not lift. Mismatches the test knows of are listed, with the reason, in its `KNOWN`. A deeper run, and on an Apple silicon Mac the x86-64 code under Rosetta 2 with the Linux build's flags:
+
+```sh
+python tools/dev/difftest.py --synthetic --per-template 4 --states 32 --draws 8000 --seed 2
+python tools/dev/difftest.py --synthetic --toolchain rosetta
 ```
 
 Game-backed checks after preparing local modules:
