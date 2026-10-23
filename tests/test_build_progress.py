@@ -258,25 +258,29 @@ class CompileReportTests(unittest.TestCase):
         self.assertEqual(sorted(seen), [('end', 'a.c', True), ('end', 'b.c', True), ('start', 'a.c'), ('start', 'b.c')])
 
     def test_compile_dir_follows_the_stale_files(self):
+        def fake(jobs, n, started=None, finished=None, compiled=None):
+            for job in jobs:
+                if started:
+                    started(job)
+                Path(job[1]).write_text('')
+                if finished:
+                    finished(job, 1.0)
+                compiled(job, job[2])
+            return []
         with tempfile.TemporaryDirectory() as d:
             for n in ('g0000.c', 'g0001.c', 'g_module.c'):
                 Path(d, n).write_text('int x;\n')
             Path(d, 'manifest.tsv').write_text('g0000.c\t40000\t5000\ng0001.c\t210157\t210157\n')
-            Path(d, 'g0000.obj').write_text('')
-            os.utime(Path(d, 'g0000.obj'), (os.path.getmtime(Path(d, 'g0000.c')) + 10,) * 2)   # up to date
+            with mock.patch.object(cc, 'compile_each', side_effect=fake), mock.patch('sys.stdout', io.StringIO()):
+                self.assertTrue(recomp.compile_dir(d, 4))   # (every file)
+            for n in ('g0001.c', 'g_module.c'):   # g0000.obj up to date, these two not
+                Path(d, n).write_text('int y;\n')
             todo = recomp.stale_files(d)
             self.assertEqual([(os.path.basename(t[0]), t[2]) for t in todo], [('g0001.c', '/O1'), ('g_module.c', '/O1')])
             self.assertAlmostEqual(todo[0][3], P.file_cost(210157, 210157))
 
             b = P.Build(4)
             b.module(os.path.basename(d), 250000, [(t[0], t[3]) for t in todo])
-
-            def fake(jobs, n, started, finished):
-                for job in jobs:
-                    started(job)
-                    Path(job[1]).write_text('')
-                    finished(job, 1.0)
-                return []
             with mock.patch.object(cc, 'compile_each', side_effect=fake), mock.patch('sys.stdout', io.StringIO()):
                 self.assertTrue(recomp.compile_dir(d, 4, b))
             self.assertEqual(b.done, {('compile', os.path.basename(d))})

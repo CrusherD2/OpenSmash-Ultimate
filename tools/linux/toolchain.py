@@ -150,15 +150,18 @@ def run(cmd):
     return r.returncode, r.stdout + r.stderr
 
 
+def compile_command(src, obj, opt, flags=(), extra=()):
+    """The command compile_each compiles src into obj with (and what objcache.py keys the object on)."""
+    lang = ["-x", "c++", "-std=gnu++20", "-fexceptions"] if src.endswith((".cpp", ".cc")) or "c++" in flags else []
+    return [CLANG, "-c", opt, *CFLAGS, *lang, *extra, *[f for f in flags if f != "c++"], src, "-o", obj]
+
+
 def compile_each(jobs_list, jobs=16, extra=()):
     """Compile (src, obj, opt[, flags]) jobs in parallel; returns [(src, error text)] for failures."""
     def one(job):
         src, obj, opt = job[:3]
-        flags = job[3] if len(job) > 3 else []
         os.makedirs(os.path.dirname(obj), exist_ok=True)
-        lang = ["-x", "c++", "-std=gnu++20", "-fexceptions"] if src.endswith((".cpp", ".cc")) or "c++" in flags else []
-        flags = [f for f in flags if f != "c++"]
-        code, out = run([CLANG, "-c", opt, *CFLAGS, *lang, *extra, *flags, src, "-o", obj])
+        code, out = run(compile_command(src, obj, opt, job[3] if len(job) > 3 else [], extra))
         return (src, out) if code else None
     with ThreadPoolExecutor(jobs) as pool:
         return [f for f in pool.map(one, jobs_list) if f]

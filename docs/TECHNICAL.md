@@ -68,6 +68,8 @@ That address manifest is a build input. Preserve it when incrementally rebuildin
 
 Each module's build folder has a `module.txt` stamp: build ID, address, name, and a fingerprint of the tools that generated it (the recompiler's sources and the runtime's list of native functions). With the same stamp, [`modcache.py`](../tools/modcache.py) leaves the generated C as it is, and the build only checks it for objects to compile. After a change to the recompiler, the C is generated again, but only changed files are compiled.
 
+Whether an object is current goes by content, not by date ([`objcache.py`](../tools/objcache.py), in the Windows and Linux builds). Each build folder's `objcache.json` records each object's key: a SHA-256 of its C, the runtime headers it includes (`recomp.h` or `module.h` and the headers they include), the compiler (its path and what `--version` prints) and the whole compile command, with its optimisation level and instruction set. A change to any of them compiles the object again; a file saved again unchanged does not. A source with the same size and modification time as last time is not read again. A key is recorded only once its object has compiled, so a stopped build carries on where it stopped. A file the compiler crashed on and compiled at `/O1` instead keeps its own level's key, so it is not compiled again at every build. The runtime's objects are kept the same way, with every runtime header. The macOS build keeps its own record, `build-mac/obj/game_sources.tsv`.
+
 ### The game version
 
 WindowSmash builds one version of the game: 13.0.5, its last update. [`game_version.py`](../tools/game_version.py) holds what identifies it: the main module's build ID (`21450C647B8C5940ED5B68218EA128FD3C5D597D`), the update's title version (`0x1F0000`, v31) and data.arc's version field (`0xD0005`). Each step checks what it can see:
@@ -215,6 +217,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 | [`install_windowsmash.ps1`](../tools/install_windowsmash.ps1) | What `Install WindowSmash.bat` runs: PC checks, Python, the compiler, SDL3, the folder wizard, then `build_game.py`. |
 | [`update.py`](../tools/update.py) | Apply the 13.0.5 update over the game's data as a layered RomFS in `dump/`, checking every block against the update's hashes ([the 13.0.5 update](UPDATES.md)). |
 | [`modcache.py`](../tools/modcache.py) | Keep fighter module addresses (`dump/nro/bases.txt`), the stamp that says a module's build folder is current, and the imports check. |
+| [`objcache.py`](../tools/objcache.py) | Decide whether a compiled object is current, from the content of its C and headers, the compiler and the compile command (`objcache.json` in each build folder). |
 | [`nso.py`](../tools/nso.py) | Read NSO/NRO images and dynamic metadata; inspect modules and export ELF representations. |
 | [`funcs.py`](../tools/funcs.py) | Discover functions and optionally write a function inventory. |
 | [`recomp.py`](../tools/recomp.py) | Run `coverage`, `emit`, `image`, `build`, `compile`, `link`, the end-to-end `all` driver, the `check` of unresolved imports, or `wrap-sig` for a hook's code signature. |

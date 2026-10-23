@@ -71,6 +71,15 @@ class CompileCrashTests(unittest.TestCase):
         self.assertIn('compiling it again on its own, at /O1', log[1])
         self.assertIn('b.c compiled (at /O1', log[2])
 
+    def test_compiled_says_the_level_it_compiled_at(self):
+        # (the build records each object's key as it compiles: tools/objcache.py, recomp.compile_dir)
+        compiler, done = Compiler({'b.c': [(1, CRASH), (1, CRASH), (0, '')], 'c.c': [(1, 'c.c: error: x\n')]}), []
+        with mock.patch.object(cc.subprocess, 'run', side_effect=compiler):
+            failures = cc.compile_each([('a.c', 'a.obj', '/O2'), ('b.c', 'b.obj', '/O2'), ('c.c', 'c.obj', '/O2')], 2,
+                                       log=lambda m: None, compiled=lambda job, level: done.append((job[0], level)))
+        self.assertEqual(sorted(done), [('a.c', '/O2'), ('b.c', '/O1')])
+        self.assertEqual([src for src, _e in failures], ['c.c'])
+
     def test_a_file_that_keeps_crashing_stops_the_build_with_an_explanation(self):
         failures, calls, log = run({'b.c': [(1, CRASH)]})
         self.assertEqual([c[1] for c in calls if c[0] == 'b.c'], ['/O2', '/O2', '/O1'])

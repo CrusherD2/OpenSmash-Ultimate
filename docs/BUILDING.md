@@ -584,7 +584,7 @@ How it works:
 
 ### What the build does
 
-`tools/recomp.py all` translates each module (`main`, `subsdk0`, `sdk` and the fighter modules) to C, makes the relocation images and registries, compiles everything with `clang-cl`, compiles the runtime, and links `build/ssbu.exe`. Builds after the first are incremental. The first build gives each fighter module an address and records it in `dump/nro/bases.txt`; keep that file with your build, and don't copy it from another build.
+`tools/recomp.py all` translates each module (`main`, `subsdk0`, `sdk` and the fighter modules) to C, makes the relocation images and registries, compiles everything with `clang-cl`, compiles the runtime, and links `build/ssbu.exe`. Builds after the first are incremental: a file is compiled again when its C, the runtime headers it includes, the compile flags or the compiler change ([how](TECHNICAL.md#stable-module-placement)). The first build gives each fighter module an address and records it in `dump/nro/bases.txt`; keep that file with your build, and don't copy it from another build.
 
 Before compiling, it lists imported symbols that nothing provides in `build/imports.unresolved.txt`; a *strong* one there is the first sign that the game needs something the runtime doesn't have yet ([the imports check](TECHNICAL.md#the-imports-check)). It also checks that each of the runtime's hooks into the game's code finds the 13.0.5 function it expects, and stops if one doesn't ([code tied to the game version](TECHNICAL.md#code-tied-to-the-game-version)).
 
