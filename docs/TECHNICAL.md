@@ -116,6 +116,7 @@ The guest's own unwind implementation interprets guest exception metadata. [`hle
 | :--- | :--- |
 | [`kernel.c`](../runtime/kernel.c) | Guest thread contexts, synchronization, handle/state tracking, memory operations, and supported supervisor calls. |
 | [`clock.h`](../runtime/clock.h) | The one clock behind the guest's system tick, the kernel's timeouts, and the renderer's timing: Windows' `QueryPerformanceCounter`, or, where a read of it is slow (a PC timed by the HPET), the CPU's invariant time stamp counter scaled to the same nanoseconds. `SSBU_CLOCK=qpc` or `tsc` picks one; `build\play.log`'s `[clock]` line says which. |
+| [`sleep.h`](../runtime/sleep.h) | The guest's `svcSleepThread`: a sleep of the nanoseconds asked, never shorter. On Windows it waits on a high-resolution waitable timer (one a thread, Windows 10 1803 and later; `Sleep` in whole milliseconds without one), on Linux with `clock_nanosleep`, on macOS on a critical kqueue timer. It used to round up to whole milliseconds. The kernel's timed waits (`WaitSynchronization`, the address arbiter's and condition variables' timeouts) still round their time to milliseconds. |
 | [`ipc.c`](../runtime/ipc.c), `ipc_*.c` | Service request handling and selected audio, display, Mii, and related interfaces. |
 | [`hle_fs.c`](../runtime/hle_fs.c) | RomFS reads, save/cache mounts, and host file operations. |
 | [`hle_env.c`](../runtime/hle_env.c), [`hle_applet.c`](../runtime/hle_applet.c) | Account/environment behavior, applet-facing functions, and installed add-on reporting. |
@@ -250,6 +251,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 | [`shadertest.c`](../tools/dev/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
 | [`padtest.c`](../tools/dev/padtest.c) | Check the controller layer offline: configuration, button mapping, GameCube controllers, sticks, player slots, and rumble pacing. |
 | [`clocktest.c`](../tools/dev/clocktest.c) | Check the clock offline: the timer it picks (also with a system timer slowed to a microsecond a read), that it never goes back across threads, and its rate and cost (`tests/test_clock.py` builds and runs it). |
+| [`sleeptest.c`](../tools/dev/sleeptest.c) | Check the guest's sleep offline: never shorter than asked (from 1 us to 2.5 ms, and on four threads at once), and a sleep of 200 us well under a millisecond, printed beside the old whole-millisecond sleep (`tests/test_sleep.py` builds and runs it on Windows, Linux and macOS). |
 | [`vp9test.c`](../tools/dev/vp9test.c) | Replay recorded NVDEC jobs through the VP9 path and libvpx. |
 | [`vp9rt.c`](../tools/dev/vp9rt.c) | Exercise VP9 header reconstruction with an independently parsed synthetic clip. |
 | [`menurun.sh`](../tools/dev/menurun.sh) | Script menu navigation, captures, and logging using a copied test save. |

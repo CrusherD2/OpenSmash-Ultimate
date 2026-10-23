@@ -18,6 +18,7 @@
 
 #include "host.h"
 #include "gpu.h"   /* (gpu_memory_unmapping) */
+#include "sleep.h"   /* (svcSleepThread) */
 
 #ifdef __APPLE__
 void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
@@ -469,7 +470,7 @@ void rt_svc(Cpu *c, u32 n) {
     /* calls that never touch shared kernel state */
     switch (n) {
     case 0x0B:   /* SleepThread(ns): non-positive values are yield requests */
-        if ((i64)x[0] > 0) Sleep((DWORD)((x[0] + 999999) / 1000000)); else SwitchToThread();
+        if ((i64)x[0] > 0) sleep_ns(x[0]); else SwitchToThread();
         return;
     case 0x10: x[0] = 0; return;                         /* GetCurrentProcessorNumber */
     case 0x1E: x[0] = rt_ticks(); return;                /* GetSystemTick */
