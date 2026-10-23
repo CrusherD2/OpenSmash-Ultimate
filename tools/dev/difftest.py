@@ -22,7 +22,8 @@ tools/mac/toolchain.py's on macOS (arm64); "rosetta", on an Apple silicon Mac, i
 build's x86-64 flags with Apple's clang, run under Rosetta 2. --opt lists the optimisation
 levels to build it at (the game's is O2; the synthetic mode also runs O0 by default).
 
-NaN results that differ only in sign or payload (quiet NaN on both sides) are "soft": reported,
+Floating-point results that differ only in NaN sign or payload (NaN on both sides, in the lanes
+of the result register at its lane width, both read from the disassembly) are "soft": reported,
 not counted as mismatches, unless --exact-nan. --report writes the results as JSON.
 Exit code: 0 no mismatches, 1 mismatches, 3 no native toolchain on this machine.
 """
@@ -248,26 +249,44 @@ def rand_v_fp(rng):
     return v & 0xFFFFFFFFFFFFFFFF, v >> 64
 
 
-def is_nan32(v):
-    return v & 0x7F800000 == 0x7F800000 and v & 0x7FFFFF
+NAN = {16: (0x7C00, 0x3FF), 32: (0x7F800000, 0x7FFFFF), 64: (0x7FF0000000000000, 0xFFFFFFFFFFFFF)}   # exponent, fraction
 
 
-def is_nan64(v):
-    return v & 0x7FF0000000000000 == 0x7FF0000000000000 and v & 0xFFFFFFFFFFFFF
+def nan_only(a, b, width=None):
+    """True if two 64-bit values differ only in lanes of `width` bits that are NaN on both sides.
+    Without a width (functest: a function's results have no one width), as 32-bit halves or whole."""
+    if width is None:
+        return nan_only(a, b, 32) or nan_only(a, b, 64)
+    exp, frac = NAN[width]
+    mask = (1 << width) - 1
+    for i in range(0, 64, width):
+        x, y = a >> i & mask, b >> i & mask
+        if x != y and not (x & exp == exp and x & frac and y & exp == exp and y & frac):
+            return False
+    return True
 
 
-def nan_only(a, b):
-    """True if two 64-bit values differ only in lanes that are NaN on both sides."""
-    if all(x == y or (is_nan32(x) and is_nan32(y))
-           for x, y in ((a & 0xFFFFFFFF, b & 0xFFFFFFFF), (a >> 32, b >> 32))):
-        return True
-    return bool(is_nan64(a) and is_nan64(b))
+# A floating-point result in a vector register: an f... mnemonic other than the conversions to
+# integers, the compares, fcsel and fmov, and its first operand (d0, s0, h0, v0.2d, v0.4s, v0.8h, v0.s[1]).
+FP_RESULT = re.compile(r"f(?!cvt[amnpz][su]|jcvt|cm|ac|ccmp|csel|mov)\w* (?:([hsd])(\d+)|v(\d+)\.\d*([hsd]))\b")
+LANE_BITS = {"h": 16, "s": 32, "d": 64}
+
+
+def fp_result(texts):
+    """(register, lane width) of the floating-point result a test leaves in a vector register, from
+    the disassembly of its instructions; None if it has none. Only that register's lanes, at that
+    width, can differ softly: an integer that looks like a NaN (-1 does, as an f32) is a number."""
+    found = set()
+    for m in map(FP_RESULT.match, texts):
+        if m:
+            found.add((int(m[2] or m[3]), LANE_BITS[m[1] or m[4]]))
+    return found.pop() if len(found) == 1 else None
 
 
 def compare(expected, raw, exact_nan):
     """(native faults, hard mismatches, soft NaN-only differences by test) of one native run."""
     hard, soft, faults = [], Counter(), 0
-    for k, (idx, ex, esp, enzcv, ev, epc, emem, inputs) in enumerate(expected):
+    for k, (idx, ex, esp, enzcv, ev, epc, emem, inputs, fp) in enumerate(expected):
         o = struct.unpack_from(OUT_FMT, raw, k * OUT_SIZE)
         gx, gsp, gnzcv, gv, gpc, goff, glen, gbytes, fault = o[:31], o[31], o[32], o[33:97], o[97], o[98], o[99], o[100], o[101]
         if fault:
@@ -287,7 +306,7 @@ def compare(expected, raw, exact_nan):
         nan = False
         for i in range(64):
             if gv[i] != ev[i]:
-                if nan_only(ev[i], gv[i]) and not exact_nan:
+                if not exact_nan and fp and i >> 1 == fp[0] and nan_only(ev[i], gv[i], fp[1]):
                     nan = True
                 else:
                     why.append(f"v{i // 2}.d[{i & 1}]: want {ev[i]:#018x} got {gv[i]:#018x}")
@@ -345,7 +364,7 @@ def _run(args):
 
     rng = random.Random(seed)
     expected, records, skipped = [], [], []
-    for idx, addr, n in tests:
+    for idx, addr, n, fp in tests:
         words = struct.unpack_from(f"<{n}I", img, addr)
         bases, indexes = set(), set()
         for w in words:
@@ -407,7 +426,7 @@ def _run(args):
             for v in got[33:65]:
                 ev += [v & 0xFFFFFFFFFFFFFFFF, v >> 64]
             expected.append((idx, list(got[:31]), got[31], got[32] >> 28, ev, got[65], mem,
-                             (xs, sp, nzcv, flat)))
+                             (xs, sp, nzcv, flat), fp))
             records.append(struct.pack(IN_FMT, idx, 0, *xs, sp, nzcv, *flat))
 
     tag = f"{os.getpid()}-{seed}".replace(":", "-")
@@ -537,11 +556,11 @@ def build(tc, sources, work, level, jobs):
     return exe
 
 
-def execute(pool, tests, states, exes, scratch_path, work, jobs, opts, seed=None):
+def execute(pool, tests, dis, states, exes, scratch_path, work, jobs, opts, seed=None):
     """Run every test from `states` random states under the reference and each executable:
     (states compared, tests the reference faulted on, [{faults, hard, soft}] per executable).
     With a seed, the states depend on it alone (slices of a fixed size), not on `jobs`."""
-    indexed = [(i, a, n) for i, (a, n) in enumerate(tests)]
+    indexed = [(i, a, n, fp_result([dis(a + 4 * k) for k in range(n)])) for i, (a, n) in enumerate(tests)]
     step = 128 if seed is not None else max(1, len(indexed) // (jobs * 4))
     slices = [(indexed[i:i + step], states, 1000 + i if seed is None else f"{seed}:states:{i}", exes, scratch_path, work, opts)
               for i in range(0, len(indexed), step)]
@@ -602,10 +621,11 @@ def summarize(levels, tests, total, skipped, per, dis, lifter, show):
                 "disasm": dis(addr, n), "mnemonic": mnemonic(dis(addr, n)), "c": stmts,
                 "template": " ".join(template(s) for s in stmts), "states": len(states_),
                 "differences": [why + (f"; {more}" if more else "") for _i, why, more, _in in states_[:100]],
+                # (every failing state, at most --states: the test checks each against its known bugs)
                 "examples": [{"why": why, "more": more, "x": [f"{x:#x}" for x in inputs[0]], "sp": f"{inputs[1]:#x}",
                               "nzcv": f"{inputs[2]:04b}",
                               "v": [f"{inputs[3][2 * r + 1]:016x}{inputs[3][2 * r]:016x}" for r in range(32)]}
-                             for _i, why, more, inputs in states_[:20]]})
+                             for _i, why, more, inputs in states_]})
         report.append({"level": level, "native_faults": res["faults"], "soft_tests": len(soft),
                        "soft_states": sum(soft.values()), "failing": failing})
     return report
@@ -692,7 +712,7 @@ def main_nso():
         with open(scratch_path, "wb") as f:
             f.write(random.Random(7).randbytes(SCRATCH_SIZE))
         opts = {"exact_nan": "--exact-nan" in sys.argv, "run": tc.run}
-        total, skipped, per = execute(pool, tests, states, [e for _l, e in exes], scratch_path, work, jobs, opts)
+        total, skipped, per = execute(pool, tests, dis, states, [e for _l, e in exes], scratch_path, work, jobs, opts)
 
     report = summarize([l for l, _e in exes], tests, total, skipped, per, dis, lifter, int(arg("--show", "2")))
     write_report({"mode": "nso", "tests": len(tests), "states": states, "compared": total,
@@ -858,7 +878,7 @@ def main_synthetic():
     opts = {"exact_nan": "--exact-nan" in sys.argv, "run": tc.run, "fp_special": True}
     t0 = time.monotonic()
     with Pool(jobs, _init, (image_path, len(img))) as pool:
-        total, skipped, per = execute(pool, tests, states, [e for _l, e in exes], scratch_path, work, jobs, opts, seed)
+        total, skipped, per = execute(pool, tests, dis, states, [e for _l, e in exes], scratch_path, work, jobs, opts, seed)
     print(f"ran in {time.monotonic() - t0:.0f} s ({jobs} processes)")
 
     report = summarize([l for l, _e in exes], tests, total, skipped, per, dis, lifter, int(arg("--show", "2")))
