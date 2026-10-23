@@ -3,6 +3,7 @@ for this OS (tools/dev/difftest.py's toolchain: clang-cl on Windows, the Linux b
 build's arm64 flags; on an Apple silicon Mac with Rosetta 2, the Linux build's flags under it as well), at -O2 and
 -O0, and outside Windows as C++ too (as the build compiles the generated files with landing sites):
 
+  rt_rsqrt_est     (frsqrte's estimate) equal to the architecture's loop, which it replaced, for every input
   rt_crc32*        the CRC-32 and CRC-32C check values (of "123456789"), and the host's instruction (where it is
                    used) equal to the bitwise definition, rt_crc32_bits, for random operands"""
 from pathlib import Path
@@ -24,11 +25,22 @@ CHECK = r'''
 #include <stdio.h>
 #include "recomp.h"
 
+/* rt_rsqrt_est as it was: the loop of the Arm manual's RecipSqrtEstimate */
+static u32 rsqrt_est_loop(u32 a) {
+    a = a < 256 ? a * 2 + 1 : ((a & ~1u) + 1) * 2;
+    u32 b = 512;
+    while ((u64)a * (b + 1) * (b + 1) < (1ull << 28)) b++;
+    return (b + 1) / 2;
+}
+
 static u64 next(u64 *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }   /* xorshift64 */
 static int bad;
 #define CHECK(x) do { if (!(x)) { printf("line %d: %s\n", __LINE__, #x); bad++; } } while (0)
 
 int main(void) {
+    for (u32 a = 0; a < 4096; a++)   /* (frsqrte gives it 128 .. 511) */
+        if (rt_rsqrt_est(a) != rsqrt_est_loop(a)) { printf("rt_rsqrt_est(%u) = %u, the loop's %u\n", a, rt_rsqrt_est(a), rsqrt_est_loop(a)); bad++; }
+
     /* the check values: "123456789" from all ones, the result inverted */
     const char *s = "123456789";
     u32 b = ~0u, cb = ~0u, bits = ~0u, cbits = ~0u, h = ~0u, ch = ~0u, w = ~0u, cw = ~0u, x = ~0u, cx = ~0u;

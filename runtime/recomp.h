@@ -237,11 +237,16 @@ static inline f64 rt_frsqrts64(f64 a, f64 b) {
 /* Reciprocal and reciprocal-square-root estimates: the architecture's table algorithm,
  * which x86's rcpps / rsqrtps do not reproduce. */
 static inline u32 rt_recip_est(u32 a) { a = a * 2 + 1; return ((1u << 19) / a + 1) / 2; }
+/* (The manual's loop - b = 512; while (a * (b + 1)^2 < 2^28) b++; return (b + 1) / 2 - takes up
+ * to 500 steps: k = b + 1 is found from sqrt and corrected exactly instead, the same for every a,
+ * which tests/test_recomp_helpers.py checks.) */
 static inline u32 rt_rsqrt_est(u32 a) {
     a = a < 256 ? a * 2 + 1 : ((a & ~1u) + 1) * 2;
-    u32 b = 512;
-    while ((u64)a * (b + 1) * (b + 1) < (1ull << 28)) b++;
-    return (b + 1) / 2;
+    u32 k = (u32)sqrt((f64)(1u << 28) / a);
+    if (k < 513) k = 513;
+    while (k > 513 && (u64)a * (k - 1) * (k - 1) >= (1ull << 28)) k--;
+    while ((u64)a * k * k < (1ull << 28)) k++;
+    return k / 2;
 }
 #define RT_FRAC52 0xFFFFFFFFFFFFFull
 static inline u64 rt_frecpe_frac(u64 frac, int *exp, int top) {
