@@ -305,9 +305,11 @@ static const char *data_root(char *out, size_t n, const char *leaf) {   /* nativ
  * files are in place never touches those. (ssbu-recomp's journal deletes the old path whole,
  * so a commit that deletes a file or folder and makes it again lost the new one when it was
  * finished a second time.)
- * Moves and deletions try again for about a second when a file is held (an antivirus scan).
+ * Moves and deletions try again for about a second when a file is held (an antivirus scan). On
+ * Windows a committed file still open for reading is replaced as POSIX does it, and a read-only
+ * mark is cleared first.
  * One process at a time commits or recovers: a lock file beside the save (save/<user>.lock),
- * on Windows a named mutex. */
+ * on Windows a named mutex. One process mounts a save once. */
 #define SHARE_ALL (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)   /* (a commit can move a file someone reads) */
 #define JOURNAL_FORMAT "ssbu-save-journal 1"   /* the journal's first line */
 #ifndef ERROR_SHARING_VIOLATION
@@ -333,7 +335,12 @@ static int pid_alive(DWORD pid) {
     CloseHandle(p);
     return alive;
 }
-static void flush_dir(const char *path) { (void)path; }   /* (NTFS logs a folder's changes in order; a write-through rename flushes the log) */
+/* NTFS logs a folder's changes in order, so none is on the disk without those before it (the
+ * marker's rename without the flushed files it lists, its deletion without the moves). The log
+ * goes to the disk within seconds, not when MoveFileEx returns (MOVEFILE_WRITE_THROUGH is
+ * documented for moves done as a copy): a power cut just after a commit can bring back the save
+ * before it, whole. */
+static void flush_dir(const char *path) { (void)path; }
 #else
 typedef int SaveLock;
 static SaveLock lock_saves(const char *root) {   /* (flock: the shim's objects have no names) */
@@ -390,17 +397,50 @@ static void parent_of(char *out, size_t n, const char *path) {
     if (s) *s = 0; else snprintf(out, n, ".");
 }
 
+#ifdef _WIN32
+/* Windows will not replace or delete a file marked read-only (a save copied from read-only
+ * media): the mark goes first. */
+static void not_read_only(const char *path) {
+    DWORD a = GetFileAttributesA(path), b = a & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY);
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY)) SetFileAttributesA(path, b ? b : FILE_ATTRIBUTE_NORMAL);
+}
+/* MoveFileEx will not replace a file another handle has open, even one that shares deletion
+ * (the game reading a committed file it then saves): ERROR_ACCESS_DENIED. A POSIX-style rename
+ * does (NTFS, Windows 10 1607 and later), and that handle keeps reading the file it opened.
+ * 0 with the move's own error if it cannot. */
+typedef struct { DWORD flags; HANDLE root; DWORD len; WCHAR name[1024]; } RenameInfo;   /* FILE_RENAME_INFO, with Flags */
+static int replace_open_file(const char *from, const char *to) {
+    RenameInfo info = {.flags = 0x1 | 0x2};   /* FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS */
+    DWORD err = GetLastError();
+    int n = err == ERROR_ACCESS_DENIED ? MultiByteToWideChar(CP_ACP, 0, to, -1, info.name, 1024) : 0, ok = 0;
+    HANDLE f = n > 0 ? CreateFileA(from, DELETE | SYNCHRONIZE, SHARE_ALL, NULL, OPEN_EXISTING, 0, NULL) : INVALID_HANDLE_VALUE;
+    if (f != INVALID_HANDLE_VALUE) {
+        info.len = (DWORD)(n - 1) * sizeof(WCHAR);
+        ok = SetFileInformationByHandle(f, (FILE_INFO_BY_HANDLE_CLASS)22 /* FileRenameInfoEx */, &info,
+                                        (DWORD)(FIELD_OFFSET(RenameInfo, name) + info.len + sizeof(WCHAR))) != 0;
+        CloseHandle(f);
+    }
+    if (!ok) SetLastError(err);
+    return ok;
+}
+#else
+#define not_read_only(path) ((void)0)   /* (POSIX: a file's own permissions never stop a rename or a deletion) */
+#define replace_open_file(from, to) 0   /* (rename replaces an open file) */
+#endif
+
 /* Windows: a file someone holds open (an antivirus scan, a backup) cannot be moved or deleted
  * for a moment - tried again for about a second. */
 static int held(void) { DWORD e = GetLastError(); return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED; }
 static int move_file(const char *from, const char *to) {
+    not_read_only(to);
     for (DWORD wait = 1;; wait *= 2) {
-        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
+        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) || replace_open_file(from, to)) return 1;
         if (!held() || wait > 512) return 0;
         Sleep(wait);
     }
 }
 static int delete_file(const char *path) {
+    not_read_only(path);
     for (DWORD wait = 1;; wait *= 2) {
         if (DeleteFileA(path) || !is_file(path)) return 1;
         if (!held() || wait > 512) return 0;
@@ -420,6 +460,7 @@ static void remove_tree(const char *dir) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
+    not_read_only(dir);
     RemoveDirectoryA(dir);
 }
 static int folder_empty(const char *dir) {
@@ -775,12 +816,18 @@ static u32 journal_commit(struct Mount *m) {
     return m->pending ? R_HOST_FAILURE : 0;   /* (pending: every call on the mount tries it again first; the next mount finishes it) */
 }
 
+static int save_mounted(const char *root) {   /* (a second mount would share the first's working folder) */
+    for (int i = 0; i < 16; i++)
+        if (__atomic_load_n(&mounts[i].kind, __ATOMIC_ACQUIRE) == M_SAVE && !_stricmp(mounts[i].root, root)) return 1;
+    return 0;
+}
+
 static u32 journal_mount(const char *name, const char *where) {
     char root[512], work[540], journal[540];
     snprintf(root, sizeof root, "%s", where);
     for (char *p = root; *p; p++) if (*p == '/') *p = '\\';
     EnterCriticalSection(&jlock);
-    u32 r = mount_named(name) ? R_MOUNT_EXISTS : 0;
+    u32 r = mount_named(name) || save_mounted(root) ? R_MOUNT_EXISTS : 0;
     if (!r) {
         make_dirs(root);
         SaveLock l = lock_saves(root);
@@ -811,7 +858,8 @@ static u32 save_open(struct Mount *m, const char *rest, Handle *h) {
     u32 r = save_rel(m, rest, rel, sizeof rel);
     if (r) return r;
     if (view(m, rel, path, sizeof path) != 1) return R_PATH_NOT_FOUND;
-    if (h->mode & OPEN_WRITE) {   /* copy-on-write: a committed file is never opened for writing */
+    if (h->mode & OPEN_WRITE) {   /* copy-on-write: a committed file is never opened for writing (one already open for
+                                   * reading keeps reading the committed copy, without this handle's writes) */
         join(w, sizeof w, m->work, rel);
         if (strcmp(w, path)) {
             make_parents(w);

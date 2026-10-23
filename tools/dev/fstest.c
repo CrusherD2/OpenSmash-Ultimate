@@ -9,9 +9,11 @@
  *   fstest <folder> checks <a running process's id>
  *       the journal in one process: reads see the session's writes, which reach the committed
  *       folder only at Commit, and are gone after Unmount; Commit refused while a file is open
- *       for writing; listings and entry types of the merged save; deleting and making again,
- *       files becoming folders and back; leftovers of dead processes dropped (not a running
- *       one's); an incomplete journal ignored; the cache and the RomFS read and written directly
+ *       for writing, not while files are open for reading; a save mounted once; listings and
+ *       entry types of the merged save; deleting and making again, files becoming folders and
+ *       back; leftovers of dead processes dropped (not a running one's); an incomplete journal
+ *       ignored; a commit decided but not applied (a file the PC will not replace), finished
+ *       later; read-only files; the cache and the RomFS read and written directly
  *   fstest <folder> old       puts the old save in the committed folder, nothing else
  *   fstest <folder> new       mounts it and changes it into the new save (files new, changed,
  *                             deleted, made again; folders new, deleted, made again), commits
@@ -84,16 +86,21 @@ static u32 t_write(const char *path, u64 at, const char *text, int make, u64 *ke
     if (keep) *keep = h; else t_close(h);
     return r;
 }
-static const char *t_read(const char *path) {   /* the whole file, or NULL */
+static const char *t_read_open(u64 h) {   /* the whole file an open handle reads, or NULL */
     static char buf[256];
-    u64 h = 0, size = 0, got = 0;
-    if (t_open(path, OPEN_READ, &h)) return NULL;
+    u64 size = 0, got = 0;
     call(hle__ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE, G(&size), h, 0, 0, 0);
     u32 r = size < sizeof buf ? call(hle__ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm, G(&got), h, 0, G(buf), size) : 1;
-    t_close(h);
     if (r || got != size) return NULL;
     buf[got] = 0;
     return buf;
+}
+static const char *t_read(const char *path) {   /* the whole file, or NULL */
+    u64 h = 0;
+    if (t_open(path, OPEN_READ, &h)) return NULL;
+    const char *text = t_read_open(h);
+    t_close(h);
+    return text;
 }
 /* A folder's listing, sorted: "a.bin:8 d1/ ..." */
 static int by_name(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
@@ -156,6 +163,32 @@ static const char *own(const char *kind) {   /* <save>.<kind>.<this process> */
     return path;
 }
 
+/* block(1): the PC refuses to replace a.bin of the committed save until block(0). Windows: another
+ * program holds it open without FILE_SHARE_DELETE (and for longer than a commit tries again);
+ * elsewhere the save's folder is read-only (not for root, whom that does not stop). */
+#ifdef _WIN32
+static HANDLE blocker = INVALID_HANDLE_VALUE;
+static int can_block(void) { return 1; }
+static void block(int on) {
+    char path[1024];
+    join(path, sizeof path, save_root, "a.bin");
+    if (!on) { CloseHandle(blocker); return; }
+    blocker = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(blocker != INVALID_HANDLE_VALUE, "test set-up: a.bin held open (error %lu)", (unsigned long)GetLastError());
+}
+static void read_only(const char *path) { SetFileAttributesA(path, FILE_ATTRIBUTE_READONLY); }
+#else
+static int can_block(void) { return geteuid() != 0; }
+static void block(int on) {
+    char unix_root[1024];
+    chmod(rt_unix_path(save_root, unix_root, sizeof unix_root), on ? 0555 : 0755);
+}
+static void read_only(const char *path) {
+    char unix_path[1024];
+    chmod(rt_unix_path(path, unix_path, sizeof unix_path), 0444);
+}
+#endif
+
 /* The scratch folder: SSBU_DATA_ROOT, and a made-up RomFS - one file, hello.txt - in data/. */
 static void setup(const char *dir) {
     char data[600], path[700];
@@ -210,6 +243,8 @@ static void checks_all(DWORD live_pid) {
     /* the save: writes are the session's until Commit */
     h_put("a.bin", "AAAA-old"); h_put("b.bin", "BBBB-old"); h_put("d1\\c.bin", "CCCC-old"); h_put("d2\\e.bin", "EEEE-old");
     CHECK(mount_save() == 0 && mount_save() == R_MOUNT_EXISTS, "MountSaveData, then again");
+    CHECK(call(hle__ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE, G("save2"), G(UID), 0, 0, 0) == R_MOUNT_EXISTS && t_type("save2:/") == -1,
+          "the same save mounted under another name");
     CHECK(is_dir(own("work")), "the working folder %s", own("work"));
     CHECK(t_write("save:/a.bin", 0, "AAAA-new", 0, NULL) == 0, "a write");
     CHECK(t_read("save:/a.bin") && is(t_read("save:/a.bin"), "AAAA-new"), "reading back what was written: %s", t_read("save:/a.bin"));
@@ -239,7 +274,11 @@ static void checks_all(DWORD live_pid) {
     CHECK(is(t_read("save:/a.bin"), "AAAA-old") && t_type("save:/f.bin") == -1 && t_type("save:/d2/e.bin") == 1 && t_type("save:/d3") == -1,
           "uncommitted changes survived a remount");
 
-    /* Commit */
+    /* Commit, with files open for reading: one of the committed save (opened before its first
+     * write, so the commit replaces the file it reads: Windows' MoveFileEx refuses that) and a
+     * working copy (opened after it, so the commit moves the file it reads) */
+    u64 old_reader = 0, new_reader = 0;
+    CHECK(t_open("save:/b.bin", OPEN_READ, &old_reader) == 0, "a committed file opened for reading");
     t_write("save:/a.bin", 0, "AAAA-new", 0, NULL);
     t_write("save:/b.bin", 0, "XX", 0, NULL);
     t_write("save:/f.bin", 0, "F", 1, NULL);
@@ -247,8 +286,11 @@ static void checks_all(DWORD live_pid) {
     t_rmdir("save:/d2");
     t_mkdir("save:/d3");
     t_write("save:/d3/g.bin", 0, "G", 1, NULL);
-    CHECK(t_open("save:/b.bin", OPEN_READ, &h) == 0 && commit("save") == 0, "Commit with a reader open");
-    t_close(h);
+    CHECK(t_open("save:/a.bin", OPEN_READ, &new_reader) == 0 && commit("save") == 0, "Commit with readers open");
+    CHECK(is(t_read_open(new_reader), "AAAA-new") && is(t_read_open(old_reader), "BBBB-old"),
+          "after Commit, a reader of a working copy reads the new file, one opened before the write the old one: %s", t_read_open(old_reader));
+    t_close(old_reader);
+    t_close(new_reader);
     CHECK(is(h_save("a.bin"), "AAAA-new") && is(h_save("b.bin"), "XXBB-old") && is(h_save("f.bin"), "F") && is(h_save("d3\\g.bin"), "G"),
           "the committed folder after Commit");
     snprintf(path, sizeof path, "%s\\d2", save_root);
@@ -295,28 +337,33 @@ static void checks_all(DWORD live_pid) {
     CHECK(mount_save() == 0 && !h_exists(h_beside("commit")) && !h_exists(dead_work) && is(t_read("save:/a.bin"), "A2"), "an incomplete journal");
     unmount("save");
 
-#ifndef _WIN32
-    /* a commit decided but not applied: the PC refuses the moves (the save's folder read-only;
-     * not for root, whom that does not stop) */
-    char unix_root[1024];
-    rt_unix_path(save_root, unix_root, sizeof unix_root);
-    if (geteuid()) {
+    /* a commit decided but not applied: the PC refuses to replace a.bin */
+    if (can_block()) {
         CHECK(mount_save() == 0 && t_write("save:/a.bin", 0, "A3", 0, NULL) == 0, "a write");
-        chmod(unix_root, 0555);
+        block(1);
         CHECK(commit("save") == R_HOST_FAILURE && h_exists(h_beside("commit")), "a commit not applied keeps its marker");
         CHECK(t_read("save:/a.bin") == NULL, "the save read while a decided commit waits");
-        chmod(unix_root, 0755);
+        block(0);
         CHECK(is(t_read("save:/a.bin"), "A3") && is(h_save("a.bin"), "A3") && !h_exists(h_beside("commit")), "the next call finishes it");
         CHECK(t_write("save:/a.bin", 0, "A4", 0, NULL) == 0, "a write");
-        chmod(unix_root, 0555);
+        block(1);
         CHECK(commit("save") == R_HOST_FAILURE, "a commit not applied");
         unmount("save");
         CHECK(is_dir(own("work")) && h_exists(h_beside("commit")), "Unmount keeps what a decided commit needs");
-        chmod(unix_root, 0755);
+        block(0);
         CHECK(mount_save() == 0 && is(t_read("save:/a.bin"), "A4") && !h_exists(h_beside("commit")), "the next mount finishes it");
         unmount("save");
     }
-#endif
+
+    /* files marked read-only in the committed save are replaced and deleted all the same */
+    h_put("ro1.bin", "RO1-old"); h_put("ro2.bin", "RO2-old");
+    join(path, sizeof path, save_root, "ro1.bin");
+    read_only(path);
+    join(path, sizeof path, save_root, "ro2.bin");
+    read_only(path);
+    CHECK(mount_save() == 0 && t_write("save:/ro1.bin", 0, "RO1-new", 0, NULL) == 0 && t_delete("save:/ro2.bin") == 0, "a read-only file written, another deleted");
+    CHECK(commit("save") == 0 && is(h_save("ro1.bin"), "RO1-new") && !h_save("ro2.bin") && !h_exists(h_beside("commit")), "Commit of read-only files");
+    unmount("save");
 }
 
 /* ---- the crash matrix's two saves --------------------------------------------------------- */
