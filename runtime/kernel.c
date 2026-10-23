@@ -50,14 +50,18 @@ typedef struct KThread {
     CONDITION_VARIABLE woken;   /* what this thread sleeps on (kwait): wakes go to the threads concerned */
     u64 wait_handles;   /* while in WaitSynchronization: its handle array (guest) and count */
     u32 wait_count;
+    struct KThread *next_dead;   /* (recycling) the next thread waiting for its host thread to end */
 } KThread;
 
-typedef struct KObject { int type, signaled; KThread *thread; void *session; } KObject;
+/* refs: handles open on it; waits: WaitSynchronization calls holding it; gen: how often its slot
+ * was used, in the handle's upper bits (these three for recycling: see new_handle) */
+typedef struct KObject { int type, signaled; KThread *thread; void *session; u32 gen, refs, waits; } KObject;
 typedef struct Region { u64 base, size; u32 state, perm; } Region;
 
 static CRITICAL_SECTION klock;
-/* Every thread the kernel made (an exited one stays: its handle may still be waited on). Waits
- * and hand-overs look through these rather than through every handle. */
+/* The threads running or named by a handle (an exited one stays while its handle is open: it may
+ * still be waited on), or without recycling every thread the kernel made. Waits and hand-overs
+ * look through these rather than through every handle. */
 static KThread *threads[1024];
 static u32 nthreads;
 static KObject objects[4096];
@@ -66,6 +70,11 @@ static Region regions[REGIONS];
 static u32 region_count;
 static struct { u64 dst, src, size; } maps[1024];
 static u64 heap_size, tlr_next = KERNEL_BASE, next_thread_id = 1, wait_order;
+#define TLR_AREA 0x1000000ull                /* thread-local regions: a page each from KERNEL_BASE */
+static int recycle;                          /* SSBU_THREAD_RECYCLING=1 (see "thread lifetime") */
+static KThread *dead;                        /* (recycling) threads freed but for their host thread */
+static u64 spare_tlrs[TLR_AREA / 0x1000];    /* (recycling) regions of freed threads, for the next ones */
+static u32 nspare_tlrs;
 
 /* ---- time ------------------------------------------------------------------------ */
 static u64 now_ns(void) { return rt_clock_ns(); }
@@ -101,20 +110,62 @@ static void kwake_handle(u32 handle) {
     }
 }
 
-/* ---- handles --------------------------------------------------------------------- */
+/* ---- handles ---------------------------------------------------------------------
+ * Without recycling a handle is 0xA000 plus its object's slot, as before. With it, the layout
+ * public descriptions of the console's kernel give: the slot in the low 15 bits, a linear id
+ * above them - here the slot's use count, 1 to 0x7FFF, so that a handle kept past CloseHandle
+ * names nothing rather than the slot's next object. Never 0, and below bit 30: mutex words hold
+ * owner handles under their WAITERS bit, and the pseudo-handles (0xFFFF800x) have the top bits
+ * set. */
 static u32 new_handle(int type, KThread *t) {
     for (u32 i = 1; i < 4096; i++)
         if (objects[i].type == OBJ_FREE) {
-            objects[i] = (KObject){type, 0, t};
-            return 0xA000 + i;
+            u32 gen = objects[i].gen % 0x7FFF + 1;
+            objects[i] = (KObject){type, 0, t, NULL, gen, 1, 0};
+            return recycle ? gen << 15 | i : 0xA000 + i;
         }
     rt_fatal("kernel: out of handles");
 }
 
+static u32 index_of(u32 handle) { return recycle ? handle & 0x7FFF : handle - 0xA000; }
+
+/* The slot of the object an open handle names, or 0 (never a slot). With recycling a closed
+ * handle names nothing, though its object may live on (a running thread, one a wait holds). */
+static u32 slot_of(u32 handle) {
+    u32 i = index_of(handle);
+    if (i >= 4096 || objects[i].type == OBJ_FREE) return 0;
+    return !recycle || (objects[i].refs && handle >> 15 == objects[i].gen) ? i : 0;
+}
+
 static KObject *object_of(Cpu *c, u32 handle, int type) {
-    if (handle == CUR_THREAD && type == OBJ_THREAD) return &objects[((KThread *)c->thread)->handle - 0xA000];
-    u32 i = handle - 0xA000;
-    return i < 4096 && objects[i].type == type ? &objects[i] : NULL;
+    u32 i = handle == CUR_THREAD && type == OBJ_THREAD ? index_of(((KThread *)c->thread)->handle) : slot_of(handle);
+    return i && objects[i].type == type ? &objects[i] : NULL;
+}
+
+static void drop_thread(KThread *t);
+
+/* (recycling) Free an object nothing names any more: no handle open, no wait holding it, and
+ * for a thread, not running (exited, or never started). */
+static void release(u32 i) {
+    KObject *o = &objects[i];
+    if (o->refs || o->waits) return;
+    if (o->type == OBJ_THREAD) {
+        if (o->thread->started && !o->thread->exited) return;
+        drop_thread(o->thread);
+    }
+    o->type = OBJ_FREE;   /* (gen stays: the slot's next object gets the next one) */
+}
+
+/* (recycling) CloseHandle. svcCreateEvent's object counts its two handles, one value here: the
+ * SDK closes both when it destroys a system event (inferred from open reimplementations of
+ * nn::os, not seen in the game). A handle native code hands out again counts once more each time
+ * (kernel_copy_handle: on the console each copy is a handle of its own). */
+static u32 close_handle(u32 handle) {
+    u32 k = slot_of(handle);
+    if (!k) return R_INVALID_HANDLE;
+    if (--objects[k].refs == 0 && objects[k].type == OBJ_SESSION) ipc_close(objects[k].session);
+    release(k);
+    return R_OK;
 }
 
 /* ---- memory map ------------------------------------------------------------------ */
@@ -223,6 +274,41 @@ static void *commit(u64 at, u64 size, const char *what) {
     return p;
 }
 
+/* ---- thread lifetime ---------------------------------------------------------------
+ * With SSBU_THREAD_RECYCLING=1, as on the console: a thread object lives while its thread runs
+ * or a handle names it, and once it has exited and its handle is closed, its place in threads[],
+ * its handle and its thread-local region go to the next ones. Without it nothing of a thread is
+ * ever freed, as before: a session that had made 1024 threads, running or not, stopped at the
+ * next ("too many threads").
+ *
+ * A thread leaves the tables at once. Its KThread, Cpu and thread-local region, and its host
+ * thread's handle, wait until its host thread has ended, which the next thread made or object
+ * freed checks (WaitForSingleObject(host, 0)): exit_thread runs on the exiting thread itself,
+ * which is still on its way out then. Windows signals a thread's handle once it has ended; the
+ * POSIX shim once its start routine has returned, after which it touches nothing of ours (it
+ * never signals the guest main thread's, a DuplicateHandle: that one is never freed there). The
+ * only other holder of a thread's Cpu is the fiber made of the thread itself (hle_fiber.c), which
+ * runs on that thread's own stack: nothing can resume it once the thread has ended. */
+static void reap(void) {
+    for (KThread **p = &dead; *p;) {
+        KThread *t = *p;
+        if (t->host && WaitForSingleObject(t->host, 0) != WAIT_OBJECT_0) { p = &t->next_dead; continue; }
+        *p = t->next_dead;
+        if (t->host) CloseHandle(t->host);
+        spare_tlrs[nspare_tlrs++] = t->tlr;   /* (committed, its memory-map region kept) */
+        _aligned_free(t->cpu);
+        free(t);
+    }
+}
+
+static void drop_thread(KThread *t) {
+    for (u32 i = 0; i < nthreads; i++)
+        if (threads[i] == t) { threads[i] = threads[--nthreads]; break; }
+    t->next_dead = dead;
+    dead = t;
+    reap();
+}
+
 /* ---- threads --------------------------------------------------------------------- */
 static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 core) {
     KThread *t = calloc(1, sizeof *t);
@@ -231,10 +317,17 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
     InitializeConditionVariable(&t->woken);
     t->entry = entry; t->arg = arg; t->stack_top = stack_top; t->priority = priority; t->core = core;
     t->id = next_thread_id++;
-    t->tlr = tlr_next;
-    tlr_next += 0x1000;
-    commit(t->tlr, 0x1000, "a thread-local region");
-    kernel_add_region(t->tlr, 0x1000, GM_TLS, 3);
+    if (recycle) reap();
+    if (nspare_tlrs) {
+        t->tlr = spare_tlrs[--nspare_tlrs];
+        memset(G2H(t->tlr), 0, 0x1000);   /* (a new thread's starts zeroed) */
+    } else {
+        if (tlr_next == KERNEL_BASE + TLR_AREA) rt_fatal("kernel: out of thread-local regions");
+        t->tlr = tlr_next;
+        tlr_next += 0x1000;
+        commit(t->tlr, 0x1000, "a thread-local region");
+        kernel_add_region(t->tlr, 0x1000, GM_TLS, 3);
+    }
     t->cpu = _aligned_malloc(sizeof *t->cpu, 64);
     memset(t->cpu, 0, sizeof *t->cpu);
     t->cpu->thread = t;
@@ -255,8 +348,9 @@ static __thread jmp_buf *exit_point;
 static _Noreturn void exit_thread(KThread *t) {
     EnterCriticalSection(&klock);
     t->exited = 1;
-    objects[t->handle - 0xA000].signaled = 1;
+    objects[index_of(t->handle)].signaled = 1;
     kwake_handle(t->handle);
+    if (recycle) release(index_of(t->handle));   /* (freed now if its handle was closed already) */
     LeaveCriticalSection(&klock);
 #ifndef _WIN32
     if (exit_point) RT_LONGJMP(*exit_point, 1);
@@ -370,13 +464,13 @@ static u32 get_info(Cpu *c, u32 id, u64 sub, u64 *out) {
     return R_OK;
 }
 
-static u32 wait_synchronization(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
+static u32 wait_objects(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
     KThread *me = c->thread;
     u64 deadline = deadline_of(timeout);
     for (;;) {
         for (u32 i = 0; i < count; i++) {
-            u32 h = ld32(handles + 4 * i), k = h - 0xA000;
-            if (k >= 4096 || objects[k].type == OBJ_FREE) return R_INVALID_HANDLE;
+            u32 h = ld32(handles + 4 * i), k = recycle ? index_of(h) : slot_of(h);   /* (recycling: held, closed or not) */
+            if (!k) return R_INVALID_HANDLE;
             if (objects[k].signaled) { *index = i; return R_OK; }
         }
         if (me->cancelled) { me->cancelled = 0; return R_CANCELLED; }
@@ -387,6 +481,24 @@ static u32 wait_synchronization(Cpu *c, u64 handles, u32 count, i64 timeout, u32
         me->wait_count = 0;
         if (!more) return R_TIMEOUT;
     }
+}
+
+/* With recycling the wait holds its objects, as the console's does: one whose handle another
+ * thread closes meanwhile is still waited on (an exiting thread whose handle was closed is still
+ * seen signalled), and is freed when the wait ends. (The handle array is the waiting thread's
+ * own: it does not change under the wait - kwake_handle reads it too.) */
+static u32 wait_synchronization(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
+    if (!recycle) return wait_objects(c, handles, count, timeout, index);
+    for (u32 i = 0; i < count; i++)
+        if (!slot_of(ld32(handles + 4 * i))) return R_INVALID_HANDLE;
+    for (u32 i = 0; i < count; i++) objects[index_of(ld32(handles + 4 * i))].waits++;
+    u32 r = wait_objects(c, handles, count, timeout, index);
+    for (u32 i = 0; i < count; i++) {
+        u32 k = index_of(ld32(handles + 4 * i));
+        objects[k].waits--;
+        release(k);
+    }
+    return r;
 }
 
 static u32 wait_for_address(Cpu *c, u64 addr, u32 type, i32 value, i64 timeout) {
@@ -577,6 +689,7 @@ void rt_svc(Cpu *c, u32 n) {
         x[0] = R_OK;
         break;
     case 0x16: {   /* CloseHandle(handle) */
+        if (recycle) { x[0] = close_handle((u32)x[0]); break; }
         u32 k = (u32)x[0] - 0xA000;
         if (k < 4096 && objects[k].type == OBJ_SESSION) { ipc_close(objects[k].session); objects[k].type = OBJ_FREE; }
         if (k < 4096 && (objects[k].type == OBJ_EVENT || objects[k].type == OBJ_MEMORY)) objects[k].type = OBJ_FREE;
@@ -584,8 +697,8 @@ void rt_svc(Cpu *c, u32 n) {
         break;
     }
     case 0x17: {   /* ResetSignal(handle) */
-        u32 k = (u32)x[0] - 0xA000;
-        if (k >= 4096 || objects[k].type == OBJ_FREE) { x[0] = R_INVALID_HANDLE; break; }
+        u32 k = slot_of((u32)x[0]);
+        if (!k) { x[0] = R_INVALID_HANDLE; break; }
         x[0] = objects[k].signaled && objects[k].type == OBJ_EVENT ? R_OK : R_INVALID_STATE;
         if (objects[k].type == OBJ_EVENT) objects[k].signaled = 0;
         break;
@@ -645,6 +758,7 @@ void rt_svc(Cpu *c, u32 n) {
     }
     case 0x45: {   /* CreateEvent() -> writable handle, readable handle (one object here) */
         u32 h = new_handle(OBJ_EVENT, NULL);
+        objects[index_of(h)].refs = 2;
         x[0] = R_OK; x[1] = h; x[2] = h;
         break;
     }
@@ -695,14 +809,23 @@ void kernel_dump_threads(void) {
 u32 kernel_new_session(void *session) {
     EnterCriticalSection(&klock);
     u32 h = new_handle(OBJ_SESSION, NULL);
-    objects[h - 0xA000].session = session;
+    objects[index_of(h)].session = session;
     LeaveCriticalSection(&klock);
     return h;
 }
 
 void *kernel_session_of(u32 handle) {
-    u32 k = handle - 0xA000;
-    return k < 4096 && objects[k].type == OBJ_SESSION ? objects[k].session : NULL;
+    u32 k = slot_of(handle);
+    return k && objects[k].type == OBJ_SESSION ? objects[k].session : NULL;
+}
+
+/* A handle native code gives the guest once more (an IPC copy handle, ipc.c): on the console a
+ * handle of its own, so one more CloseHandle to come. */
+void kernel_copy_handle(u32 handle) {
+    EnterCriticalSection(&klock);
+    u32 k = slot_of(handle);
+    if (k) objects[k].refs++;
+    LeaveCriticalSection(&klock);
 }
 
 u32 kernel_create_event(void) {
@@ -712,10 +835,12 @@ u32 kernel_create_event(void) {
     return h;
 }
 
+/* (an event the guest has closed: nothing, as one it was handed and closed - rt_attach_system_event's
+ * - names nothing any more) */
 void kernel_signal_event(u32 handle) {
     EnterCriticalSection(&klock);
-    u32 k = handle - 0xA000;
-    if (k < 4096 && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; kwake_handle(handle); }
+    u32 k = slot_of(handle);
+    if (k && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; kwake_handle(handle); }
     LeaveCriticalSection(&klock);
 }
 
@@ -729,13 +854,15 @@ u32 rt_attach_system_event(Cpu *c, u64 system_event, int auto_clear) {
 
 void kernel_init(void) {
     InitializeCriticalSection(&klock);
+    recycle = getenv("SSBU_THREAD_RECYCLING") && !strcmp(getenv("SSBU_THREAD_RECYCLING"), "1");
+    if (recycle) fprintf(stderr, "[kernel] exited threads and their handles recycled (SSBU_THREAD_RECYCLING=1)\n");
     rt_clock_ns();   /* (the clock set up - and its line logged - before the game asks it) */
     /* Reserve the areas the guest maps into; pages are committed as they are used. The alias
      * area, where the game keeps its GPU memory, has its writes watched so that the renderer
      * learns which textures the CPU changed (GetWriteWatch). */
     static const struct { u64 base, size; const char *what; DWORD flags; } areas[] = {
         {HEAP_BASE, HEAP_LIMIT, "heap", 0}, {ALIAS_BASE, ALIAS_SIZE, "alias", MEM_WRITE_WATCH}, {STACK_BASE, STACK_SIZE, "stack", 0},
-        {KERNEL_BASE, 0x1000000, "thread-local", 0},
+        {KERNEL_BASE, TLR_AREA, "thread-local", 0},
     };
     for (u32 i = 0; i < sizeof areas / sizeof *areas; i++)
         if (VirtualAlloc(G2H(areas[i].base), areas[i].size, MEM_RESERVE | areas[i].flags, PAGE_READWRITE) != G2H(areas[i].base))
