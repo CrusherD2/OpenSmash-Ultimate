@@ -365,6 +365,42 @@ def simd_shifts(rng):
     return out
 
 
+def simd_round_insert(rng):
+    """srshr / urshr / srsra / ursra and rshrn / rshrn2 by 1, 2, half, esize-1 and esize; sri by every
+    amount (1 to esize), sli by every amount (0 to esize-1); vector at both widths and scalar (d), every
+    other amount with rd = rn."""
+    out = []
+    for opcode, u in ((0x04, 0), (0x04, 1), (0x06, 0), (0x06, 1), (0x08, 1), (0x0A, 1), (0x11, 0)):
+        for esize in (8, 16, 32, 64):
+            if opcode == 0x11 and esize == 64:
+                continue
+            amounts = (range(esize) if opcode == 0x0A else range(1, esize + 1) if opcode == 0x08 else
+                       sorted({1, 2, esize // 2, esize - 1, esize}))
+            for k, amount in enumerate(amounts):
+                immhb = esize + amount if opcode == 0x0A else 2 * esize - amount
+                rd = rng.randrange(32)
+                rn = rd if k % 2 else rng.randrange(32)
+                for q in (0, 1):
+                    if q or esize < 64:
+                        out.append(q << 30 | u << 29 | 0x0F000400 | immhb << 16 | opcode << 11 | rn << 5 | rd)
+                if esize == 64 and opcode != 0x11:
+                    out.append(u << 29 | 0x5F000400 | immhb << 16 | opcode << 11 | rn << 5 | rd)
+    return out
+
+
+def simd_pairwise_long(rng):
+    """saddlp / uaddlp / sadalp / uadalp: every element size (3 is reserved) at both widths, with rd = rn too."""
+    out = []
+    for opcode in (2, 6):
+        for u in (0, 1):
+            for size in range(4):
+                for q in (0, 1):
+                    rd, rn = rng.randrange(32), rng.randrange(32)
+                    for n in (rn, rd):
+                        out.append(q << 30 | u << 29 | 0x0E200800 | size << 22 | opcode << 12 | n << 5 | rd)
+    return out
+
+
 def simd_permutes(rng):
     """ext at every byte position, tbl / tbx of one to four registers (wrapping past v31),
     and every element copy at its first and last index."""
@@ -444,6 +480,8 @@ EDGES = [
     ("register offset", loads_stores),
     ("fp scalar", fp_scalar),
     ("advsimd shift by immediate", simd_shifts),
+    ("advsimd rounding shift / insert / rshrn", simd_round_insert),
+    ("advsimd pairwise add long", simd_pairwise_long),
     ("advsimd permute / copy", simd_permutes),
     ("advsimd load / store structures", simd_structures),
     ("advsimd modified immediate", simd_immediates),

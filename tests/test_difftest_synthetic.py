@@ -22,8 +22,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 DIFFTEST = ROOT / 'tools' / 'dev' / 'difftest.py'
-# CI's run: some 8,600 encodings x 8 states (capstone 5.0.9, pinned in tests/requirements-dev.txt: the words kept
-# are those it decodes), built at -O2 and -O0 (8 s on an Apple M5 Pro with 4 processes)
+# CI's run: some 9,700 encodings x 8 states (capstone 5.0.9, pinned in tests/requirements-dev.txt: the words kept
+# are those it decodes), built at -O2 and -O0 (8-9 s on an Apple M5 Pro with 4 processes)
 DEFAULTS = ['--per-template', '2', '--states', '8', '--draws', '2000', '--seed', '1']
 HAVE_PACKAGES = all(importlib.util.find_spec(m) is not None for m in ('capstone', 'unicorn'))
 
