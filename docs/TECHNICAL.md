@@ -10,7 +10,7 @@ This document describes the checked-in implementation. Implemented paths and dev
 
 | Section | Covers |
 | :--- | :--- |
-| [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement, the game version, the imports check. |
+| [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement, incremental builds, the game version, the imports check. |
 | [2. Loading, symbols, and guest execution](#2-loading-symbols-and-guest-execution) | Mapping, binding, native replacements, exceptions. |
 | [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts. |
 | [4. The graphics path](#4-the-graphics-path) | GPU commands, the D3D11 back end, shader compilation, audio and video. |
@@ -66,9 +66,11 @@ The primary modules have explicit guest bases in `recomp.py`: `main`, `subsdk0`,
 
 That address manifest is a build input. Preserve it when incrementally rebuilding an existing installation; generated code and relocation images must agree on placement.
 
+### Incremental builds
+
 Each module's build folder has a `module.txt` stamp: build ID, address, name, and a fingerprint of the tools that generated it (the recompiler's sources and the runtime's list of native functions). With the same stamp, [`modcache.py`](../tools/modcache.py) leaves the generated C as it is, and the build only checks it for objects to compile. After a change to the recompiler, the C is generated again, but only changed files are compiled.
 
-Whether an object is current goes by content, not by date ([`objcache.py`](../tools/objcache.py), in the Windows and Linux builds). Each build folder's `objcache.json` records each object's key: a SHA-256 of its C, the runtime headers it includes (`recomp.h` or `module.h` and the headers they include), the compiler (its path and what `--version` prints) and the whole compile command, with its optimisation level and instruction set. A change to any of them compiles the object again; a file saved again unchanged does not. A source with the same size and modification time as last time is not read again. A key is recorded only once its object has compiled, so a stopped build carries on where it stopped. A file the compiler crashed on and compiled at `/O1` instead keeps its own level's key, so it is not compiled again at every build. The runtime's objects are kept the same way, with every runtime header. The macOS build keeps its own record, `build-mac/obj/game_sources.tsv`.
+Whether an object is current goes by content, not by date ([`objcache.py`](../tools/objcache.py), in the Windows and Linux builds). Each build folder's `objcache.json` records each object's key: a SHA-256 of its C, the runtime headers it includes (`recomp.h` or `module.h` and the headers they include), the compiler (its path and what `--version` prints) and the whole compile command, with its optimisation level and instruction set. A change to any of them compiles the object again; a file saved again unchanged does not. The generated C is compiled without the runtime's own defines and include folders (SDL3, libopus, libvpx: `cc.GAME_CFLAGS`), which it cannot see, so their coming and going compiles only the runtime again. The key names a file and its object by their names in the build folder, so the folder spelled another way (`build\main`, `.\build\main`, a full path), or moved, compiles nothing again. A source with the same size and modification time as last time is not read again. A key is recorded only once its object has compiled, so a stopped build carries on where it stopped. A file the compiler crashed on and compiled at `/O1` instead keeps its own level's key, so it is not compiled again at every build. The runtime's objects are kept the same way, with every runtime header. A record that another program holds open is waited for a moment; one that still cannot be opened stops the build before anything is compiled or removed, rather than compiling the folder again. The macOS build keeps its own record, `build-mac/obj/game_sources.tsv`.
 
 ### The game version
 

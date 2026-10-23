@@ -17,7 +17,8 @@ of (which say why an object is compiled again), and each source's SHA-256 with i
 recorded once it has compiled (Record.compiled) and forgotten before it is compiled again
 (Record.forget), the record written whole each time (a new file, then os.replace): a build that
 stops half-way, or a file that fails to compile, leaves no key for an object it did not make.
-No record, or one that cannot be read: its objects are compiled again."""
+No record, or one that cannot be read: its objects are compiled again. One there that cannot be
+opened (another program holding it) stops the build before anything is compiled or removed."""
 import functools
 import hashlib
 import json
@@ -102,6 +103,18 @@ def compiler_id(compiler):
     return " ".join(args) + "\n" + said
 
 
+def _retried(do):
+    """do(), tried again for a moment on PermissionError: on Windows something (an antivirus) can hold
+    the record open just after it was written."""
+    for attempt in range(5):
+        try:
+            return do()
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+
+
 def summary(reasons):
     """The build log's line for why objects are compiled again (reasons: a Counter of Record.check's
     answers), or None when it is only new and changed sources."""
@@ -122,13 +135,13 @@ class Record:
     every object of its folder, and one it did not look at is no longer built there."""
 
     def __init__(self, folder, scan=(), log=print):
-        self.folder, self.path, self.scan = folder, os.path.join(folder, RECORD), tuple(scan)
+        self.folder, self.path, self.scan, self.log = folder, os.path.join(folder, RECORD), tuple(scan), log
         self.lock = threading.Lock()
         self.objects, self.sources = {}, {}
         self.seen_objects, self.seen_sources, self.recent = set(), set(), set()
         self.unrecorded = UNRECORDED
         try:
-            with open(self.path, encoding="utf-8") as f:
+            with _retried(lambda: open(self.path, encoding="utf-8")) as f:
                 data = json.load(f)
             if not isinstance(data, dict) or data.get("version") != VERSION:
                 raise ValueError(f"not version {VERSION}'s")
@@ -136,7 +149,10 @@ class Record:
             self.sources = {k: v for k, v in data["sources"].items() if isinstance(v, list) and len(v) == 4}
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        except OSError as e:   # there but not to be opened: not taken for no record, which compiles hours again
+            raise SystemExit(f"{self.path} could not be opened ({e}). Build again once no other program holds it "
+                             f"open; deleting it compiles the objects in {folder} again.") from e
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
             self.unrecorded = f"{RECORD} could not be read"
             log(f"{self.path} could not be read ({e}): the objects there are compiled again")
 
@@ -182,16 +198,19 @@ class Record:
             return self.unrecorded
         if was.get("key") == entry["key"]:
             return None
+        if was.get("source") != entry["source"]:
+            return CHANGED   # (the cause even when its level or language changed with it)
         return next((why for p, why in zip(PARTS, (COMPILER, COMMAND, HEADERS)) if was.get(p) != entry[p]), CHANGED)
 
     def forget(self, objs):
-        """Before these objects are compiled: their keys gone from the record on disk."""
+        """Before these objects are compiled: their keys gone from the record on disk. A record that
+        cannot be written stops the build here, before the builds remove an object."""
         with self.lock:
             for obj in objs:
                 self.objects.pop(self.name(obj), None)
             self._save()
 
-    def compiled(self, obj, entry, log=print):
+    def compiled(self, obj, entry):
         """An object compiled with this key: recorded at once (a build stopped later keeps it)."""
         if not os.path.exists(obj):
             return
@@ -201,11 +220,14 @@ class Record:
             try:
                 self._save()
             except OSError as e:   # (not worth stopping the build for: the object is compiled again next time)
-                log(f"could not write {self.path} ({e}): its objects may be compiled again next time")
+                self.log(f"could not write {self.path} ({e}): its objects may be compiled again next time")
 
     def save(self):
         with self.lock:
-            self._save()
+            try:
+                self._save()
+            except OSError as e:   # (the sources' digests: they are read again next time)
+                self.log(f"could not write {self.path} ({e}): its sources are read again next time")
 
     def _save(self):
         data = {"version": VERSION,
@@ -215,11 +237,4 @@ class Record:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, separators=(",", ":"), sort_keys=True)
-        for attempt in range(5):   # (on Windows, something - an antivirus - can hold the old file open a moment)
-            try:
-                os.replace(tmp, self.path)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.1 * (attempt + 1))
+        _retried(lambda: os.replace(tmp, self.path))

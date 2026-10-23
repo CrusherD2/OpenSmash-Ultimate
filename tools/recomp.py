@@ -494,7 +494,9 @@ def build(path, outdir, jobs, per_file):
 
 def plan(outdir):
     """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
-    one is). A generated file includes recomp.h, g_module.c module.h (_emit, module_table)."""
+    one is). A generated file includes recomp.h, g_module.c module.h (_emit, module_table). The key's
+    command names the file and its object by their names in the folder: the folder spelled another
+    way (build/main, .\\build\\main, a full path), or moved, compiles nothing again."""
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
@@ -506,7 +508,7 @@ def plan(outdir):
         obj = src[:-2] + ".obj"
         # very large functions make the optimiser superlinear; build those at a lower level
         opt = "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"
-        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt), compiler,
+        keys[obj] = record.entry([src], cc.compile_command(name, name[:-2] + ".obj", opt, cc.GAME_CFLAGS), compiler,
                                  headers["module.h" if name == "g_module.c" else "recomp.h"])
         reason = record.check(obj, keys[obj])
         if reason:
@@ -542,7 +544,7 @@ def compile_dir(outdir, jobs, shown=None):
         # it is built from changes, rather than compiled again at every build in case the compiler no longer crashes
         record.compiled(job[1], keys[job[1]])
     failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()),
-                               compiled=compiled)
+                               compiled=compiled, flags=cc.GAME_CFLAGS)
     if shown:
         shown.end("compile", os.path.basename(outdir))
     objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
@@ -559,7 +561,7 @@ def link(dirs, exe, rt_dir=None):
     runtime's objects go to rt_dir (default: rt beside the exe)."""
     import cc
     t0 = time.time()
-    rt_dir = rt_dir or os.path.join(os.path.dirname(exe), "rt")
+    rt_dir = os.path.abspath(rt_dir or os.path.join(os.path.dirname(exe), "rt"))   # (one spelling: its objects' keys name it)
     os.makedirs(rt_dir, exist_ok=True)
     # An object is compiled again when its source, a runtime header, the compiler or its compile command
     # changes (objcache.py): cc.CFLAGS change as SDL3, libopus or libvpx come and go.
@@ -596,6 +598,9 @@ def link(dirs, exe, rt_dir=None):
     if objcache.summary(why):
         print(f"runtime: {objcache.summary(why)}")
     record.forget([obj for _src, obj, _opt in jobs])
+    for _src, obj, _opt in jobs:   # (as compile_dir: a file that fails to compile leaves no old object)
+        if os.path.exists(obj):
+            os.remove(obj)
     failures = cc.compile_each(jobs, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]))
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")

@@ -160,6 +160,8 @@ class RecordTests(Folder):
         write(self.src, '#include "recomp.h"\nvoid f_7100000004(void) { return; }\n', age=1800)   # (the same size)
         self.assertEqual(self.build(), objcache.CHANGED)
         self.assertIsNone(self.build())
+        write(self.src, '#include "recomp.h"\nvoid f_7100000008(void) { return; }\n')
+        self.assertEqual(self.build(level='-O1'), objcache.CHANGED)   # (a level that comes with the change: not the command)
 
     def test_object_gone(self):
         self.build()
@@ -238,6 +240,55 @@ class RecordTests(Folder):
                 self.assertIsNone(self.build())
                 self.assertEqual(len(self.log), 1)
 
+    def test_a_record_held_a_moment_is_read(self):
+        """On Windows another program (an antivirus) can hold the record a moment after it was written."""
+        self.build()
+        held, real = [], open
+
+        def opened(path, *args, **kw):
+            if path == str(self.out / objcache.RECORD) and len(held) < 2:
+                held.append(path)
+                raise PermissionError(13, 'held by another program', path)
+            return real(path, *args, **kw)
+        with mock.patch.object(objcache, 'open', opened, create=True), mock.patch.object(objcache.time, 'sleep'):
+            self.assertIsNone(self.build())
+        self.assertEqual(len(held), 2)
+        self.assertEqual(self.log, [])
+
+    def test_a_record_that_cannot_be_opened_stops_the_build(self):
+        """Not taken for no record (every object compiled again, the record replaced): nothing is compiled or
+        removed, and the record is left as it was."""
+        self.build()
+        before = (self.out / objcache.RECORD).read_text()
+
+        def opened(path, *args, **kw):
+            raise PermissionError(13, 'held by another program', path)
+        with mock.patch.object(objcache, 'open', opened, create=True), mock.patch.object(objcache.time, 'sleep'), \
+                self.assertRaises(SystemExit) as stop:
+            self.build()
+        self.assertIn('could not be opened', str(stop.exception))
+        self.assertEqual((self.out / objcache.RECORD).read_text(), before)
+        self.assertTrue(self.obj.exists())
+        self.assertIsNone(self.build())
+
+    def test_a_record_that_cannot_be_written(self):
+        """After a build's look (save) or a compile (compiled): logged, and the build goes on (its sources are
+        read and the object compiled again next time). Before a compile (forget): the build stops there, before
+        an old object is removed, as its key could not be dropped."""
+        self.build()
+        before = (self.out / objcache.RECORD).read_text()
+        record = objcache.Record(str(self.out), log=self.log.append)
+        key = {'key': '1' * 64}
+        with mock.patch.object(objcache.os, 'replace', side_effect=PermissionError(13, 'held')), \
+                mock.patch.object(objcache.time, 'sleep'):
+            record.save()
+            record.compiled(str(self.obj), key)
+            with self.assertRaises(PermissionError):
+                record.forget([str(self.obj)])
+        self.assertEqual(len(self.log), 2)
+        self.assertTrue(all('could not write' in line for line in self.log), self.log)
+        self.assertEqual((self.out / objcache.RECORD).read_text(), before)
+
     def test_a_failed_compile_records_nothing(self):
         self.build()
         write(self.src, '#error not this one\n')
@@ -278,16 +329,18 @@ class WindowsBuildTests(Folder):
         write(self.module / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) {}\n')
         write(self.module / 'g0001.c', '#include "recomp.h"\nvoid f_7100001000(void) {}\n')
         write(self.module / 'g_module.c', '#include "module.h"\n')
-        self.flags = ['/nologo', '/arch:AVX2', '-mfma', '/I', str(self.runtime)]
-        for patch in (mock.patch.object(cc, 'CLANG', self.cc.name), mock.patch.object(cc, 'CFLAGS', self.flags),
-                      mock.patch.object(cc, 'RUNTIME', str(self.runtime)), self.cc.patch()):
+        self.flags = ['/nologo', '/arch:AVX2', '-mfma', '/I', str(self.runtime)]   # cc.GAME_CFLAGS
+        self.rt_flags = list(self.flags)   # cc.CFLAGS: the runtime's, with its libraries' defines and folders
+        for patch in (mock.patch.object(cc, 'CLANG', self.cc.name), mock.patch.object(cc, 'GAME_CFLAGS', self.flags),
+                      mock.patch.object(cc, 'CFLAGS', self.rt_flags), mock.patch.object(cc, 'RUNTIME', str(self.runtime)),
+                      self.cc.patch()):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def compile(self):
+    def compile(self, folder=None):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ok = recomp.compile_dir(str(self.module), 1)
+            ok = recomp.compile_dir(str(folder or self.module), 1)
         self.said = out.getvalue()
         return ok, self.cc.runs()
 
@@ -309,10 +362,41 @@ class WindowsBuildTests(Folder):
         self.flags[1] = '/arch:SSE4.2'   # (another instruction set: every object, never a mix of the two)
         self.assertEqual(self.compile(), (True, every))
         self.assertIn('main: 3 objects to compile again: the compile command changed', self.said)
+        self.assertIn('/arch:SSE4.2', (self.module / 'g0000.obj').read_text())   # (compiled with the flags it is keyed on)
+        self.rt_flags += ['/DSSBU_HAVE_SDL3', '/I', str(self.dir / 'SDL3' / 'include')]   # (the runtime's alone)
+        self.assertEqual(self.compile(), (True, []))
         self.cc.version('fake clang version 20.1.8')
         self.assertEqual(self.compile(), (True, every))
         self.assertIn('main: 3 objects to compile again: the compiler changed', self.said)
         self.assertEqual(recomp.stale_files(str(self.module)), [])
+        # a change to the C that puts the file at another level: said as a change to its C, not to the command
+        write(self.module / 'manifest.tsv', 'g0000.c\t40000\t25000\ng0001.c\t30000\t25000\n')
+        write(self.module / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { /* bigger */ }\n')
+        self.assertEqual(self.compile(), (True, ['g0000.c /O1']))
+        self.assertNotIn('to compile again', self.said)
+
+    def test_the_folder_spelled_another_way_or_moved(self):
+        """The key names a file and its object by their names in the folder: build/main, ./build/main, the
+        full path (build\\main on Windows), or the build folder moved, compile nothing again."""
+        with contextlib.chdir(self.dir):
+            self.assertTrue(self.compile('build/main')[0])
+            for spelling in ('./build/main', os.path.join('build', 'main'), str(self.module)):
+                with self.subTest(spelling):
+                    self.assertEqual(self.compile(spelling), (True, []))
+        os.rename(self.dir / 'build', self.dir / 'moved')
+        self.assertEqual(self.compile(self.dir / 'moved' / 'main'), (True, []))
+
+    def test_the_game_is_compiled_without_the_runtime_s_libraries(self):
+        """SDL3, libopus and libvpx are the runtime's. Their defines and include folders come and go with the
+        libraries; they are not in the generated C's command (cc.GAME_CFLAGS), so they compile only the runtime again."""
+        lib = write(self.dir / 'opus.lib', '')
+        with mock.patch.dict(os.environ, {'SSBU_OPUS_LIBS': str(lib)}):
+            spec = importlib.util.spec_from_file_location('cc_under_test', ROOT / 'tools' / 'cc.py')
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+        self.assertIn('/DSSBU_HAVE_OPUS', fresh.CFLAGS)
+        self.assertEqual(fresh.GAME_CFLAGS, [*fresh.BASE_CFLAGS, '/I', fresh.RUNTIME])
+        self.assertNotIn('/DSSBU_HAVE_OPUS', fresh.compile_command('g0000.c', 'g0000.obj', '/O2', fresh.GAME_CFLAGS))
 
     def test_a_crash_compiled_at_O1_is_kept(self):
         """A file the compiler crashed on at /O2 and compiled at /O1 (cc.RETRY) is recorded under its own
@@ -322,7 +406,7 @@ class WindowsBuildTests(Folder):
         self.assertEqual(self.compile(), (True, sorted(crashed + ['g0001.c /O1', 'g_module.c /O1'])))
         self.assertIn('g0000.c compiled (at /O1', self.said)
         self.assertEqual(self.compile(), (True, []))
-        self.flags.append('/DSSBU_HAVE_SDL3')
+        self.flags[1] = '/arch:SSE4.2'
         self.assertEqual(self.compile(), (True, sorted(crashed + ['g0001.c /O1', 'g_module.c /O1'])))
         self.assertEqual(self.compile(), (True, []))
 
@@ -376,14 +460,16 @@ class WindowsBuildTests(Folder):
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\nint more;\n')
         self.assertEqual(link(), (True, every))
         self.assertIn('runtime: 4 objects to compile again: the runtime headers changed', self.said)
-        self.flags.append('/DSSBU_HAVE_OPUS')
+        self.rt_flags.append('/DSSBU_HAVE_OPUS')
         self.assertEqual(link(), (True, every))
         self.assertIn('runtime: 4 objects to compile again: the compile command changed', self.said)
         self.cc.version('fake clang version 20.1.8')
         self.assertEqual(link(), (True, every))
         write(self.runtime / 'kernel.c', '#error made up\n')
         self.assertEqual(link(), (False, ['kernel.c /O2']))
+        self.assertFalse((rt / 'kernel.obj').exists())   # (not the old one either)
         self.assertEqual(link(), (False, ['kernel.c /O2']))   # (still not compiled: tried again)
+        self.assertNotIn('to compile again', self.said)
 
 
 # ---- the Linux build -------------------------------------------------------------------------
@@ -453,6 +539,9 @@ class LinuxBuildTests(Folder):
         self.cc.version('fake clang version 20.1.8')
         self.assertEqual(self.build(), (True, every))
         self.assertIn('game: 3 objects to compile again: the compiler changed', self.said)
+        write(self.tree / 'build' / 'main' / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { __try { } }\n')
+        self.assertEqual(self.build(), (True, ['g0000_cxx.cpp -O2']))   # (now C++: said as a change to its C)
+        self.assertNotIn('to compile again', self.said)
 
     def test_landing_sites_found_once(self):
         """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""

@@ -270,10 +270,11 @@ def forget(jobs):
     records = {}
     for job in jobs:
         records.setdefault(KEYS[job[1]][0], []).append(job[1])
-        if os.path.exists(job[1]):
-            os.remove(job[1])
     for record, objs in records.items():
         record.forget(objs)
+    for job in jobs:
+        if os.path.exists(job[1]):
+            os.remove(job[1])
 
 
 def compile_all(jobs, what, shown=None):

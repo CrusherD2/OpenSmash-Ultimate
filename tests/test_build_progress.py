@@ -258,7 +258,7 @@ class CompileReportTests(unittest.TestCase):
         self.assertEqual(sorted(seen), [('end', 'a.c', True), ('end', 'b.c', True), ('start', 'a.c'), ('start', 'b.c')])
 
     def test_compile_dir_follows_the_stale_files(self):
-        def fake(jobs, n, started=None, finished=None, compiled=None):
+        def fake(jobs, n, started=None, finished=None, compiled=None, flags=None):
             for job in jobs:
                 if started:
                     started(job)
