@@ -7,20 +7,26 @@
  *   (runtime/macos/include: the Windows types without the Linux build's Direct3D headers)
  *
  *   SSBU_THREAD_RECYCLING=1 kerneltest recycling
- *       6000 threads made, started, ended (returning, or through svcExitThread) and closed one
- *       after another, and 40 batches of 50 at once, without a fatal error: the table of live
- *       threads stays small, thread-local regions are used again and the memory map does not
- *       grow; a thread closed before it exits and one closed after are both freed; an exited
- *       thread stays signalled while its handle is open; every svc taking a handle refuses one
- *       whose object was freed, whose slot then gives a different value; handles below 1 << 30;
- *       a reused thread-local region zeroed; a wait on a thread whose handle another thread
- *       closes still sees it end, one on a closed event times out, both then freed;
- *       CancelSynchronization; the two handles of svcCreateEvent, IPC copies of a native event
- *       and sessions closed one reference at a time; userspace mutexes handed over and condition
- *       variables signalled among threads that come and go
+ *       one slot's handles through a full turn of its use count (0x7FFF + 4 uses: nonzero, below
+ *       1 << 30, the first value back only after 0x7FFF); 2100 events open at once said once in
+ *       the log; 6000 threads made, started, ended (returning, or through svcExitThread) and
+ *       closed one after another, and 40 batches of 50 at once, without a fatal error: the table
+ *       of live threads stays small, at most 1024 thread-local regions are made (more would mean
+ *       none used again) and the memory map keeps its count of regions; a thread closed before
+ *       it exits and one closed after are both freed; an exited thread stays signalled while its
+ *       handle is open; a handle whose object was freed refused by StartThread, Get/
+ *       SetThreadPriority, Get/SetThreadCoreMask, SignalEvent, ClearEvent, CloseHandle,
+ *       ResetSignal, WaitSynchronization, CancelSynchronization, SendSyncRequest (both) and
+ *       GetThreadId, its slot then giving a different value; a reused thread-local region
+ *       zeroed; a wait on a thread whose handle another thread closes still sees it end, one on
+ *       a closed event times out, both then freed; CancelSynchronization; the two handles of
+ *       svcCreateEvent, IPC copies of a native event and sessions closed one reference at a
+ *       time; userspace mutexes handed over and condition variables signalled among threads
+ *       that come and go
  *   kerneltest old
  *       without the switch, as before: handles 0xA000 + slot, thread objects kept after
- *       CloseHandle, which always succeeds
+ *       CloseHandle, which always succeeds, SetThreadCoreMask taking any handle, nothing said
+ *       of the handle table
  *
  * Exit code 0 when every check passes. tests/test_kernel_threads.py builds and runs both. */
 #include <stdarg.h>
@@ -182,6 +188,37 @@ static void g_worker(Cpu *c) {   /* 20 turns in the mutex, then waits for the ga
 }
 
 /* ---- with recycling ------------------------------------------------------------------------- */
+/* one slot used 0x7FFF + 4 times over (an event made and closed, nothing else running): its
+ * handles' upper bits count 1 to 0x7FFF and start again, every value nonzero and below the
+ * WAITERS bit, the slot's first value back only after 0x7FFF uses */
+static void generations(Cpu *c) {
+    u32 first = new_event(c), h = first, ok = 1, back = 0, top = 0;
+    for (u32 n = 1; n <= 0x7FFF + 4 && ok; n++) {
+        ok = close_h(c, h) == R_OK && close_h(c, h) == R_OK;
+        u32 next = new_event(c);
+        ok = ok && next && next < WAITERS && next != h && (next & 0x7FFF) == (first & 0x7FFF) && next >> 15 == (h >> 15) % 0x7FFF + 1;
+        CHECK(ok, "use %u of slot %u: %#x after %#x", n, first & 0x7FFF, next, h);
+        if (next == first && !back) back = n;
+        if (next >> 15 == 0x7FFF) top = next;
+        h = next;
+    }
+    CHECK(close_h(c, h) == R_OK && close_h(c, h) == R_OK && slot_type(h) == OBJ_FREE, "the last event");
+    CHECK(back == 0x7FFF, "the slot's first handle %#x back after %u uses, not 0x7FFF", first, back);
+    CHECK(top == (0x7FFFu << 15 | (first & 0x7FFF)), "the slot's highest handle %#x", top);
+}
+
+/* 2100 events open at once: the log says once that half the handle table is in use (a slow leak
+ * shows before "out of handles"), and closing them gives every slot back */
+static u32 many[2100];
+static void half_table(Cpu *c) {
+    u32 slots0 = used_slots();
+    CHECK(!said_half_full, "half the handle table said in use with %u slots used", slots0);
+    for (int i = 0; i < 2100; i++) many[i] = new_event(c);
+    CHECK(said_half_full, "%u handle slots in use, nothing said", used_slots());
+    for (int i = 0; i < 2100; i++) CHECK(close_h(c, many[i]) == R_OK && close_h(c, many[i]) == R_OK, "event %d (%#x)", i, many[i]);
+    CHECK(used_slots() == slots0, "%u handle slots used, %u before", used_slots(), slots0);
+}
+
 static void churn(Cpu *c) {
     EnterCriticalSection(&klock);
     u32 regions0 = region_count;
@@ -274,8 +311,12 @@ static void lifetimes(Cpu *c) {
     c->x[2] = t; CHECK(svc(c, 0x0E) == R_INVALID_HANDLE, "GetThreadCoreMask on a stale handle");
     c->x[0] = t; CHECK(svc(c, 0x19) == R_INVALID_HANDLE, "CancelSynchronization on a stale handle");
     c->x[0] = t; CHECK(svc(c, 0x17) == R_INVALID_HANDLE, "ResetSignal on a stale handle");
+    c->x[0] = t; c->x[1] = 0; c->x[2] = 1; CHECK(svc(c, 0x0F) == R_INVALID_HANDLE, "SetThreadCoreMask on a stale handle");
+    c->x[0] = 0x12345; c->x[1] = 0; c->x[2] = 1; CHECK(svc(c, 0x0F) == R_INVALID_HANDLE, "SetThreadCoreMask on a made-up handle");
+    c->x[0] = CUR_THREAD; c->x[1] = 0; c->x[2] = 1; CHECK(svc(c, 0x0F) == R_OK, "SetThreadCoreMask on the current thread");
     create(c, g_exit, 0, &h2);
     CHECK((h2 & 0x7FFF) == (t & 0x7FFF) && h2 != t, "the slot used again: %#x after %#x", h2, t);
+    c->x[0] = h2; c->x[1] = 0; c->x[2] = 1; CHECK(svc(c, 0x0F) == R_OK, "SetThreadCoreMask on the slot's new thread");
     CHECK(thread_id(c, h2, &id2) == R_OK && id2 > id, "the new thread's id %llu after %llu", (unsigned long long)id2, (unsigned long long)id);
     CHECK(thread_id(c, t, &id) == R_INVALID_HANDLE && start(c, t) == R_INVALID_HANDLE, "the stale handle names the slot's new thread");
     CHECK(close_h(c, h2) == R_OK && live() == base, "a thread never started not freed at CloseHandle");
@@ -319,8 +360,10 @@ static void lifetimes(Cpu *c) {
     create(c, g_wait, REC(5), &w);
     start(c, w);
     CHECK(until(is_waiting, thread_of(w)), "the waiter never waited");
+    c->x[0] = ev3; CHECK(svc(c, 0x12) == R_OK, "ClearEvent");
     CHECK(close_h(c, ev3) == R_OK && close_h(c, ev3) == R_OK && slot_type(ev3) == OBJ_EVENT, "an event a wait holds freed at CloseHandle");
     CHECK(signal_event(c, ev3) == R_INVALID_HANDLE, "SignalEvent on a closed handle");
+    c->x[0] = ev3; CHECK(svc(c, 0x12) == R_INVALID_HANDLE, "ClearEvent on a closed handle");
     CHECK(wait_on(c, MAIN_ARRAY, w, 10 * SECOND) == R_OK && ld32(REC(5) + 4) == R_TIMEOUT, "a wait on a closed event gave %#x", ld32(REC(5) + 4));
     CHECK(slot_type(ev3) == OBJ_FREE && wait_on(c, MAIN_ARRAY, ev3, 0) == R_INVALID_HANDLE, "the closed event not freed after the wait");
     close_h(c, w);
@@ -356,8 +399,11 @@ static void lifetimes(Cpu *c) {
     int closed = sessions_closed;
     u32 s = kernel_new_session(&checks);
     CHECK(kernel_session_of(s) == &checks, "a session's handle");
+    c->x[0] = s; CHECK(svc(c, 0x21) == R_OK, "SendSyncRequest");
     CHECK(close_h(c, s) == R_OK && sessions_closed == closed + 1 && !kernel_session_of(s), "closing a session");
     CHECK(close_h(c, s) == R_INVALID_HANDLE && sessions_closed == closed + 1, "closing a session twice");
+    c->x[0] = s; CHECK(svc(c, 0x21) == R_INVALID_HANDLE, "SendSyncRequest on a closed session");
+    c->x[0] = 0; c->x[1] = 0; c->x[2] = s; CHECK(svc(c, 0x22) == R_INVALID_HANDLE, "SendSyncRequestWithUserBuffer on a closed session");
     CHECK(live() == base, "%u threads left, not %u", live(), base);
 }
 
@@ -397,8 +443,12 @@ static void old_behaviour(Cpu *c) {
     CHECK(close_h(c, t) == R_OK && slot_type(t) == OBJ_THREAD && live() == base + 1 && thread_id(c, t, &id) == R_OK,
           "a closed thread's object not kept");
     CHECK(close_h(c, t) == R_OK && close_h(c, 0x1234) == R_OK, "CloseHandle failed");
+    c->x[0] = 0x12345; c->x[1] = 0; c->x[2] = 1; CHECK(svc(c, 0x0F) == R_OK, "SetThreadCoreMask refused a handle without the switch");
     u32 ev = new_event(c);
     CHECK(ev > 0xA000 && ev < 0xB000 && close_h(c, ev) == R_OK && slot_type(ev) == OBJ_FREE, "an event not freed at its first CloseHandle");
+    for (int i = 0; i < 2100; i++) many[i] = new_event(c);
+    CHECK(!said_half_full, "half the handle table said in use without the switch");
+    for (int i = 0; i < 2100; i++) close_h(c, many[i]);
     for (int i = 0; i < 200; i++) {
         create(c, g_return, 0, &t);
         start(c, t);
@@ -425,6 +475,8 @@ int main(int argc, char **argv) {
     if (recycle) {
         u64 id;
         CHECK(thread_id(c, CUR_THREAD, &id) == R_OK && id == 1, "GetThreadId of the current thread");
+        generations(c);
+        half_table(c);
         churn(c);
         lifetimes(c);
         mutexes(c, main_handle);

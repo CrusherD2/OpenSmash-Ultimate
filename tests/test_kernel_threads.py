@@ -65,14 +65,15 @@ class KernelThreadTests(unittest.TestCase):
         r = subprocess.run([self.exe, mode], capture_output=True, text=True, env=env, timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertRegex(r.stdout, r'\d+ checks, 0 failed')
-        return r.stdout
+        return r.stdout + r.stderr
 
     def test_recycling(self):
         out = self.kerneltest('recycling', '1')
         self.assertIn('8000 threads made', out)
+        self.assertEqual(out.count('[kernel] half the handle table in use'), 1, out)   # (said once, with 2100 events open)
 
     def test_old_behaviour(self):
-        self.kerneltest('old')
+        self.assertNotIn('[kernel] half the handle table', self.kerneltest('old'))
 
     def test_other_values_keep_the_old_behaviour(self):
         self.kerneltest('old', '0')

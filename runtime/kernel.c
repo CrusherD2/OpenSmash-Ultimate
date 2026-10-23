@@ -75,6 +75,7 @@ static int recycle;                          /* SSBU_THREAD_RECYCLING=1 (see "th
 static KThread *dead;                        /* (recycling) threads freed but for their host thread */
 static u64 spare_tlrs[TLR_AREA / 0x1000];    /* (recycling) regions of freed threads, for the next ones */
 static u32 nspare_tlrs;
+static int said_half_full;                   /* (recycling) see say_half_full */
 
 /* ---- time ------------------------------------------------------------------------ */
 static u64 now_ns(void) { return rt_clock_ns(); }
@@ -111,20 +112,35 @@ static void kwake_handle(u32 handle) {
 }
 
 /* ---- handles ---------------------------------------------------------------------
- * Without recycling a handle is 0xA000 plus its object's slot, as before. With it, the layout
- * public descriptions of the console's kernel give: the slot in the low 15 bits, a linear id
- * above them - here the slot's use count, 1 to 0x7FFF, so that a handle kept past CloseHandle
- * names nothing rather than the slot's next object. Never 0, and below bit 30: mutex words hold
- * owner handles under their WAITERS bit, and the pseudo-handles (0xFFFF800x) have the top bits
- * set. */
+ * Without recycling a handle is 0xA000 plus its object's slot, as before. With it, the console's
+ * layout as Atmosphere's open-source kernel has it (mesosphere's kern_k_handle_table.hpp: index
+ * in bits 0-14, a linear id 1 to 0x7FFF in bits 15-29, bits 30-31 zero) - the linear id here is
+ * the slot's use count, so that a handle kept past CloseHandle names nothing rather than the
+ * slot's next object. Never 0, and below bit 30: mutex words hold owner handles under their
+ * WAITERS bit, and the pseudo-handles (0xFFFF800x) have the top bits set. */
+static void say_half_full(void);
+
 static u32 new_handle(int type, KThread *t) {
     for (u32 i = 1; i < 4096; i++)
         if (objects[i].type == OBJ_FREE) {
             u32 gen = objects[i].gen % 0x7FFF + 1;
             objects[i] = (KObject){type, 0, t, NULL, gen, 1, 0};
+            if (recycle && i >= 2048 && !said_half_full) say_half_full();
             return recycle ? gen << 15 | i : 0xA000 + i;
         }
     rt_fatal("kernel: out of handles");
+}
+
+/* (recycling) Said once, when the first free slot is past half the table. A handle nothing
+ * closes keeps its slot for good - one of svcCreateEvent's two values never closed, or one the
+ * game moves to a native service (ipc.c keeps none) - and a slow leak ends at "out of handles"
+ * (without recycling an event's first CloseHandle frees it). */
+static void say_half_full(void) {
+    u32 n[OBJ_MEMORY + 1] = {0};
+    for (u32 i = 1; i < 4096; i++) n[objects[i].type]++;
+    said_half_full = 1;
+    fprintf(stderr, "[kernel] half the handle table in use: %u threads, %u events, %u sessions, %u transfer memories (4095 stop the run)\n",
+            n[OBJ_THREAD], n[OBJ_EVENT], n[OBJ_SESSION], n[OBJ_MEMORY]);
 }
 
 static u32 index_of(u32 handle) { return recycle ? handle & 0x7FFF : handle - 0xA000; }
@@ -157,9 +173,11 @@ static void release(u32 i) {
 }
 
 /* (recycling) CloseHandle. svcCreateEvent's object counts its two handles, one value here: the
- * SDK closes both when it destroys a system event (inferred from open reimplementations of
- * nn::os, not seen in the game). A handle native code hands out again counts once more each time
- * (kernel_copy_handle: on the console each copy is a handle of its own). */
+ * SDK closes both when it destroys a system event (inferred, not seen in the game: Atmosphere's
+ * libstratosphere, an open reimplementation of nn::os, does so in DestroyInterProcessEvent, and
+ * aborts if a CloseHandle fails - so the second close must succeed too). A handle native code
+ * hands out again counts once more each time (kernel_copy_handle: on the console each copy is a
+ * handle of its own). */
 static u32 close_handle(u32 handle) {
     u32 k = slot_of(handle);
     if (!k) return R_INVALID_HANDLE;
@@ -288,7 +306,11 @@ static void *commit(u64 at, u64 size, const char *what) {
  * POSIX shim once its start routine has returned, after which it touches nothing of ours (it
  * never signals the guest main thread's, a DuplicateHandle: that one is never freed there). The
  * only other holder of a thread's Cpu is the fiber made of the thread itself (hle_fiber.c), which
- * runs on that thread's own stack: nothing can resume it once the thread has ended. */
+ * runs on that thread's own stack: nothing can resume it once the thread has ended.
+ *
+ * Not freed with a thread, outside this file: the Linux and macOS platform layer's 256 KiB signal
+ * stack of each host thread (linux/win32.c, address space only until a signal runs on it), and
+ * hle_fiber.c's slot of a thread made a fiber (16384 slots, "too many fibers"). */
 static void reap(void) {
     for (KThread **p = &dead; *p;) {
         KThread *t = *p;
@@ -676,7 +698,9 @@ void rt_svc(Cpu *c, u32 n) {
         if (!(o = object_of(c, (u32)x[2], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
         x[0] = R_OK; x[1] = (u32)o->thread->core; x[2] = 0x7;
         break;
-    case 0x0F: x[0] = R_OK; break;                       /* SetThreadCoreMask */
+    case 0x0F:     /* SetThreadCoreMask(handle, core, mask): not kept - host threads run on any core */
+        x[0] = recycle && !object_of(c, (u32)x[0], OBJ_THREAD) ? R_INVALID_HANDLE : R_OK;   /* (without recycling any handle, as before) */
+        break;
     case 0x11:     /* SignalEvent(handle) */
         if (!(o = object_of(c, (u32)x[0], OBJ_EVENT))) { x[0] = R_INVALID_HANDLE; break; }
         o->signaled = 1;
