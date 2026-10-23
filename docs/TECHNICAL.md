@@ -285,7 +285,7 @@ python tools/dev/difftest.py --synthetic --per-template 4 --states 32 --draws 80
 python tools/dev/difftest.py --synthetic --toolchain rosetta
 ```
 
-[`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one) against the bitwise CRC and the standard check values.
+[`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one, else for CRC-32 tables made on first use) against the bitwise CRC and the standard check values.
 
 Game-backed checks after preparing local modules:
 

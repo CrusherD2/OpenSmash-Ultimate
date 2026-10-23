@@ -169,7 +169,8 @@ static inline u64 smulh64(u64 a, u64 b) { return (u64)(((__int128)(i64)a * (i64)
 
 /* crc32b/h/w/x and crc32cb/ch/cw/cx: the reflected CRC of the low 8, 16, 32 or 64 bits of v,
  * least significant bit first, continuing acc, with no inversion before or after. The bitwise
- * form is the definition; the host's instruction where it has one (x86's crc32 is CRC-32C only). */
+ * form is the definition; the host's instruction where it has one (x86's crc32 is CRC-32C only),
+ * else for CRC-32 tables made from the bitwise form. */
 #define RT_CRC32_POLY 0xEDB88320u    /* 0x04C11DB7, reflected */
 #define RT_CRC32C_POLY 0x82F63B78u   /* 0x1EDC6F41 (Castagnoli), reflected */
 static inline u32 rt_crc32_bits(u32 acc, u64 v, int bits, u32 poly) {
@@ -187,10 +188,34 @@ static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_arm_crc32ch(acc,
 static inline u32 rt_crc32cw(u32 acc, u32 v) { return __builtin_arm_crc32cw(acc, v); }
 static inline u32 rt_crc32cx(u32 acc, u64 v) { return __builtin_arm_crc32cd(acc, v); }
 #else
-static inline u32 rt_crc32b(u32 acc, u8 v)  { return rt_crc32_bits(acc, v, 8, RT_CRC32_POLY); }
-static inline u32 rt_crc32h(u32 acc, u16 v) { return rt_crc32_bits(acc, v, 16, RT_CRC32_POLY); }
-static inline u32 rt_crc32w(u32 acc, u32 v) { return rt_crc32_bits(acc, v, 32, RT_CRC32_POLY); }
-static inline u32 rt_crc32x(u32 acc, u64 v) { return rt_crc32_bits(acc, v, 64, RT_CRC32_POLY); }
+/* CRC-32 by slicing: t[256 * k + b] is the CRC of byte b followed by k zero bytes. The tables are
+ * built on first use by one thread (the others take the bitwise form meanwhile): 8 KB in each
+ * file that uses them. (The building is out of line, not in every crc32 the lifter writes.) */
+static inline __attribute__((noinline)) void rt_crc32_build(u32 *t) {
+    for (int i = 0; i < 8 * 256; i++) t[i] = rt_crc32_bits(0, (u64)(i & 255), 8 + 8 * (i >> 8), RT_CRC32_POLY);
+}
+static inline const u32 *rt_crc32_tables(void) {
+    static u32 t[8 * 256];
+    static int state;   /* 0 not built, 1 being built, 2 built */
+    int s = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
+    if (s == 2) return t;
+    if (s || !__atomic_compare_exchange_n(&state, &s, 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 0;
+    rt_crc32_build(t);
+    __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    return t;
+}
+static inline u32 rt_crc32_sliced(u32 acc, u64 v, int bytes) {
+    const u32 *t = rt_crc32_tables();
+    if (!t) return rt_crc32_bits(acc, v, 8 * bytes, RT_CRC32_POLY);
+    u64 x = acc ^ v;
+    u32 r = bytes < 4 ? (u32)(x >> 8 * bytes) : 0;   /* (the bits of acc above v's, shifted down) */
+    for (int i = 0; i < bytes; i++) r ^= t[256 * (bytes - 1 - i) + (x >> 8 * i & 255)];
+    return r;
+}
+static inline u32 rt_crc32b(u32 acc, u8 v)  { return rt_crc32_sliced(acc, v, 1); }
+static inline u32 rt_crc32h(u32 acc, u16 v) { return rt_crc32_sliced(acc, v, 2); }
+static inline u32 rt_crc32w(u32 acc, u32 v) { return rt_crc32_sliced(acc, v, 4); }
+static inline u32 rt_crc32x(u32 acc, u64 v) { return rt_crc32_sliced(acc, v, 8); }
 #if defined(__SSE4_2__)
 static inline u32 rt_crc32cb(u32 acc, u8 v)  { return __builtin_ia32_crc32qi(acc, v); }
 static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_ia32_crc32hi(acc, v); }

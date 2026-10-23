@@ -4,8 +4,8 @@ build's arm64 flags; on an Apple silicon Mac with Rosetta 2, the Linux build's f
 -O0, and outside Windows as C++ too (as the build compiles the generated files with landing sites):
 
   rt_rsqrt_est     (frsqrte's estimate) equal to the architecture's loop, which it replaced, for every input
-  rt_crc32*        the CRC-32 and CRC-32C check values (of "123456789"), and the host's instruction (where it is
-                   used) equal to the bitwise definition, rt_crc32_bits, for random operands"""
+  rt_crc32*        the CRC-32 and CRC-32C check values (of "123456789"), and the host's instruction or CRC-32's
+                   tables (whichever is used) equal to the bitwise definition, rt_crc32_bits, for random operands"""
 from pathlib import Path
 import importlib.util
 import os
@@ -76,9 +76,11 @@ int main(void) {
 #if defined(__ARM_FEATURE_CRC32)
     puts("crc32: arm; crc32c: arm");
 #elif defined(__SSE4_2__)
-    puts("crc32: bitwise; crc32c: sse4.2");
+    CHECK(rt_crc32_tables() != 0);
+    puts("crc32: tables; crc32c: sse4.2");
 #else
-    puts("crc32: bitwise; crc32c: bitwise");
+    CHECK(rt_crc32_tables() != 0);
+    puts("crc32: tables; crc32c: bitwise");
 #endif
     puts(bad ? "FAILED" : "ok");
     return bad != 0;
@@ -86,8 +88,8 @@ int main(void) {
 '''
 
 # the CRC instructions each build uses
-EXPECTED = {'windows': 'crc32: bitwise; crc32c: sse4.2', 'linux': 'crc32: bitwise; crc32c: sse4.2',
-            'rosetta': 'crc32: bitwise; crc32c: sse4.2', 'mac': 'crc32: arm; crc32c: arm'}
+EXPECTED = {'windows': 'crc32: tables; crc32c: sse4.2', 'linux': 'crc32: tables; crc32c: sse4.2',
+            'rosetta': 'crc32: tables; crc32c: sse4.2', 'mac': 'crc32: arm; crc32c: arm'}
 HOST = {'win32': 'windows', 'darwin': 'mac'}.get(sys.platform, 'linux')
 
 
