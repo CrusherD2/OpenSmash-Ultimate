@@ -37,7 +37,7 @@ name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a 
 it, so the replacement is reached by every caller, including direct calls inside the module.
 tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list).
 When it has an exact-callee, build reads main, subsdk0 and sdk from --exefs (dump/exefs if not
-given) for the import stubs bound to it (hook_imports).
+given) for the names other modules reach it by (hook_imports).
 """
 import bisect
 import hashlib
@@ -226,33 +226,57 @@ HOOK_KINDS = ("exact-callee", "exact-caller")
 # `<kind> <address> [<n> words, sha256 <16 hex digits>] <name>`
 HOOK_LINE = re.compile(r"(\S+)\s+(?:0x)?([0-9a-fA-F]+)(?:\s+(\d+) words?, sha256 ([0-9a-f]{16}))?\s+(\S+)")
 HOOK_NAME = re.compile(r"[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*")
-# 8 hex digits, maybe some masked as '.' (the form HLE_WRAP signatures once spelled the game's
-# code in), next to anything but another letter or digit (inside a longer run: an address, a hash)
-WORD_LIKE = re.compile(r"(?<![0-9A-Za-z])(?:0x)?([0-9A-Fa-f.]{8})(?![0-9A-Za-z])")
+# What could be the game's instruction words (word_like), anywhere in a line: a run of hex
+# digits, to count, maybe with digit separators (C++'s ', or _ after 0x: unprefixed, _ is a
+# name's); 8 hex digits and dots, not inside a longer word, the form HLE_WRAP signatures once
+# spelled the game's code in when the dots are a run of 4 or more (signature masks at least
+# that much); and 4 or more bytes in a row, as hex dumps, C arrays and strings write them
+# (`ff 83 00 d1`, `0xff, 0x83, ...`, `\xff\x83...`).
+HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])(?:(?<=0[xX])[0-9A-Fa-f]+(?:[_'][0-9A-Fa-f]+)*|[0-9A-Fa-f]+(?:'[0-9A-Fa-f]+)*)")
+MASKED_WORD = re.compile(r"(?<![0-9A-Za-z])(?:0[xX])?([0-9A-Fa-f.]{8})(?![0-9A-Za-z])")
+BYTE_ROW = re.compile(r"(?<![0-9A-Za-z])(?:(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:, ?| |(?=\\x))){3,}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}"
+                      r"(?![0-9A-Za-z])")
 
 
 def word_like(text):
-    """Whether text holds what could be an instruction word (WORD_LIKE)."""
-    return any(re.search(r"[0-9A-Fa-f]", m.group(1)) for m in WORD_LIKE.finditer(text))
+    """What in text could be one of the game's instruction words, or None: a run of 8 or more
+    hex digits (a word, or words run together as a hex editor copies them), a masked word, or a
+    row of bytes. The only runs that long the list needs are an address (10 digits, 7xxxxxxxxx)
+    and a signature's hash (16 digits, after `sha256 `)."""
+    for m in HEX_RUN.finditer(text):
+        run = m.group()
+        if len(re.sub(r"[_']", "", run)) < 8 or (len(run) == 10 and run[0] == "7") or (
+                len(run) == 16 and text[:m.start()].endswith("sha256 ")):
+            continue
+        return run
+    for m in MASKED_WORD.finditer(text):
+        if "...." in m.group(1) and re.search(r"[0-9A-Fa-f]", m.group(1)):
+            return m.group()
+    m = BYTE_ROW.search(text)
+    return m.group() if m else None
 
 
 def hook_list(path=None):
     """tools/hooks.txt: {(kind, address): (word count, hash) of its signature, or None}. The
     functions whose callers' whole register state a hook needs (resolve_hooks); see the file.
     Read strictly: a line that isn't an entry, a comment or blank, or that holds anything like
-    an instruction word (CONTRIBUTING.md, rule 1), stops the build."""
+    an instruction word (CONTRIBUTING.md, rule 1: word_like), stops the build."""
     path = path or HOOKS
     if not os.path.exists(path):
         return {}
     found = {}
-    with open(path, encoding="utf-8-sig") as f:   # (as some Windows editors save it: with a BOM)
-        lines = f.read().splitlines()
+    try:
+        with open(path, encoding="utf-8-sig") as f:   # (as some Windows editors save it: with a BOM)
+            lines = f.read().splitlines()
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"tools/hooks.txt: not UTF-8 ({e.reason} at byte {e.start}): save it as UTF-8") from None
     for n, line in enumerate(lines, 1):
         where = f"tools/hooks.txt line {n}"
-        if word_like(line):
-            raise SystemExit(f"{where}: an 8-digit hex number, which could be one of the game's instruction words: "
-                             "those never go in the repository (CONTRIBUTING.md, rule 1). An address is 13.0.5's, "
-                             "71xxxxxxxx; a signature is a hash (`tools/recomp.py wrap-sig <module> <address>`)")
+        if found_word := word_like(line):
+            raise SystemExit(f"{where}: `{found_word}` could be the game's instruction words, which never go in the "
+                             "repository (CONTRIBUTING.md, rule 1). Hex digits go only in an address (13.0.5's, "
+                             "71xxxxxxxx) and a signature's hash (`<n> words, sha256 <16 hex digits>`, as "
+                             "`tools/recomp.py wrap-sig <module> <address>` prints it)")
         text = line.split("#", 1)[0].strip()
         if not text:
             continue
@@ -275,18 +299,47 @@ def hook_list(path=None):
     return found
 
 
-def hook_imports(mods):
-    """{symbol: address} for each name the loader binds to an exact-callee of tools/hooks.txt:
-    the first of main, subsdk0 and sdk to export a name defines it (runtime/host.c
-    publish_exports; the NROs come later). Other modules call it by that name, through an
-    import stub. mods: name -> nso.Module."""
-    callees = {a for kind, a in hook_list() if kind == "exact-callee"}
+# The modules loaded at start, in the order runtime/host.c publishes their exports
+BOOT_MODULES = ("main", "subsdk0", "sdk")
+
+
+def hook_imports(mods, graphs=None):
+    """{symbol: address} for each name the loader binds to code that returns into the caller of
+    an exact-callee of tools/hooks.txt: the exact-callee itself, or a function that reaches one
+    by tail calls (an exported wrapper ending in `b impl`), maybe through import stubs bound to
+    such a name in turn. Other modules call these by name, through an import stub, so those
+    stubs are exact-callees too (resolve_hooks); and a module's stub joining its tail calls can
+    bring in more of its exports, so this goes round until nothing more is added.
+
+    The first of main, subsdk0 and sdk to export a name defines it (runtime/host.c
+    publish_exports). The NROs come later and define only names none of those does, each the
+    first of them loaded, so their exports are not followed here. mods: name -> nso.Module;
+    graphs: name -> (stub_symbols, tail_graph) of main, subsdk0 and sdk (by default
+    module_graph)."""
+    listed = {a for kind, a in hook_list() if kind == "exact-callee"}
+    boot = [name for name in BOOT_MODULES if name in mods] if listed else []
     bound = {}
-    for name in ("main", "subsdk0", "sdk") if callees else ():
-        if name in mods:
-            for n, v, _s, _info, _x in mods[name].exports:
-                bound.setdefault(n, MODULES[name] + v)
-    return {n: a for n, a in bound.items() if a in callees}
+    for name in boot:
+        for n, v, _s, _info, _x in mods[name].exports:
+            bound.setdefault(n, MODULES[name] + v)
+    if graphs is None:
+        graphs = {name: module_graph(name, mods[name]) for name in boot}
+    names = set()
+    while True:
+        reached = set(listed)
+        for name in boot:
+            base, (stubs, tails) = MODULES[name], graphs[name]
+            seeds = {a - base for a in listed if module_base(a) == base} | {s for s, sym in stubs.items() if sym in names}
+            reached |= {base + f for f in close_over_tail_calls(seeds, tails)}
+        more = {n for n, a in bound.items() if a in reached}
+        if more == names:
+            return {n: bound[n] for n in sorted(names)}
+        names = more
+
+
+def module_base(a):
+    """The load address of the module (main, subsdk0, sdk or an NRO) address a is in."""
+    return max((b for b in MODULES.values() if b <= a), default=None)
 
 
 def import_stub_symbols(mod):
@@ -294,6 +347,35 @@ def import_stub_symbols(mod):
     from funcs import import_stubs
     slots = {r[0]: mod.symbols[r[2]][0] for r in mod.relocs if r[2]}
     return {stub: slots[slot] for stub, slot in import_stubs(mod).items() if slot in slots}
+
+
+def native_only(forward):
+    """The functions of a module's forward (forwards) whose code never runs: replaced by a
+    native function (a wrap's original still runs, called by its wrapper)."""
+    return {a for a, v in forward.items() if isinstance(v, str)}
+
+
+def stub_symbols(mod, sizes):
+    """{import stub offset: the symbol it is bound to}, for the stubs that are functions here."""
+    return {stub: sym for stub, sym in import_stub_symbols(mod).items() if stub in sizes}
+
+
+def tail_graph(mod, sizes, entries=None, native=()):
+    """{function: the functions it jumps to without a call} (lift.tail_calls, with the Lifter's
+    entries: by default the function starts). A function replaced natively (native:
+    native_only) runs none of its own code, so its jumps are left out: they would only make
+    more calls exact than need be."""
+    from lift import tail_calls
+    return tail_calls(mod.image, sorted((a, s) for a, s in sizes.items() if a not in native), entries or set(sizes))
+
+
+def module_graph(name, mod):
+    """How a module (main, subsdk0, sdk) reaches an exact-callee without a call of its own, for
+    hook_imports: (stub_symbols, tail_graph), from its functions as build lifts them."""
+    found, funcs = functions(mod)
+    sizes = dict(funcs)
+    native = native_only(forwards(mod, MODULES[name], found, funcs, name))
+    return stub_symbols(mod, sizes), tail_graph(mod, sizes, set(found), native)
 
 
 def close_over_tail_calls(callees, tails):
@@ -312,19 +394,20 @@ def close_over_tail_calls(callees, tails):
     return out
 
 
-def resolve_hooks(mod, base, sizes, name, entries=None, imports=None):
+def resolve_hooks(mod, base, sizes, name, entries=None, imports=None, native=()):
     """This module's entries of tools/hooks.txt: (exact-callee offsets, exact-caller offsets),
     for the Lifter. As with a wrap, each must be a function start that begins as its signature
     (if any) says: one that isn't stops the build rather than leave a hook's registers stale.
 
     A hook's registers are those of the call it returns to (its LR), so exact-callees are also:
-    this module's import stubs bound to one (imports: hook_imports), which calls from another
-    module go through; and every function that reaches one by tail calls (lift.tail_calls, with
-    the Lifter's entries; by default the function starts), since what it reaches returns to the
-    caller of the function that jumped."""
+    this module's import stubs bound to a name in imports (hook_imports: the exact-callees'
+    names, and those of functions that reach one), which calls from another module go through;
+    and every function that reaches one by tail calls (tail_graph, with the Lifter's entries,
+    by default the function starts, and the functions replaced natively: native_only), since
+    what it reaches returns to the caller of the function that jumped."""
     exact = {kind: set() for kind in HOOK_KINDS}
     for (kind, a), sig in sorted(hook_list().items()):
-        if max((b for b in MODULES.values() if b <= a), default=None) != base:
+        if module_base(a) != base:
             continue   # another module's
         off = a - base
         if off not in sizes:
@@ -336,10 +419,9 @@ def resolve_hooks(mod, base, sizes, name, entries=None, imports=None):
         exact[kind].add(off)
     callees = exact["exact-callee"]
     if imports:
-        callees |= {stub for stub, sym in import_stub_symbols(mod).items() if sym in imports and stub in sizes}
+        callees |= {stub for stub, sym in stub_symbols(mod, sizes).items() if sym in imports}
     if callees:
-        from lift import tail_calls
-        callees = close_over_tail_calls(callees, tail_calls(mod.image, sorted(sizes.items()), entries or set(sizes)))
+        callees = close_over_tail_calls(callees, tail_graph(mod, sizes, entries, native))
     return callees, exact["exact-caller"]
 
 
@@ -439,6 +521,11 @@ def _emit(args):
 def load(path):
     """(module, {entry: sources}, [(entry, size)]) with every function that has code."""
     mod = Module(path)
+    return (mod, *functions(mod))
+
+
+def functions(mod):
+    """({entry: sources}, [(entry, size)]) with every function of a module that has code."""
     found, sizes = discover(mod)
     funcs = sorted((a, sizes[a]) for a, src in found.items() if "eh" in src or "plt" in src)
     # Hand-written assembly (system-call wrappers, memcpy, setjmp, ...) has no unwind entry.
@@ -473,7 +560,7 @@ def load(path):
             end -= 4
         if end > a:
             extra.append((a, end - a))
-    return mod, found, sorted(funcs + extra)
+    return found, sorted(funcs + extra)
 
 
 def image_file(mod):
@@ -610,17 +697,24 @@ def module_table(mod, name, base, funcs, missing):
     return "".join(out), len(imports), len(relocs)
 
 
+def forwards(mod, base, found, funcs, name):
+    """{offset: what replaces the function there}: the native function of an exported name
+    the runtime implements (hle_names), libunwind's jumpto, and the wraps (resolve_wraps)."""
+    hle = hle_names()
+    forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
+    forward.update(unwind_jumpto(mod, found))
+    forward.update(resolve_wraps(mod, base, dict(funcs), name))
+    return forward
+
+
 def build(path, outdir, jobs, per_file, imports=None):
     """imports: hook_imports, for this module's import stubs (none: the stubs are not exact)."""
     mod, found, funcs = load(path)
     name, base = module_key(path), base_of(path)
     os.makedirs(outdir, exist_ok=True)
     modcache.clear_stamp(outdir)   # (until generated and compiled again)
-    hle = hle_names()
-    forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
-    forward.update(unwind_jumpto(mod, found))
-    forward.update(resolve_wraps(mod, base, dict(funcs), name))
-    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name, set(found), imports)
+    forward = forwards(mod, base, found, funcs, name)
+    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name, set(found), imports, native_only(forward))
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -781,12 +875,16 @@ def build_all(exefs, out, jobs, compile_c=True):
     targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
                for name, nso in paths.items()}
     shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
+    generate = False
     for name, mod in mods.items():
         current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
+        generate |= not current
         shown.module(name, (mod.text.end - mod.text.mem) // 4,
                      [(t[0], t[3]) for t in stale_files(targets[name])] if current else None)
     build_ids = {name: mod.build_id for name, mod in mods.items()}
-    imports = hook_imports(mods)
+    # (for the modules whose C is generated again; the names come from the boot modules, 13.0.5's,
+    # so a module whose C is current has them already)
+    imports = hook_imports(mods) if generate else {}
     del mods   # (the compilers want the memory)
     exe = os.path.join(out, "ssbu.exe")
     with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):

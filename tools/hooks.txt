@@ -17,8 +17,10 @@
 # makes exact, in every module:
 #   - the calls to a function that reaches it without a call of its own (by b, b.cond, cbz or
 #     tbz, or by running on into it), directly or through others that do
-#   - the calls through an import stub bound to its exported name (calls from another module
-#     go through these)
+#   - the calls through an import stub bound to its exported name, or to the exported name of
+#     a function that reaches it as above (a wrapper ending in `b impl`): calls from another
+#     module go through these. The names are those main, subsdk0 and sdk export, bound as the
+#     loader binds them; what a fighter module exports is followed only inside that module.
 # A call through a pointer (blr), or a jump through a register (br), cannot be known to reach
 # it: list the function such a call returns to as an exact-caller. (For the same reason, what
 # an exact-caller jumps to without a call sees registers only as exact as the call that reached
@@ -33,7 +35,9 @@
 # <name>     what the function is, for people
 #
 # Addresses and names only: never instruction words (CONTRIBUTING.md, rule 1). The build stops
-# at a line it cannot read, or at any 8-digit hex number, comments included.
+# at a line it cannot read, or at anything that could be a word, comments included: a run of 8
+# or more hex digits other than an address or a signature's hash (after `sha256 `), hex digits
+# masked with a run of dots as old signatures spelled them, or a row of 4 or more bytes.
 #
 # Empty for now. The hooks that need it (ssbu-recomp's loose files and new-fighter registry)
 # add their entries when they are ported. Examples, with made-up addresses:

@@ -2,7 +2,8 @@
 recompiler reads the list (recomp.hook_list, resolve_hooks) and the lifter honours it: a direct
 call to an exact-callee, and every call an exact-caller makes, store every register the caller
 changed and read back every register it uses (tools/regcache.py). The functions that reach an
-exact-callee by a tail call, and the import stubs bound to one, are exact-callees too.
+exact-callee by a tail call, and the import stubs bound to one or to an exported function that
+reaches one (in any of main, subsdk0 and sdk), are exact-callees too.
 Everything else is lifted exactly as before. The functions here are made of hand-assembled
 words, the lists of made-up addresses."""
 import contextlib
@@ -238,25 +239,56 @@ class HookList(unittest.TestCase):
                      '# the first word is d10083ff.\n', '#d10083ff\n', '# d10083ff/aa1303e0\n', '# d10083ff-aa1303e0\n',
                      '# *d10083ff*\n', '# |d10083ff|\n', '# 0xd10083ff.\n', '# d10083ff+d10083ff\n', '# sub_d10083ff\n',
                      '# (d10083ff)\n', 'exact-callee 7100001000 name #d10083ff\n', '# 9.......!\n',
-                     'exact-callee 7100001000 name # words: d10083ff|aa1303e0|aa1403e1|d65f03c0\n'):
+                     'exact-callee 7100001000 name # words: d10083ff|aa1303e0|aa1403e1|d65f03c0\n',
+                     # next to letters, in other notations
+                     '# 0XD10083FF\n', '# 0D10083FFh\n', '# x0xd10083ff\n', '# Ud10083ff\n', "# 0xd100'83ff\n",
+                     '# 0xd100_83ff\n', 'exact-callee 71000010zz name\n',
+                     # words run together (as a hex editor copies them), in a name, or with a masked one
+                     '# d10083ffaa1303e0aa1403e1d65f03c0\n', '# ff8300d1e00313aae10314aac0035fd6\n',
+                     '# d10083ffaa1303e0aa1403e1\n', 'exact-callee 7100001000 f_d10083ffaa1303e0\n',
+                     'exact-callee 7100001000 deadbeefdeadbeef\n', '# d10083ff94......\n', '# 9.......54.....1\n',
+                     # 16 digits are a hash only after `sha256 `
+                     '# 0123456789abcdef\n', '# 64-bit 0x00000000ffffffff\n',
+                     # a row of bytes: a hex dump, a C array, a C string
+                     '# ff 83 00 d1 e0 03 13 aa\n', '# ff 83 00 d1\n', '# {0xff, 0x83, 0x00, 0xd1}\n', '# 0xff,0x83,0x00,0xd1\n',
+                     '# "\\xff\\x83\\x00\\xd1"\n',
+                     # 8 decimal digits are 8 hex digits too
+                     '# 12345678 frames\n', 'exact-callee 7100001000 Func_12345678\n'):
             with self.subTest(line=line):
                 self.refused(line, 'instruction words')
 
+    def test_says_what_it_refused(self):
+        self.refused('exact-callee 7100001000 name  # was d10083ff\n', 'line 1: `d10083ff` could be')
+        self.refused('# ok\n# ff 83 00 d1\n', 'line 2: `ff 83 00 d1` could be')
+
     def test_reads_addresses_hashes_and_prose_in_comments(self):
-        """A longer run of hex digits is an address or a hash, not a word."""
-        self.assertEqual(self.parse('# see 7100001000. Its hash, 0123456789abcdef, is for 13.0.5 (x19-x28)...\n'
-                                    '# ........ a rule\n'), {})
+        """An address and a signature's hash are the only runs of 8 or more hex digits it reads,
+        and a run of dots is a masked word only when it has 4 or more and a hex digit."""
+        self.assertEqual(self.parse('# see 7100001000. Its signature, 16 words, sha256 0123456789abcdef, is for 13.0.5 '
+                                    '(x19-x28)...\n'
+                                    '# ........ a rule\n'
+                                    '# 0x7100001000-0x7100002000, 7100001000..7100002000 and a fighter module\'s 7200001000\n'
+                                    '# since 13.0.5.1, at 10.0.0.1, 26.10.23 16:38:40; pi is 3.141592, not 1.000000\n'
+                                    '# cafe.bad, a.b.c.d., A.B.C.D., 1,000,000, 1/1000000, x19..x28, 0x40, 0xff 0x83\n'
+                                    '# acceded, defaced, sub_7100001000, ...and 5 more.... a....\n'), {})
 
     def test_reads_a_file_saved_with_a_bom_or_crlf(self):
         self.assertEqual(self.parse('\ufeff# a comment\r\nexact-callee 7100001000 name\r\n'.encode('utf-8')),
                          {('exact-callee', 0x7100001000): None})
+
+    def test_a_file_not_saved_as_utf8_stops_the_build(self):
+        """(Rather than a traceback from the first thing that reads it.)"""
+        for raw in ('\ufeffexact-callee 7100001000 name\r\n'.encode('utf-16-le'),   # Notepad's "Unicode"
+                    '# caf\xe9\nexact-callee 7100001000 name\n'.encode('cp1252')):
+            with self.subTest(raw=raw[:8]):
+                self.refused(raw, 'not UTF-8')
 
     def test_refuses_malformed_lines(self):
         for line, why in (('exact-callee 7100001000\n', 'not `exact-callee|exact-caller'),
                           ('exact_callee 7100001000 name\n', 'not `exact-callee|exact-caller'),
                           ('Exact-Callee 7100001000 name\n', 'not `exact-callee|exact-caller'),
                           ('hook 7100001000 name\n', 'not `exact-callee|exact-caller'),
-                          ('exact-callee 71000010zz name\n', 'not `exact-callee|exact-caller'),
+                          ('exact-callee 7100001g00 name\n', 'not `exact-callee|exact-caller'),
                           ('exact-callee 7100001000 name extra\n', 'not `exact-callee|exact-caller'),
                           ('exact-callee 7100001000 16 words, sha256 0123 name\n', 'not `exact-callee|exact-caller'),
                           ('exact-callee 7100001000 sixteen words, sha256 0123456789abcdef name\n', 'not `exact-callee'),
@@ -266,7 +298,7 @@ class HookList(unittest.TestCase):
                           ('exact-callee 7200000000 name\n', 'not a function address'),    # a fighter module's
                           ('exact-callee 7000001000 name\n', 'not a function address'),
                           ('exact-callee 7100001000 9lives\n', 'not a function name'),
-                          ('exact-callee 7100001000 deadbeefdeadbeef\n', 'not a function name'),
+                          ('exact-callee 7100001000 a-b\n', 'not a function name'),
                           ('exact-callee 7100001000 a\nexact-callee 0x7100001000 b\n', 'listed twice')):
             with self.subTest(line=line):
                 self.refused(line, why)
@@ -319,6 +351,29 @@ class StubModule(FakeModule):
         self.text, self.eh_frame_hdr = types.SimpleNamespace(mem=0, end=0x200), (0, 0)
         self.relocs = [(0x200, 1026, 1, 0)]   # R_AARCH64_JUMP_SLOT
         self.symbols = [('', 0, 0, 0, 0), (symbol, 0, 0, 0x12, 0)]
+
+
+def assemble(funcs, size=0x208):
+    img = bytearray(size)
+    for off, words in funcs.items():
+        struct.pack_into(f'<{len(words)}I', img, off, *words)
+    return bytes(img)
+
+
+class DiscoveredModule(FakeModule):
+    """A module funcs.discover reads, as recomp.functions does a real one: code (text up to
+    0x200), exported functions [(name, offset, size)], and maybe an import stub (STUB, at 0x100)
+    whose jump slot (0x200) is bound to stub_symbol."""
+
+    def __init__(self, funcs, exports, stub_symbol=None):
+        super().__init__(assemble(funcs))
+        self.text, self.eh_frame_hdr, self.dyn = types.SimpleNamespace(mem=0, end=0x200), (0, 0), {}
+        self.exports = [(n, off, size, 0x12, 1) for n, off, size in exports]
+        self.relocs = [(0x200, 1026, 1, 0)] if stub_symbol else []
+        self.symbols = [('', 0, 0, 0, 0), (stub_symbol, 0, 0, 0x12, 0)]
+
+    def u64(self, a):
+        return struct.unpack_from('<Q', self.image, a)[0]
 
 
 class ResolveHooks(unittest.TestCase):
@@ -378,11 +433,88 @@ class ResolveHooks(unittest.TestCase):
         mods = {'main': types.SimpleNamespace(exports=[('a', 0x40, 0, 0x12, 1), ('shared', 0x80, 0, 0x12, 1)]),
                 'sdk': types.SimpleNamespace(exports=[('b', 0x1000, 0, 0x12, 1), ('shared', 0x2000, 0, 0x12, 1),
                                                       ('d', 0x3000, 0, 0x12, 1)])}
+        no_jumps = {'main': ({}, {}), 'sdk': ({}, {})}
         with hooks_file(f'exact-callee {self.MAIN + 0x40:x} a\nexact-callee {sdk + 0x1000:x} b\n'
                         f'exact-callee {sdk + 0x2000:x} c\nexact-caller {sdk + 0x3000:x} d\n'):
-            self.assertEqual(recomp.hook_imports(mods), {'a': self.MAIN + 0x40, 'b': sdk + 0x1000})   # main's `shared` first
+            self.assertEqual(recomp.hook_imports(mods, no_jumps), {'a': self.MAIN + 0x40, 'b': sdk + 0x1000})   # main's `shared` first
         with hooks_file('# nothing\n'):
-            self.assertEqual(recomp.hook_imports(mods), {})
+            self.assertEqual(recomp.hook_imports(mods), {})   # (nothing to look for: the modules are not read)
+
+    def graph(self, mod, funcs):
+        """What build_all's hook_imports reads of a module (recomp.module_graph)."""
+        sizes = {off: 4 * len(words) for off, words in funcs.items()}
+        return recomp.stub_symbols(mod, sizes), recomp.tail_graph(mod, sizes, set(sizes))
+
+    def test_an_exported_function_that_reaches_an_exact_callee_is_bound_too(self):
+        """sdk's nn_wrapper does some work and jumps to the exact-callee: main, calling
+        nn_wrapper through its import stub, returns from the hook, so its stub is exact too."""
+        sdk = recomp.MODULES['sdk']
+        sdk_funcs = {0: [MOV_X2_1, b(4, 0x40)], 0x40: [RET]}           # nn_wrapper (0): b nn_hooked (0x40)
+        sdk_mod = FakeModule(assemble(sdk_funcs))
+        sdk_mod.exports = [('nn_wrapper', 0, 8, 0x12, 1)]             # (nn_hooked itself not exported)
+        main_mod = StubModule('nn_wrapper')
+        main_mod.exports = []
+        mods, graphs = {'main': main_mod, 'sdk': sdk_mod}, {'main': self.graph(main_mod, STUB_FUNCS),
+                                                            'sdk': ({}, recomp.tail_graph(sdk_mod, {0: 8, 0x40: 4}))}
+        sizes = {off: 4 * len(words) for off, words in STUB_FUNCS.items()}
+        with hooks_file(f'exact-callee {sdk + 0x40:x} nn_hooked\n'):
+            imports = recomp.hook_imports(mods, graphs)
+            self.assertEqual(imports, {'nn_wrapper': sdk})
+            self.assertEqual(recomp.resolve_hooks(main_mod, self.MAIN, sizes, 'main', set(sizes), imports),
+                             ({0x40, 0x100}, set()))
+            # (before: only the names bound to an exact-callee itself)
+            self.assertEqual(recomp.resolve_hooks(main_mod, self.MAIN, sizes, 'main', set(sizes), {}), (set(), set()))
+        cached, lift.REGCACHE = lift.REGCACHE, True
+        try:
+            text = lift.Lifter(main_mod.image, set(sizes), exact_callees={0x40, 0x100}).lift_function(0, 16)[0]
+        finally:
+            lift.REGCACHE = cached
+        self.assertEqual(around(text, 'f_7100000100(c);'), ({'19', '30'}, {'0', '19', '30'}))
+
+    def test_names_are_followed_across_the_modules_until_nothing_more_is_added(self):
+        """subsdk0 calls main's export J through its stub; J jumps to main's stub for sdk's
+        nn_wrapper, which jumps to the exact-callee. J's name is bound only once main's stub is
+        known to reach it, which takes sdk's nn_wrapper first."""
+        sdk, sub = recomp.MODULES['sdk'], recomp.MODULES['subsdk0']
+        main_mod, sub_mod = StubModule('nn_wrapper'), StubModule('J')
+        main_mod.exports, sub_mod.exports = [('J', 0x40, 4, 0x12, 1)], []   # J (0x40): b to the stub
+        sdk_mod = types.SimpleNamespace(exports=[('nn_wrapper', 0, 8, 0x12, 1)])
+        graphs = {'main': self.graph(main_mod, STUB_FUNCS), 'subsdk0': self.graph(sub_mod, STUB_FUNCS),
+                  'sdk': ({}, {0: {0x40}})}
+        sizes = {off: 4 * len(words) for off, words in STUB_FUNCS.items()}
+        with hooks_file(f'exact-callee {sdk + 0x40:x} nn_hooked\n'):
+            imports = recomp.hook_imports({'main': main_mod, 'subsdk0': sub_mod, 'sdk': sdk_mod}, graphs)
+            self.assertEqual(imports, {'J': self.MAIN + 0x40, 'nn_wrapper': sdk})
+            self.assertEqual(recomp.resolve_hooks(sub_mod, sub, sizes, 'subsdk0', set(sizes), imports), ({0x40, 0x100}, set()))
+            main_mod.exports = []   # J not exported: nothing calls it by name
+            self.assertEqual(recomp.hook_imports({'main': main_mod, 'subsdk0': sub_mod, 'sdk': sdk_mod}, graphs),
+                             {'nn_wrapper': sdk})
+
+    def test_a_function_replaced_natively_reaches_nothing(self):
+        """D (0xC0) jumps to B, but forwarded to a native function its code never runs."""
+        sizes = {off: 4 * len(words) for off, words in FUNCS.items()}
+        with hooks_file(f'exact-callee {self.MAIN + 0x40:x} b\n'):
+            self.assertEqual(recomp.resolve_hooks(FakeModule(image()), self.MAIN, sizes, 'main', set(FUNCS), None, {0xC0}),
+                             ({0x40, 0x1C0}, set()))
+        self.assertEqual(recomp.native_only({0xC0: 'hle_thing', 0x40: ('wrap', 'hle_wrap_7100000040'), 0: 'rt_unwind_jumpto'}),
+                         {0xC0, 0})   # (a wrap's original still runs)
+
+    def test_build_all_reads_each_modules_functions_for_the_names(self):
+        """hook_imports' default: each boot module's functions and native replacements as build
+        lifts them (recomp.functions, forwards), from a module discover() reads."""
+        sdk = recomp.MODULES['sdk']
+        # sdk: nn_wrapper (0) b nn_hooked (0x40); nn_native (0x80), implemented natively, b nn_hooked too
+        sdk_funcs = {0: [MOV_X2_1, b(4, 0x40)], 0x40: [RET], 0x80: [b(0x80, 0x40)]}
+        sdk_mod = DiscoveredModule(sdk_funcs, [('nn_wrapper', 0, 8), ('nn_hooked', 0x40, 4), ('nn_native', 0x80, 4)])
+        main_mod = DiscoveredModule(STUB_FUNCS, [('J', 0x40, 4)], stub_symbol='nn_native')
+        with hooks_file(f'exact-callee {sdk + 0x40:x} nn_hooked\n'), \
+                mock.patch.object(recomp, 'hle_names', lambda: {'nn_native'}), mock.patch.object(recomp, 'hle_wraps', dict):
+            self.assertEqual(recomp.functions(sdk_mod)[1], [(0, 8), (0x40, 4), (0x80, 4)])
+            self.assertEqual(recomp.hook_imports({'main': main_mod, 'sdk': sdk_mod}),
+                             {'nn_hooked': sdk + 0x40, 'nn_wrapper': sdk})   # not nn_native, and so not J
+            main_mod.symbols[1] = ('nn_wrapper',) + main_mod.symbols[1][1:]
+            self.assertEqual(recomp.hook_imports({'main': main_mod, 'sdk': sdk_mod}),
+                             {'J': self.MAIN + 0x40, 'nn_hooked': sdk + 0x40, 'nn_wrapper': sdk})
 
 
 # ---- built and run on an arm64 Mac ------------------------------------------------------
