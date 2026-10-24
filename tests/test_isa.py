@@ -511,14 +511,14 @@ class CpuCheckTests(unittest.TestCase):
 
     def test_made_up_processors(self):
         code, out, err = self.run_check('check_v2', 'avx2')
-        self.assertEqual((code, out), (5, ''))   # (stopped before main)
+        self.assertEqual((code, out), (5, ''), err)   # (stopped before main)
         self.assertTrue(err.startswith('[boot] This copy of WindowSmash was built for processors with AVX2, and this processor '
                                        'lacks AVX, AVX2, FMA'), err)
         self.assertIn('If this message comes back, build it with SSBU_ISA=x86-64-v2 set', err)
         self.assertEqual(self.run_check('check_everything', 'avx2'), (0, 'main', ''))
         self.assertEqual(self.run_check('check_v2', 'x86-64-v2'), (0, 'main', ''))
         code, out, err = self.run_check('check_old', 'x86-64-v2')
-        self.assertEqual((code, out), (5, ''))
+        self.assertEqual((code, out), (5, ''), err)
         self.assertIn('[boot] This processor lacks SSE4.2, POPCNT, which WindowSmash needs', err)
         self.assertIn('It cannot run on this PC.', err)
 
@@ -545,7 +545,7 @@ class CpuCheckTests(unittest.TestCase):
         self.assertEqual(named(insns, BEYOND_X86_64, SSE4_PREFIXES), [])
         headers = subprocess.run([objdump(), '-h', str(self.check)], capture_output=True, text=True, timeout=60).stdout
         if os.name == 'nt':
-            self.assertIn('.CRT$XIB', headers)   # (a C initialiser: before C++'s and main)
+            self.assertIn('.CRT$XID', headers)   # (a C initialiser: after the C runtime's, before C++'s and main)
         elif not ON_MAC:
             self.assertIn('.preinit_array', headers)   # (before every constructor)
 
@@ -818,6 +818,10 @@ def make_cases(n=400):
         f_acc = [-to32(p * q) if (i + k) % 4 else single() for k, (p, q) in enumerate(zip(f_a, f_b))]
         d_a, d_b = [double() for _ in range(2)], [double() for _ in range(2)]
         d_acc = [-(p * q) for p, q in zip(d_a, d_b)]
+        if i == 4:   # (a product too small for the format, plus +0: -0, in each fused multiply-add)
+            s13, s14, s15 = 2.0 ** -80, -(2.0 ** -75), 0.0
+            f_a[0], f_b[0], f_acc[0] = 2.0 ** -80, -(2.0 ** -75), 0.0
+            d_a[0], d_b[0], d_acc[0] = 2.0 ** -600, -(2.0 ** -500), 0.0
         half = HALVES[i] if i < len(HALVES) else rng.getrandbits(16)
         x1 = rng.getrandbits(rng.randint(0, 64)) if i > 2 else (0, 1 << 63, 1 << 31)[i]
         junk = rng.getrandbits(64)   # (the upper halves of scalar inputs: never read)
@@ -880,6 +884,8 @@ def parse(line):
 
 @unittest.skipUnless(CAN_RUN_X86, WHY_NOT)
 class LiftedCodeTests(unittest.TestCase):
+    maxDiff = None   # (every wrong result shown, up to 20)
+
     @classmethod
     def setUpClass(cls):
         cls.dir = Path(tempfile.mkdtemp(prefix='isa-lifted-'))
@@ -953,7 +959,8 @@ class LiftedCodeTests(unittest.TestCase):
     def test_software_fma(self):
         """x86-64-v2's fma() where the C library does it without the processor's FMA instruction: Windows' with
         _set_FMA3_enable(0), glibc's told the processor has none (GLIBC_TUNABLES), a Mac's under Rosetta (which
-        says there is none)."""
+        says there is none). (Windows' gives +0 for a product too small for a double plus +0: recomp.h's
+        rt_fma_v2 takes a zero c itself.)"""
         if os.name == 'nt':
             lines = self.results('x86-64-v2', 'nofma3')
         else:

@@ -13,6 +13,22 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(_WIN32) && !defined(__FMA__) && !defined(__cplusplus)
+/* x86-64-v2 on Windows: fma() and fmaf() are the C runtime's. On a processor without FMA3 its
+ * software fma() returns a * b + c when c is a zero, so a product too small for a double (-2^-1100)
+ * plus +0 gives +0, not -0 (tests/test_isa.py, test_software_fma). For a zero c the fused result is
+ * the product rounded once, or for a zero product the sum of the two zeros, so that is computed here
+ * instead; every other c goes to the C runtime. Windows' avx2 build has the instruction. */
+static inline double rt_fma_v2(double a, double b, double c) {
+    return c != 0 ? (fma)(a, b, c) : a == 0 || b == 0 ? a * b + c : a * b;
+}
+static inline float rt_fmaf_v2(float a, float b, float c) {
+    return c != 0 ? (fmaf)(a, b, c) : a == 0 || b == 0 ? a * b + c : a * b;
+}
+#define fma(a, b, c) rt_fma_v2(a, b, c)
+#define fmaf(a, b, c) rt_fmaf_v2(a, b, c)
+#endif
+
 /* Linux and macOS builds compile the generated files that have exception landing sites as
  * C++ (see rt_eh_filter below); everything here keeps C linkage either way. */
 #ifdef __cplusplus
