@@ -16,6 +16,7 @@
 #include "clock.h"
 #include "display.h"
 #include "hookable.h"
+#include "input_seq.h"
 #include "settings.h"
 #ifdef _WIN32
 #include <dbghelp.h>
@@ -49,6 +50,8 @@ extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches
     gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology,
     gfx_skip_target, gfx_stat_unmap_dropped;
 u64 present_frames(void);
+void movie_test_start(void);   /* (hle_movie_skip.c) SSBU_SKIP_MOVIES, SSBU_SEQ's mark movie */
+void test_fight_start(void);   /* (hle_fight_test.c) SSBU_FIGHT_HASH, SSBU_DETERMINISTIC, SSBU_DEBUG_MATCH... */
 void gfx_report_compiles(void (*line)(const char *text));
 void gfx_status_lines(void);
 #ifdef _WIN32
@@ -762,6 +765,14 @@ static struct Sym *sym_slot(const char *name) {
 
 u64 rt_symbol(const char *name) { return sym_slot(name)->addr; }
 
+const char *rt_symbol_at(u64 addr, const char *prefix) {   /* (every export looked at: for start-up checks) */
+    size_t n = strlen(prefix);
+    for (u32 m = 0; m < module_count; m++)
+        for (u32 i = 0; i < modules[m]->export_count; i++)
+            if (modules[m]->exports[i].addr == addr && !strncmp(modules[m]->exports[i].name, prefix, n)) return modules[m]->exports[i].name;
+    return NULL;
+}
+
 /* Functions the loader wraps so that progress through start-up is visible. */
 static u64 real_startup, real_main;
 static void wrap_startup(Cpu *c) { phase = "nninitStartup"; printf("[boot] nninitStartup\n"); fflush(stdout); rt_call(c, real_startup); phase = "start-up after nninitStartup"; }
@@ -937,6 +948,11 @@ u64 rt_load_nro(Cpu *c, u64 image) {
     printf("[ro] loaded %s at %#llx: %u functions, %u exports, %u symbol relocations\n",
            mod->name, mod->base, mod->func_count, mod->export_count, relocs);
     fflush(stdout);
+    if (input_seq_on()) {   /* (SSBU_SEQ's @module:<name>) */
+        char mark[SEQ_TEXT];
+        snprintf(mark, sizeof mark, "module:%s", mod->name);
+        input_seq_mark(mark);
+    }
     if (mod->init != mod->base) rt_call(c, mod->init);
     return mod->base;
 }
@@ -1169,6 +1185,8 @@ int main(int argc, char **argv) {
     rt_data_dir = dir;
     kernel_init();
     load(dir);
+    movie_test_start();
+    test_fight_start();
 #ifndef _WIN32
     rt_window_init();   /* (SDL wants its window and events on the main thread, which then runs them) */
 #endif

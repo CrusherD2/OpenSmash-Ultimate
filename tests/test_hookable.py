@@ -249,6 +249,15 @@ class Lifting(unittest.TestCase):
         wrapped = lifted(forward={B: ('wrap', f'hle_wrap_{HOOKED}')}, hookable={B})[B]
         self.assertIn(f'RT_HOOKABLE void f_{HOOKED}_body(Cpu *c) {{ hle_wrap_{HOOKED}(c); }}\nvoid f_{HOOKED}_orig(Cpu *c) {{\n',
                       wrapped)
+        # wrapped by exported name (HLE_WRAP_EXPORT): the slot starts at the wrapper, handed the original
+        named = lifted(forward={B: ('wrap', 'hle_wrap_nn_a', 'export')}, hookable={B})[B]
+        self.assertIn(f'void f_{HOOKED}(Cpu *c) {{ TAIL(RT_HOOK(rt_hook_{HOOKED})) }}\n', named)
+        self.assertIn(f'RT_HOOKABLE void f_{HOOKED}_body(Cpu *c) {{ hle_wrap_nn_a(c, f_{HOOKED}_orig); }}\n'
+                      f'void f_{HOOKED}_orig(Cpu *c) {{\n', named)
+        # under two names: each wrapper hands on to the next, the last to the original
+        two = lifted(forward={B: ('wrap', 'hle_wrap_nn_a', 'export', 'hle_wrap_nn_b')}, hookable={B})[B]
+        self.assertIn(f'static void f_{HOOKED}_w1(Cpu *c) {{ hle_wrap_nn_b(c, f_{HOOKED}_orig); }}\n', two)
+        self.assertIn(f'RT_HOOKABLE void f_{HOOKED}_body(Cpu *c) {{ hle_wrap_nn_a(c, f_{HOOKED}_w1); }}\n', two)
 
     def test_without_the_register_cache(self):
         out = lifted(regcache=False, hookable={B})

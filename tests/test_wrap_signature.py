@@ -89,13 +89,35 @@ class HleWraps(unittest.TestCase):
                 self.wraps(bad + 'HLE_WRAP(7100001000) {}\n')
             self.assertIn('not in the form', str(e.exception))
 
+    # Hooks still waiting for theirs (tools/recomp.py wrap-sig prints it, from the game): the fight
+    # test switches' frame end and player record builder, and their hooks by exported name: the
+    # fighters' frame line, the system tick (both names) and the SDK's random bytes
+    # (runtime/hle_fight_test.c).
+    AWAITING = {0x71038701e0, 0x71017880c0}
+    AWAITING_EXPORTS = {'_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv', '_ZN2nn2os13GetSystemTickEv',
+                        'nnosGetSystemTick', '_ZN2nn2os19GenerateRandomBytesEPvm'}
+
     def test_the_runtimes_own_hooks_all_carry_a_hash(self):
-        wraps = recomp.hle_wraps()   # (raises on a signature that spells out words)
+        wraps, by_name = recomp.runtime_wraps()   # (raises on a signature that spells out words)
         self.assertGreater(len(wraps), 0)
-        for address, sig in wraps.items():
-            with self.subTest(address=f'{address:x}'):
+        for key, sig in [*wraps.items(), *by_name.items()]:
+            with self.subTest(hook=key if isinstance(key, str) else f'{key:x}'):
+                if key in self.AWAITING | self.AWAITING_EXPORTS:
+                    continue
                 self.assertIsNotNone(sig, 'every hook says what the function it wraps begins with')
                 self.assertTrue(1 <= sig[0] <= 16)
+
+    def test_the_awaiting_ones_are_still_waiting(self):
+        """(One given its signature comes off the lists above.)"""
+        wraps, by_name = recomp.runtime_wraps()
+        for address in self.AWAITING:
+            with self.subTest(address=f'{address:x}'):
+                self.assertIn(address, wraps)
+                self.assertIsNone(wraps[address])
+        for name in self.AWAITING_EXPORTS:
+            with self.subTest(name=name):
+                self.assertIn(name, by_name)
+                self.assertIsNone(by_name[name])
 
 
 class ResolveWraps(unittest.TestCase):

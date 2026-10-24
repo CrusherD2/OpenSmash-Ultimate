@@ -508,7 +508,7 @@ class ResolveHooks(unittest.TestCase):
         sdk_mod = DiscoveredModule(sdk_funcs, [('nn_wrapper', 0, 8), ('nn_hooked', 0x40, 4), ('nn_native', 0x80, 4)])
         main_mod = DiscoveredModule(STUB_FUNCS, [('J', 0x40, 4)], stub_symbol='nn_native')
         with hooks_file(f'exact-callee {sdk + 0x40:x} nn_hooked\n'), \
-                mock.patch.object(recomp, 'hle_names', lambda: {'nn_native'}), mock.patch.object(recomp, 'hle_wraps', dict):
+                mock.patch.object(recomp, 'hle_names', lambda: {'nn_native'}), mock.patch.object(recomp, 'runtime_wraps', lambda: ({}, {})):
             self.assertEqual(recomp.functions(sdk_mod)[1], [(0, 8), (0x40, 4), (0x80, 4)])
             self.assertEqual(recomp.hook_imports({'main': main_mod, 'sdk': sdk_mod}),
                              {'nn_hooked': sdk + 0x40, 'nn_wrapper': sdk})   # not nn_native, and so not J
