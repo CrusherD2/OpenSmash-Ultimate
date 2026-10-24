@@ -6,9 +6,10 @@ Usage: hook_inline_check.py <module C dir>... [--obj <object dir>]...
 Each C dir is a module's build folder (build/main, ...); its hookable functions are the entries
 of tools/hooks.txt in that module. --obj gives the object folder of the C dir in the same place
 (by default the C dir itself, as the Windows build keeps them); the objects of the files that
-define or call a hookable function are read too. recomp.py build runs the C check on every file
-it writes when the list has a hookable function; tests/test_hookable.py runs both checks on a
-made-up module.
+define or call a hookable function are read too. Exit status: 0 if all is well, 1 if a problem
+was found, 2 if not, but a file that defines or calls one had no object that could be read.
+recomp.py build runs the C check on every file it writes when the list has a hookable
+function; tests/test_hookable.py runs both checks on a made-up module.
 """
 import os
 import re
@@ -27,6 +28,10 @@ def names(addr):
     return f"f_{a}_body", f"f_{a}", f"rt_hook_{a}"
 
 
+# a hookable function's names in a line (f_<a>, f_<a>_body, rt_hook_<a>), the address captured
+NAMED = re.compile(r"\b(?:f|rt_hook)_([0-9a-f]+)")
+
+
 def check_c(files, hookables, whole=True):
     """Problems, as strings, in generated C (files: {name: text}) for these hookable functions
     (guest addresses). The function itself, f_<a>_body, is named only where it is declared,
@@ -34,49 +39,62 @@ def check_c(files, hookables, whole=True):
     and no call or tail call names either: each loads the slot. The file that defines it also
     adds its slot to the list and includes hookable.h. whole: these are all of a module's files,
     so each function is defined, with its slot and forwarder, exactly once (and g_module.c, if
-    given, holds the forwarder for rt_lookup)."""
+    given, holds the forwarder for rt_lookup). One pass over each file however many functions
+    are listed: only a line that names one is looked at closely."""
+    want, found, count, spell = {}, {}, {}, {}
+    for addr in hookables:
+        body, fwd, slot = names(addr)
+        want[f"{addr:x}"] = addr
+        found[addr], count[addr] = [], {"body": 0, "slot": 0, "add": 0, "forwarder": 0, "table": 0}
+        spell[addr] = {"body": body, "fwd": fwd, "slot": slot, "decl": f"GuestFn {body};",
+                       "slot_def": f"RtHook {slot} = {{0x{addr:X}ull, {body}, {body}}};",
+                       "forwarder": f"void {fwd}(Cpu *c) {{ TAIL(RT_HOOK({slot})) }}",
+                       "head": f"RT_HOOKABLE void {body}(Cpu *c) {{", "add": f"RT_HOOK_ADD({slot})",
+                       "table": f"{{0x{addr:X}ull, {fwd}}}", "uses_body": re.compile(rf"\b{body}\b"),
+                       "calls": re.compile(rf"\b{fwd}\(c\)|TAIL\({fwd}\)")}
+    for name, text in sorted(files.items()):
+        lines = text.splitlines()
+        here, defines = {}, set()   # function: the lines here that name it (stripped); the functions defined here
+        for n, line in enumerate(lines, 1):
+            hits = {want[h] for h in NAMED.findall(line) if h in want}
+            if not hits:
+                continue
+            s, where = line.strip(), f"{name}:{n}"
+            for addr in hits:
+                k, problems, c = spell[addr], found[addr], count[addr]
+                here.setdefault(addr, set()).add(s)
+                if k["uses_body"].search(s):
+                    if s.startswith(k["head"]):
+                        c["body"] += 1
+                        defines.add(addr)
+                    elif s == k["slot_def"]:
+                        c["slot"] += 1
+                    elif s != k["decl"]:
+                        problems.append(f"{where}: {k['body']} named other than in its slot: {s[:120]}")
+                if k["calls"].search(s):
+                    problems.append(f"{where}: calls {k['fwd']} directly, not through its slot: {s[:120]}")
+                if s.startswith(f"void {k['fwd']}(Cpu *c)"):
+                    c["forwarder"] += 1
+                    if s != k["forwarder"]:
+                        problems.append(f"{where}: {k['fwd']} does not call through its slot: {s[:120]}")
+                c["add"] += s == k["add"]
+                c["table"] += s.startswith(k["table"])
+        for addr in sorted(defines):
+            k, seen = spell[addr], here[addr]
+            for what, ok in ((f"{k['slot']}'s definition", k["slot_def"] in seen), (k["add"], k["add"] in seen),
+                             (k["fwd"], k["forwarder"] in seen), ('#include "hookable.h"', '#include "hookable.h"' in lines)):
+                if not ok:
+                    found[addr].append(f"{name}: defines {k['body']} without {what}")
     problems = []
     for addr in sorted(hookables):
-        body, fwd, slot = names(addr)
-        decl, slot_def = f"GuestFn {body};", f"RtHook {slot} = {{0x{addr:X}ull, {body}, {body}}};"
-        forwarder = f"void {fwd}(Cpu *c) {{ TAIL(RT_HOOK({slot})) }}"
-        head = f"RT_HOOKABLE void {body}(Cpu *c) {{"
-        uses_body, calls = re.compile(rf"\b{body}\b"), re.compile(rf"\b{fwd}\(c\)|TAIL\({fwd}\)")
-        count = {"body": 0, "slot": 0, "add": 0, "forwarder": 0, "table": 0}
-        for name, text in sorted(files.items()):
-            lines = text.splitlines()
-            defines = False
-            for n, line in enumerate(lines, 1):
-                s, where = line.strip(), f"{name}:{n}"
-                if uses_body.search(s):
-                    if s.startswith(head):
-                        count["body"] += 1
-                        defines = True
-                    elif s == slot_def:
-                        count["slot"] += 1
-                    elif s != decl:
-                        problems.append(f"{where}: {body} named other than in its slot: {s[:120]}")
-                if calls.search(s):
-                    problems.append(f"{where}: calls {fwd} directly, not through its slot: {s[:120]}")
-                if s.startswith(f"void {fwd}(Cpu *c)"):
-                    count["forwarder"] += 1
-                    if s != forwarder:
-                        problems.append(f"{where}: {fwd} does not call through its slot: {s[:120]}")
-                count["add"] += s == f"RT_HOOK_ADD({slot})"
-                count["table"] += s.startswith(f"{{0x{addr:X}ull, {fwd}}}")
-            if defines:
-                for what, ok in ((f"{slot}'s definition", slot_def in (x.strip() for x in lines)),
-                                 (f"RT_HOOK_ADD({slot})", f"RT_HOOK_ADD({slot})" in (x.strip() for x in lines)),
-                                 (fwd, forwarder in (x.strip() for x in lines)),
-                                 ('#include "hookable.h"', '#include "hookable.h"' in lines)):
-                    if not ok:
-                        problems.append(f"{name}: defines {body} without {what}")
+        problems += found[addr]
         if whole:
-            for what, n in (("defined", count["body"]), ("given a slot", count["slot"]), ("added to the list", count["add"]),
-                            ("given a forwarder", count["forwarder"])):
+            c, body, fwd = count[addr], spell[addr]["body"], spell[addr]["fwd"]
+            for what, n in (("defined", c["body"]), ("given a slot", c["slot"]), ("added to the list", c["add"]),
+                            ("given a forwarder", c["forwarder"])):
                 if n != 1:
                     problems.append(f"{body}: {what} {n} times, not once")
-            if "g_module.c" in files and count["table"] != 1:
+            if "g_module.c" in files and c["table"] != 1:
                 problems.append(f"g_module.c: {fwd} is not in the module's table once")
     return problems
 
@@ -102,12 +120,14 @@ def check_header(text=None):
 
 # ---- objects ---------------------------------------------------------------------------
 IMAGE_SCN_CNT_CODE, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_MEM_EXECUTE = 0x20, 0x1000, 0x20000000
+IMAGE_SCN_LNK_NRELOC_OVFL = 0x01000000
 
 
 def coff_code(data):
     """(functions, {function: the symbols its code's relocations name}, the functions in a COMDAT
     section) of a COFF object, as clang-cl writes them (the big-object form too, which a file
-    with very many functions needs)."""
+    with very many functions needs, and a section with more than 65,535 relocations, whose count
+    is in its first relocation record)."""
     if data[:4] == b"\0\0\xff\xff":   # (ANON_OBJECT_HEADER_BIGOBJ: more than 65,279 sections)
         nsec, symptr, nsym = struct.unpack_from("<III", data, 44)
         sec_at, sym_size, sym_form = 56, 20, "<8sIiHBB"
@@ -133,7 +153,10 @@ def coff_code(data):
         if not flags & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE):
             continue
         here = sorted((v, n) for s, v, n in funcs if s == index)
-        for r in range(nrel):
+        first = 0
+        if flags & IMAGE_SCN_LNK_NRELOC_OVFL and nrel == 0xFFFF:   # (the real count, which counts that record too)
+            nrel, first = struct.unpack_from("<I", data, relocs)[0], 1
+        for r in range(first, nrel):
             at, sym, _type = struct.unpack_from("<IIH", data, relocs + 10 * r)
             owner = [n for v, n in here if v <= at]
             if owner and symbols[sym]:
@@ -281,7 +304,7 @@ def main(argv):
             dirs.append(a)
     if not dirs or None in objs:
         sys.exit(__doc__)
-    problems = check_header()
+    problems, unchecked = check_header(), 0
     for i, c_dir in enumerate(dirs):
         hookables = module_hookables(c_dir)
         files = {}
@@ -299,11 +322,17 @@ def main(argv):
             found = check_object(obj, hookables) if obj else None
             if found is None:
                 print(f"{c_dir}/{n}: no object, or no objdump to read it with: not checked")
+                unchecked += 1
             problems += found or []
         print(f"{c_dir}: {len(hookables)} hookable functions")
     for p in problems:
         print(p)
-    return 1 if problems else 0
+    if problems:
+        return 1
+    if unchecked:   # (not a pass: the objects were not read)
+        print(f"{unchecked} files that define or call a hookable function have no object checked (--obj <object dir>)")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

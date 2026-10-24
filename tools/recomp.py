@@ -538,10 +538,13 @@ def _emit(args):
             + "".join(f"GuestFn f_{lifter.base + a:x};\n" for a in sorted(ext | own))
             + "".join(f"extern RtHook rt_hook_{lifter.base + a:x};\n" for a in slots)
             + "\n" + "\n\n".join(bodies) + "\n")
-    problems = []
-    if lifter.hookable:   # (each listed function reached only through its slot)
+    # Each listed function reached only through its slot. The list is read again here, not taken
+    # from the Lifter, so a build that lost the Lifter's hookable set (build's Pool arguments out
+    # of step with _init's) stops rather than generate plain calls.
+    problems, listed = [], lifter.hookable | hookables(lifter.base)
+    if listed:
         import hook_inline_check
-        problems = hook_inline_check.check_c({name: text}, {lifter.base + a for a in lifter.hookable}, whole=False)
+        problems = hook_inline_check.check_c({name: text}, {lifter.base + a for a in listed}, whole=False)
     write_if_changed(os.path.join(outdir, name), text)
     insns = sum(s for _, s in funcs) // 4
     return name, ext - own, insns, max(s for _, s in funcs) // 4, bad, lifter.unresolved, problems
