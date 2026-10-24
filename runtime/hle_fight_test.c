@@ -274,14 +274,14 @@ HLE_WRAP(71017880c0) {
 static long long end_limit, shown;
 static int fights;
 static DebugEnd end;
-static volatile long long end_fired;
+static volatile long long end_fired, end_count;
 
 void rt_upnp_remove(void);
 /* As the guest's own exit (svcExitProcess, kernel.c), the hash log written out first. */
 static DWORD WINAPI end_watch(LPVOID unused) {
     (void)unused;
     while (!end_fired) Sleep(5);
-    fprintf(stderr, "[fight] SSBU_DEBUG_END: %lld fight frames at frame %lld shown: the run ends\n", end.frames, end_fired);
+    fprintf(stderr, "[fight] SSBU_DEBUG_END: %lld fight frames at frame %lld shown: the run ends\n", end_count, end_fired);
     if (hash_out) fflush(hash_out);
     fflush(NULL);
 #ifdef __APPLE__
@@ -308,7 +308,7 @@ void test_fight_presented(void) {
                 (int)(i8)ld8(block + 0x588 + 0x260), ld8(block + 0x580 + 0x260 + 0xa), ld8(block + 0x580 + 0x260 + 0x79), ld32(block + 0x420),
                 (unsigned long long)ld64(sel), ld32(sel + 8), ld8(GAME_ADDR(STAGE_HAZARDS)), ld8(block + 0x4c), ld32(block + 0x54));
     }
-    if (end_limit && n >= end_limit && !end_fired) end_fired = shown;
+    if (end_limit && n >= end_limit && !end_fired) { end_count = n; end_fired = shown; }
 }
 
 /* ---- start --------------------------------------------------------------------------------- */
