@@ -4953,7 +4953,7 @@ static void dev_timestamp_now(Ctx *c) { RET(now_ns()); }
 static void dev_timestamp_of(Ctx *c) { RET(A1 ? rd64(A1 + 8) : 0); }      /* (device, const NVNcounterData *): counter timestamps are written in nanoseconds */
 static void dev_debug_domain(Ctx *c) { static volatile LONG next; RET(InterlockedIncrement(&next)); }
 static void dev_separate_handle(Ctx *c) { RET((uint64_t)(int64_t)(int32_t)(uint32_t)A1 | 0x100000000ull); }   /* nvnDeviceGetSeparateTextureHandle [sdk 0x41bc60] */
-static void dev_separate_sampler_handle(Ctx *c) { RET((uint64_t)((int64_t)(int32_t)(uint32_t)A1 << 20)); }                 /* nvnDeviceGetSeparateSamplerHandle [sdk 0x41bc50]: sbfiz x0, x1, #20, #32 */
+static void dev_separate_sampler_handle(Ctx *c) { RET((uint64_t)((int64_t)(int32_t)(uint32_t)A1 << 20)); }                 /* nvnDeviceGetSeparateSamplerHandle [sdk 0x41bc50]: the ID sign-extended from 32 bits, then << 20 */
 static void dev_debugger_attached(Ctx *c) { RET(0); }   /* no external NVN debugger exists for this process: the true answer */
 /* nvnDeviceInstallDebugCallback: in this SDK build the function is a bare `ret` [sdk 0x41b890] (the entry the name resolves to in
  * the table nvnDeviceGetProcAddress reads, [0x41d6a0] -> table [0xc28398]): nothing is stored, nothing can ever be reported.

@@ -12,7 +12,7 @@ This document describes the checked-in implementation. Implemented paths and dev
 | :--- | :--- |
 | [1. From extracted modules to a Windows executable](#1-from-extracted-modules-to-a-windows-executable) | Inputs, function discovery, translation, module placement, the game version, the imports check. |
 | [2. Loading, symbols, and guest execution](#2-loading-symbols-and-guest-execution) | Mapping, binding, native replacements, exceptions. |
-| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts. |
+| [3. Native services](#3-native-services) | The runtime's service implementations, files and fonts, memory mappings. |
 | [4. The graphics path](#4-the-graphics-path) | GPU commands, the D3D11 back end, shader compilation, audio and video. |
 | [5. Multiplayer transport](#5-multiplayer-transport) | The relay, the lobby and direct connections. |
 | [6. DLC and fighter unlocks](#6-dlc-and-fighter-unlocks) | Installed-content reporting and save editing. |
@@ -132,6 +132,16 @@ The guest's own unwind implementation interprets guest exception metadata. [`hle
 
 These are targeted service implementations, not a complete implementation of the console OS. Some functions return fixed or limited behavior appropriate to the supported paths.
 
+### Threads and handles
+
+Each guest thread runs on a host thread of its own (with a 256 MiB reserved stack, since guest call depth is host call depth), with its own register context and a 4 KiB thread-local region from `0x7780000000` up. A handle names a slot in the kernel's table of 4096 objects (threads, events, IPC sessions, transfer memory), and waits and mutex hand-overs look through a table of up to 1024 threads.
+
+By default nothing of a thread is ever freed, as before: its slot, its handle and its thread-local region stay after it has exited and its handle is closed, so a session that has made 1024 threads (the main thread among them) stops at the next one with "too many threads", however few are running. `SSBU_THREAD_RECYCLING=1` gives threads the console's lifetime instead: a thread object lives while the thread runs or a handle to it is open. Once it has exited and its handle is closed, its slot and handle go to the next object and its thread-local region (zeroed) to the next thread; its context and its host thread's handle are freed once the host thread has ended. An exited thread stays signalled while its handle is open, and a wait holds the objects it waits on, so a thread whose handle another thread closes during the wait is still seen to end.
+
+Handle values then take the console's layout, as Atmosphère's open-source kernel (mesosphère, `kern_k_handle_table.hpp`) has it: the slot in the low 15 bits and, above them, a linear id from 1 to `0x7FFF`, here a count of the slot's uses. Values stay nonzero and below `0x40000000`, the waiters bit of the userspace mutex words that hold owner handles. A handle used after its `CloseHandle` names nothing, not the slot's next object: `StartThread`, `GetThreadPriority` and `SetThreadPriority`, `GetThreadCoreMask` and `SetThreadCoreMask`, `SignalEvent`, `ClearEvent`, `CloseHandle`, `ResetSignal`, `WaitSynchronization`, `CancelSynchronization`, `SendSyncRequest` and `GetThreadId` refuse it with `0xE401` (invalid handle); `GetInfo` answers only the process's own values and does not look at its handle. `svcCreateEvent`'s two handles (one value here) and each IPC copy of a handle count as references of their own, each dropped by its own `CloseHandle`. That the SDK closes both of an event's handles is inferred, not seen in the game: libstratosphere, Atmosphère's open reimplementation of `nn::os`, does so in `DestroyInterProcessEvent`. A handle nothing closes keeps its slot for good: one of an event's two values left open, or one the game moves to a native service, which keeps none. The log says once when half the table's 4095 slots are in use (`[kernel] half the handle table in use`, with a count of each kind of object), since a slow leak would end at "out of handles". Also not freed with a thread, outside the kernel: the Linux and macOS platform layer's 256 KiB signal stack of each host thread (address space only, until a signal runs on it), and the fiber slot of a thread the game made a fiber ([`hle_fiber.c`](../runtime/hle_fiber.c), 16384 at most).
+
+Without the switch, a handle is `0xA000` plus its slot, `CloseHandle` frees events, sessions and transfer memory at once and keeps threads, and `SetThreadCoreMask` takes any handle, as before. The switch stays off by default until a long play session has been run with it; [`kerneltest.c`](../tools/dev/kerneltest.c) checks both behaviours offline.
+
 ### Files and fonts
 
 `dump/modules/romfs.cfg` contains two lines: a host file path, then the byte offset at which an unencrypted RomFS begins. Relative paths resolve against the game's working directory. The runtime reads RomFS metadata and game files in place rather than extracting all assets.
@@ -139,6 +149,14 @@ These are targeted service implementations, not a complete implementation of the
 Save data and cache files are host directories. `SSBU_DATA_ROOT` can redirect those per-run files for testing. A network identity is separate from save contents: copying `netplay_id.txt` to another PC can make two installs appear as the same player.
 
 The font service loads six firmware font files, decodes their container format, and maps shared font memory. Fonts are user-supplied runtime inputs, not repository assets.
+
+### Memory mappings
+
+Thread stacks are mapped with `svcMapMemory`: the pages of memory the game allocated appear in the stack area, from `0x7700000000` up. On the console the source is then locked, with no access at all, until the unmap. The kernel copies instead: the destination gets a copy of the source, and the unmap writes it back over the source before the destination is decommitted (the renderer is told, as for any memory decommitted). A game that keeps to the console's rules cannot tell the difference; the cost is two copies and the destination's memory while the mapping lasts. On an M5 Pro (macOS), mapping and unmapping 1 MiB took some 60-70 and 20-30 µs (16 KiB: 2-3 µs each), and 64 mappings of 1 MiB with 16 KiB of each written added 64 MiB to the process's memory footprint. As aliases made with `mach_vm_remap` they added 1 MiB, and a 1 MiB alias made and removed took some 5 µs. Each status line (`--status`) gives the mappings made, how many are mapped and the most at once, and the time the copies took, so a session's log shows whether they matter.
+
+An alias, the same pages at both addresses, needs the source in memory that can be mapped twice. On Windows that is a pagefile-backed section mapped into placeholders (`MapViewOfFile3`, Windows 10 1803 and later), whose committed pages `VirtualFree` cannot decommit and `GetWriteWatch` does not watch; on Linux a shared mapping (a memfd); on macOS anonymous memory will do (`mach_vm_remap`), but in 16 KiB pages, so only where source and destination sit at the same offset in one (and whatever shares a host page with the source then appears at the destination too). The heap and the alias area, where a stack's memory can come from, would have to be allocated that way. That has not been done.
+
+`SSBU_MAP_GUARD=1` makes a mapping's source inaccessible while it is mapped, as on the console, so that a stray access faults, and the crash report names the guest function, instead of reading the stale copy or writing what the unmap then overwrites. It guards a source that the memory map has as read-write memory, outside the alias area (where the write watch sets the pages' protection itself, on macOS and on Linux before 6.7), and on macOS only the 16 KiB host pages wholly inside it. `svcQueryMemory` reports the source as it does without the switch, and `kernel_read64` (the kernel's read of memory that may be gone, which `hle_fiber.c` looks into dropped fibers with) treats the guarded pages as not mapped rather than fault on them. A system call that would write into them (a file read or a socket receive into the source) fails with an error instead of faulting, so the game sees a failed call there, not a crash. It is off by default until a play session has been run with it. The log says when it is on, and the status line how many sources it guarded. [`maptest.c`](../tools/dev/maptest.c) checks both behaviours offline.
 
 ## 4. The graphics path
 
@@ -250,9 +268,10 @@ Paths below are relative to the repository root. `tools/` holds what the install
 
 | Tool | Role |
 | :--- | :--- |
-| [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across sampled CPU states. |
+| [`difftest.py`](../tools/dev/difftest.py) | Compare lifted single-instruction behavior against Unicorn across random CPU states: instructions sampled from a module, or with `--synthetic` made from the A64 encoding classes without the game ([`difftest_words.py`](../tools/dev/difftest_words.py); CI runs it on Windows, Linux and macOS). |
 | [`functest.py`](../tools/dev/functest.py) | Compare selected whole leaf functions against Unicorn, including registers and memory writes. |
 | [`shadertest.c`](../tools/dev/shadertest.c) | Translate dumped guest shaders and compile their HLSL with D3DCompiler. |
+| [`maptest.c`](../tools/dev/maptest.c) | Check the kernel's memory mappings offline: a mapping's pages at its destination and written back to its source at the unmap, the destination freed and the renderer told, mappings side by side and from neighbouring sources, more mappings than slots, sources in the alias area and in a module, the status line's counts; with `SSBU_MAP_GUARD=1` the source inaccessible while mapped, where it should be, and `kernel_read64` refusing it (`tests/test_kernel_map_memory.py` builds and runs it on Windows, Linux and macOS). |
 | [`padtest.c`](../tools/dev/padtest.c) | Check the controller layer offline: configuration, button mapping, GameCube controllers, sticks, player slots, and rumble pacing. |
 | [`fighttest.c`](../tools/dev/fighttest.c) | Check the fight test switches' logic offline: the hash line, the generators' fixed state, the steps, the debug match and end, the fixed seed (`tests/test_fight_test.py` builds and runs it). |
 | [`fightruntest.c`](../tools/dev/fightruntest.c) | Run the fight test switches' hooks on made-up guest memory, one switch at a time (`tests/test_fight_test.py`; macOS and Linux). |
@@ -260,6 +279,7 @@ Paths below are relative to the repository root. `tools/` holds what the install
 | [`clocktest.c`](../tools/dev/clocktest.c) | Check the clock offline: the timer it picks (also with a system timer slowed to a microsecond a read), that it never goes back across threads, and its rate and cost (`tests/test_clock.py` builds and runs it). |
 | [`vp9test.c`](../tools/dev/vp9test.c) | Replay recorded NVDEC jobs through the VP9 path and libvpx. |
 | [`vp9rt.c`](../tools/dev/vp9rt.c) | Exercise VP9 header reconstruction with an independently parsed synthetic clip. |
+| [`kerneltest.c`](../tools/dev/kerneltest.c) | Check the kernel's threads and handles offline, with made-up guest threads: with `SSBU_THREAD_RECYCLING=1`, 8000 threads made and ended one at a time and in batches with the tables staying small, stale handles refused by each call that takes one, one slot's handle values through a full turn of its use count, the log's line when half the handle table is in use, thread-local regions used again and zeroed, waits on handles closed meanwhile, and mutexes and condition variables among threads that come and go; without it, the old behaviour (`tests/test_kernel_threads.py` builds and runs it on Windows, Linux and macOS). |
 | [`menurun.sh`](../tools/dev/menurun.sh) | Script menu navigation, captures, and logging using a copied test save. |
 | [`autobattle.sh`](../tools/dev/autobattle.sh) | Drive a timed menu-to-battle input sequence for local diagnostics. |
 | [`netpair.sh`](../tools/dev/netpair.sh) | Run two local instances through loopback relay transport with separate copied test data. |
@@ -286,6 +306,15 @@ Source-only checks:
 python -m unittest discover -s tests -v
 ```
 
+They include the lifter's differential test without the game ([`tests/test_difftest_synthetic.py`](../tests/test_difftest_synthetic.py)). `difftest.py --synthetic` assembles instruction words from the bit fields of the A64 encoding classes the lifter handles (random words inside each class, a few kept per C statement shape, plus edge cases and exclusive-monitor sequences), lifts them, compiles the C with the game build's compiler and flags for the OS (clang-cl on Windows, the Linux build's x86-64 flags, the macOS build's arm64 flags) at -O2 and -O0, and compares registers, flags, the next PC and memory writes with Unicorn from random states whose floating-point operands are often special values (signed zeros, infinities, quiet and signalling NaNs, denormals, conversion and rounding limits). Floating-point results that differ only in NaN sign or payload (NaN on both sides, in the result register at its lane width) are reported but not counted as mismatches unless `--exact-nan`. It also lists, per class, the instructions the lifter does not lift. Mismatches the test knows of are listed, with the reason, in its `KNOWN`. A deeper run, and on an Apple silicon Mac the x86-64 code under Rosetta 2 with the Linux build's flags:
+
+```sh
+python tools/dev/difftest.py --synthetic --per-template 4 --states 32 --draws 8000 --seed 2
+python tools/dev/difftest.py --synthetic --toolchain rosetta
+```
+
+[`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one, else for CRC-32 tables made on first use) against the bitwise CRC and the standard check values.
+
 Game-backed checks after preparing local modules:
 
 ```powershell
@@ -298,9 +327,13 @@ Differential results apply to the sampled encodings, states, and functions. Whol
 
 The overlay exposes frame/rendering counters. F1 toggles the overlay, F2 shows details (with the connected pads), F3 captures a frame, F4 requests draw diagnostics, F6 triggers a sampling profile, and F11 switches to full screen.
 
+A diagnostic switch of the kernel: `SSBU_MAP_GUARD=1` makes a memory mapping's source inaccessible while it is mapped, as on the console, so that a stray access to it is a crash with a report ([Memory mappings](#memory-mappings)); off by default.
+
 A host exception writes `reports/crash_<time>.txt` with a minidump, and a runtime stop writes `reports/stopped_<time>.txt`. The minidump is written by a second process (the same executable started with `--write-dump`), because a process that dumps itself can deadlock on a lock held by one of its suspended threads. A watchdog ([`debug_watchdog.c`](../runtime/debug_watchdog.c)) writes `reports/freeze_<time>.txt` and a minidump when no frame has been presented for 5 s (again at 30 s and 120 s): the owners of the renderer's, present queue's, kernel's, and GPU channel's locks, the shader compiles in flight, the guest threads' states, and every thread's stack, with guest functions named by module offset. `SSBU_WATCHDOG=0` turns the watchdog off; `SSBU_MINIDUMP=0` writes no minidumps and `SSBU_MINIDUMP=full` writes all memory. `SSBU_HITCH=<ms>` logs every frame longer than that with what the main, vsync, and renderer threads spent it on: the program's functions by name once its map has been read (a few seconds after start), and for a wait inside a driver or library, the program's function that called into it (`... via <function>`). Locally generated linker maps are useful to `hostsym.py` and profiling tools, but are not required to run a release build.
 
 Useful environment variables include `SSBU_DATA_ROOT`, `SSBU_SHADER_CACHE`, `SSBU_SHADER_PREWARM`, `SSBU_SHADER_WARM`, `SSBU_COMPILE_THREADS`, `SSBU_DUMP_SHADERS`, `SSBU_DUMP_HLSL`, `SSBU_INPUT`, `SSBU_CAPTURE`, `SSBU_CONTROLLERS` (another `controllers.ini`), `SSBU_PAD_BACKEND=xinput`, `SSBU_DISPLAY` (another `display.ini`), `SSBU_WINDOW`, `SSBU_WINDOW_SIZE`, `SSBU_PACING`, `SSBU_RENDER_SCALE` (`display.ini`'s `render_scale`), `SSBU_SCALE_SKIP` (render target sizes kept at 1x, e.g. `square,960x540`, to find which one a scaling artifact comes from), `SSBU_GPU` (`display.ini`'s `gpu`; `warp` for Windows' software renderer), `SSBU_D3D_DEBUG` (Direct3D's debug layer, its messages in the log; needs Windows' optional *Graphics Tools*), `SSBU_WATCHDOG`, `SSBU_MINIDUMP`, `SSBU_HITCH`, `SSBU_CLOCK`, and the [network variables](MULTIPLAYER.md#reference-environment-variables). Several other `SSBU_*` switches are implementation-level debugging controls; consult their use sites before enabling them.
+
+The kernel's switch: `SSBU_THREAD_RECYCLING=1` frees exited guest threads, their handles and their thread-local regions for the next ones ([Threads and handles](#threads-and-handles)); off by default until a long play session has been run with it.
 
 ## Build boundaries
 

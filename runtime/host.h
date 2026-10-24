@@ -66,10 +66,12 @@ void account_save_id(u64 uid[2]);                       /* (hle_env.c) the id na
 void kernel_init(void);
 void kernel_add_region(u64 base, u64 size, u32 state, u32 perm);   /* for svcQueryMemory */
 int kernel_read64(u64 addr, u64 *out);                  /* 0 if no mapped memory holds addr */
+void kernel_map_status(void);                           /* the status line of svcMapMemory's mappings */
 Cpu *kernel_main_thread(u32 *handle);                  /* context + handle for the initial thread */
 u32 kernel_new_session(void *session);                 /* a handle for a native IPC session */
 void *kernel_session_of(u32 handle);
 u32 kernel_create_event(void);                         /* a kernel event handle, for native code */
+void kernel_copy_handle(u32 handle);                   /* native code hands the guest that handle again */
 void fiber_counts(u32 *slots, u32 *finalized, u64 *made);   /* (hle_fiber.c) host fibers in use, spare; guest fibers started */
 
 /* ---- native system services (ipc.c) ----------------------------------------------- */
