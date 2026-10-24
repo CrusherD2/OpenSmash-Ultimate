@@ -527,6 +527,23 @@ def talk(*players):
         p.recv(0.15)
 
 
+def talk_until_introduced(a, b, wait=3.0):
+    """talk(a, b) until a's PEERS has b introduced, for up to wait seconds: (version, [entries]), or the
+    newest PEERS if none does. As two games do: their packets keep coming, so a game packet lost on the
+    way (the lobby introduces two players once it has carried one each way) is sent again, and each
+    PING says which PEERS came last, so a lost PEERS is sent again (on_ping_ext)."""
+    newest, until = None, time.monotonic() + wait
+    while time.monotonic() < until:
+        talk(a, b)
+        a.ping()
+        got = a.introduced(b.ip, 0.4)
+        if got:
+            newest = got
+            if any(e[0] == b.ip and e[2] for e in got[1]):
+                break
+    return newest
+
+
 class Peers(LobbyTest):
     def test_introduced_once_their_games_talk(self):
         host, session, (a,) = self.room(1, ext=True)
@@ -610,19 +627,17 @@ class Peers(LobbyTest):
         a = self.player(name="Guest", ext=True, lan=(0x0A000006, 6000))
         a.ldn(host.ip, R.LM_JOIN, session + bytes(34))
         host.advertise(session, [a.ip])
-        talk(host, a)
-        self.assertEqual({e[0]: e for e in host.introduced(a.ip)[1]}[a.ip][4], (0x0A000006, 6000))   # (both 127.0.0.1: same router)
-        self.assertEqual({e[0]: e for e in a.introduced(host.ip)[1]}[host.ip][4], (0x0A000005, 5000))
+        self.assertEqual({e[0]: e for e in talk_until_introduced(host, a)[1]}[a.ip][4], (0x0A000006, 6000))   # (both 127.0.0.1: same router)
+        self.assertEqual({e[0]: e for e in talk_until_introduced(a, host)[1]}[host.ip][4], (0x0A000005, 5000))
         try:
             far = self.player(name="Far", ext=True, lan=(0x0A000007, 7000), bind="127.0.0.2")
         except OSError:
             self.skipTest("no 127.0.0.2 here")
         far.ldn(host.ip, R.LM_JOIN, session + bytes(34))
         host.advertise(session, [a.ip, far.ip])
-        talk(host, far)
-        entries = {e[0]: e for e in host.introduced(far.ip)[1]}   # (late by a PEERS_GAP: the advert just changed)
+        entries = {e[0]: e for e in talk_until_introduced(host, far)[1]}
         self.assertEqual(entries[far.ip][2:5], (1, (R.address_number("127.0.0.2"), far.s.getsockname()[1]), (0, 0)))
-        to_host = {e[0]: e for e in far.introduced(host.ip)[1]}[host.ip]
+        to_host = {e[0]: e for e in talk_until_introduced(far, host)[1]}[host.ip]
         self.assertEqual(to_host[2:5], (1, (LOCAL, host.s.getsockname()[1]), (0, 0)))   # (another router: no LAN address)
 
     def test_leaving_empties_and_coming_back_is_a_new_secret(self):
