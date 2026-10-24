@@ -21,7 +21,8 @@ emit      write C for the given functions and everything they call directly
 image     write the module image with base relocations applied for its load address
 build     write C for a whole module, split across many files, plus its loader tables
 compile   compile a build directory to objects (incremental: objcache.py; reports per-file failures)
-link      compile the host runtime and link module build directories into an executable
+link      compile the host runtime and link module build directories into an executable; each
+          directory's objects compiled already, for this build (compile): else it stops
 all       image + build + compile every module of an ExeFS, then link; a module whose C is
           current (same build id, address and tools: modcache.py) is not generated again;
           --generate-only stops before compiling (the Linux build compiles the C itself:
@@ -493,11 +494,11 @@ def build(path, outdir, jobs, per_file):
           f"{imports:,} symbols referenced by {relocs:,} relocations")
 
 
-def built_for(outdir):
-    """The instruction set a module folder's objects are compiled for (tools/isa.py): what the record of
-    the build folder it is in says (build_all's <out>/<module> or <out>/nro/<module>; link writes it)."""
+def build_folder(outdir):
+    """The build folder a module folder is in (build_all's <out>/<module> or <out>/nro/<module>), whose
+    record (tools/isa.py: isa.txt, which link writes) says what its objects are compiled for."""
     out = os.path.dirname(os.path.abspath(outdir))
-    return isa.built_for(os.path.dirname(out) if os.path.basename(out) == "nro" else out)
+    return os.path.dirname(out) if os.path.basename(out) == "nro" else out
 
 
 def plan(outdir):
@@ -509,8 +510,9 @@ def plan(outdir):
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
-    # if they are compiled for today's instruction set, which for every older version's was avx2)
-    adopt = objcache.header_files(cc.RUNTIME, "recomp.h", "module.h") if built_for(outdir) == cc.ISA else None
+    # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
+    adopt = (objcache.header_files(cc.RUNTIME, "recomp.h", "module.h")
+             if isa.adopts(build_folder(outdir), cc.ISA, isa.CLANG_CL[cc.ISA], isa.LEGACY_CLANG_CL) else None)
     record = objcache.Record(outdir, adopt_by_date=adopt)
     compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, h)) for h in ("recomp.h", "module.h")}
@@ -643,6 +645,27 @@ def link(dirs, exe, rt_dir=None):
     return True
 
 
+def link_compiled(dirs, exe, rt_dir=None):
+    """recomp.py link: link(), when every module folder's objects are current (plan: compiled with this
+    build's command, so for its instruction set, cc.ISA). link compiles the runtime for it and writes
+    it into isa.txt beside the exe (tools/isa.py), which must name what every object it links is
+    compiled for: avx2 objects linked as x86-64-v2 would pass the processor check on a processor
+    without AVX2 (it checks for what the runtime is compiled for), and build_game.py would take the
+    program as current. (build_all links the folders it has just compiled.)"""
+    import cc
+    for d in dirs:
+        todo, _record, _keys, why = plan(d)
+        if todo:
+            built = isa.built_for(build_folder(d))
+            print(f"{os.path.basename(d)}: {len(todo)} object{'s' if len(todo) != 1 else ''} not compiled for this build"
+                  + (f" (the folder is built for {built}, this build is for {cc.ISA})" if built != cc.ISA else "")
+                  + f": compile them first (recomp.py compile {d}, or recomp.py all)")
+            if objcache.summary(why):
+                print(f"{os.path.basename(d)}: {objcache.summary(why)}")
+            return False
+    return link(dirs, exe, rt_dir)
+
+
 def module_paths(exefs):
     """name -> module file, for the ExeFS's modules and dump/nro's NROs (placing new NROs)."""
     nros = nro_modules()
@@ -730,7 +753,7 @@ if __name__ == "__main__":
     elif cmd == "compile":
         sys.exit(0 if compile_dir(nso, int(arg("--jobs", "16"))) else 1)
     elif cmd == "link":
-        sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
+        sys.exit(0 if link_compiled(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
         # (on macOS the C is compiled by tools/mac/build_mac.py, the compiling and linking here being clang-cl's)
         compile_c = "--generate-only" not in sys.argv and sys.platform != "darwin"

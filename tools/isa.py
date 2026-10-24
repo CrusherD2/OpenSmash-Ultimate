@@ -16,12 +16,16 @@ below it the rounding functions become library calls too, and Windows' C runtime
 Which one (choose): SSBU_ISA=avx2 or SSBU_ISA=x86-64-v2 when set (SSBU_ISA=auto: as if unset);
 else x86-64-v2 if this PC's processor is known to lack something avx2 needs; else the build
 folder's last choice if SSBU_ISA made it (told once, kept); else avx2 if the processor is known to
-have it; else, when it cannot be asked, the folder's last choice, else x86-64-v2. A build writes
-what it compiled for into its folder's isa.txt (record): build/isa.txt on Windows, build-linux/isa.txt
-on Linux, which build_game.py compares with today's choice (another one builds again; tools/objcache.py
-then compiles every object again, their command having changed). A folder without one is avx2's
-(built_for), so the objects of a folder an older version built are kept by date only for avx2
-(tools/recomp.py's plan, tools/linux/build_linux.py's game_jobs).
+have it; else, when it cannot be asked, the folder's last choice (last_choice: avx2 for a folder an
+older version linked a program in), else x86-64-v2. A build writes what it compiled for into its
+folder's isa.txt (record) as it links: build/isa.txt on Windows, build-linux/isa.txt on Linux, which
+build_game.py compares with today's choice (another one builds again; tools/objcache.py then
+compiles every object again, their command having changed). A folder without one is avx2's
+(built_for). A folder an older version built has no objcache.json either; its objects are taken as
+current by date (objcache's adopt_by_date) only when they were compiled with the flags today's
+build compiles with (adopts: the folder built for today's target, and that target's flags the older
+versions' own, LEGACY_CLANG_CL and LEGACY_CLANG). No target's flags are theirs today, so such a
+folder is compiled again whole, once (tools/recomp.py's plan, tools/linux/build_linux.py's game_jobs).
 
 The program checks the processor itself before anything else of it runs (runtime/cpu_check.c): one
 built for AVX2 on a processor without it says what is missing and what to do, instead of crashing."""
@@ -42,7 +46,14 @@ NEEDS = {"avx2": V2 + ("avx", "avx2", "fma", "bmi1", "bmi2", "lzcnt"), "x86-64-v
 CLANG_CL = {"avx2": ("/arch:AVX2", "-mfma", "-mno-movbe", "-mno-f16c"), "x86-64-v2": ("/clang:-march=x86-64-v2",), ANY: ()}
 CLANG = {"avx2": ("-mavx2", "-mfma", "-mbmi", "-mbmi2", "-mlzcnt", "-mpopcnt"), "x86-64-v2": ("-march=x86-64-v2",),
          ANY: ("-march=x86-64",)}
+# The flags every older version compiled with (before there was a choice or an isa.txt: tools/cc.py's
+# BASE_CFLAGS, tools/linux/toolchain.py's ARCH), so what the objects of a folder it built are compiled
+# for: avx2 with MOVBE and F16C on Windows, with F16C on Linux, neither of which today's avx2 needs. Such
+# a folder's objects are kept by date only by a build whose flags are these (adopts): none, today.
+LEGACY_CLANG_CL = ("/arch:AVX2", "-mfma", "-mf16c")
+LEGACY_CLANG = ("-mavx2", "-mfma", "-mf16c", "-mbmi", "-mbmi2", "-mlzcnt", "-mpopcnt")
 RECORD = "isa.txt"
+PROGRAMS = ("ssbu.exe", "ssbu")   # what a build folder's link makes (Windows, Linux): last_choice
 
 # /proc/cpuinfo's names (Linux lists avx only when the kernel saves the YMM registers; abm is LZCNT)
 CPUINFO = {"pni": "sse3", "ssse3": "ssse3", "sse4_1": "sse4.1", "sse4_2": "sse4.2", "popcnt": "popcnt", "cx16": "cx16",
@@ -127,7 +138,8 @@ def choose(env, features, record):
     if features is not None:
         return "avx2", False, "this processor has AVX2"
     if last:
-        return last, False, "as the last build: the processor could not be asked"
+        other = "SSBU_ISA=x86-64-v2 builds for older processors" if last == "avx2" else "SSBU_ISA=avx2 builds for AVX2"
+        return last, False, f"as the last build: the processor could not be asked ({other})"
     return "x86-64-v2", False, ("the processor could not be asked whether it has AVX2: the build for older processors, "
                                 "expected to be slower (SSBU_ISA=avx2 builds for AVX2)")
 
@@ -150,8 +162,36 @@ def built_for(folder):
     return (recorded(folder) or (DEFAULT, False))[0]
 
 
+def last_choice(folder):
+    """choose()'s `record` for a build folder: its record's (target, told); without one, (avx2, chosen)
+    when an older version linked a program there; else None. Every older version built for avx2, and
+    its installer stopped for a processor whose name said it had no AVX2, so the processor of a folder
+    it linked most likely runs avx2: kept when this one cannot be asked (Windows before build 19041,
+    a name the installer does not know) rather than built again for x86-64-v2, slower. Where it does
+    not (that program never started), the program now says so as it starts, and how to build for
+    x86-64-v2."""
+    found = recorded(folder)
+    if found is None and any(os.path.isfile(os.path.join(folder, p)) for p in PROGRAMS):
+        return DEFAULT, False
+    return found
+
+
+def adopts(folder, target, flags, legacy):
+    """Whether a build for `target`, compiling with the instruction-set flags `flags`, may take the
+    objects of a folder an older version built (no objcache.json) as current by date (objcache's
+    adopt_by_date): only when they were compiled with these very flags, that is when the folder is
+    built for `target` (built_for: avx2 without a record) and `flags` are the older versions' own
+    (`legacy`: LEGACY_CLANG_CL or LEGACY_CLANG). Otherwise its objects could need of the processor what
+    today's build does not check for (on Windows, an older version's avx2 objects can use MOVBE)."""
+    return built_for(folder) == target and tuple(flags) == tuple(legacy)
+
+
 def record(folder, target, told):
-    """Writes a build folder's record: what it was built for, and whether SSBU_ISA said so (then kept)."""
+    """Writes a build folder's record: what it was built for, and whether SSBU_ISA said so (then kept).
+    Written as the build links, not as it starts: the record stands for the program beside it too
+    (build_game.py takes a program whose record names today's choice as current), so one written by
+    a build that then stopped would vouch for the program an earlier build made, for the other
+    target. So an SSBU_ISA choice is kept once a build for it has linked."""
     os.makedirs(folder, exist_ok=True)
     with open(os.path.join(folder, RECORD), "w", encoding="utf-8", newline="\n") as f:
         f.write(f"{target}\n{'told' if told else 'chosen'}\n# the instruction set this folder's build is compiled for "
@@ -159,5 +199,5 @@ def record(folder, target, told):
 
 
 def target(folder):
-    """choose() for this process: its environment, this PC's processor and `folder`'s record."""
-    return choose(os.environ, cpu_features(), recorded(folder))
+    """choose() for this process: its environment, this PC's processor and `folder`'s last choice."""
+    return choose(os.environ, cpu_features(), last_choice(folder))

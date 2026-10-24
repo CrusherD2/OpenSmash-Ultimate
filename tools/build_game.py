@@ -1154,7 +1154,9 @@ def build_linux_program(jobs):
     tc = linux_toolchain()
     import isa
     vkd3d = os.path.join(tc.VKD3D_BUILD, "linux")
-    if not os.path.isfile(os.path.join(vkd3d, "libvkd3d-shader.a")) or isa.built_for(vkd3d) != tc.ISA:
+    # (built again for another instruction set; and without a record, as an older version built it: with its
+    # flags, isa.LEGACY_CLANG, which are no target's today)
+    if not os.path.isfile(os.path.join(vkd3d, "libvkd3d-shader.a")) or (isa.recorded(vkd3d) or (None,))[0] != tc.ISA:
         log(f"  the shader compiler (vkd3d-shader), once (for {tc.ISA}):")
         run([sys.executable, os.path.join("tools", "linux", "build_vkd3d.py"), "linux"],
             "vkd3d-shader could not be built (see above).")

@@ -15,9 +15,10 @@ libvpx as the system has them). Built on Linux, the DXVK libraries go into <out>
 program runs from its own folder.
 Incremental: a file is compiled again when its source, the runtime headers it is built with, its
 compile command or the compiler changed (tools/objcache.py: <out>/rt/ and each module's folder keep
-an objcache.json). <out> holds one tree's game (port.txt): build another tree's into another <out>,
-or give --replace to start this one over. A progress bar shows how far it has got and the time left
-(tools/progress.py)."""
+an objcache.json); --link-only links only when nothing is to be compiled, so that <out>/isa.txt, which
+the link writes (tools/isa.py), says what all of it is compiled for. <out> holds one tree's game
+(port.txt): build another tree's into another <out>, or give --replace to start this one over. A
+progress bar shows how far it has got and the time left (tools/progress.py)."""
 import os
 import re
 import shutil
@@ -124,8 +125,9 @@ def game_jobs():
     headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, h)) for h in ("recomp.h", "module.h")}
     jobs, why = [], Counter()
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
-    # if they are compiled for today's instruction set, which for every older version's was avx2)
-    adopt = objcache.header_files(RUNTIME, "recomp.h", "module.h") if isa.built_for(OUT) == ISA else None
+    # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
+    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
+             if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     for name, src_dir, out_dir in modules():
         record = objcache.Record(out_dir, scan=(LANDING_SITES,), adopt_by_date=adopt)
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
@@ -363,6 +365,22 @@ def link():
     return True
 
 
+def link_only():
+    """--link-only: link(), when no object is to be compiled (runtime_jobs, game_jobs: each one compiled
+    with this build's command, so for its instruction set). link writes <out>/isa.txt, which must name
+    what every object it links is compiled for: avx2 objects linked as x86-64-v2 would pass the
+    processor check on a processor without AVX2 (it checks for what the runtime is compiled for), and
+    build_game.py would take the program as current."""
+    stale = runtime_jobs() + game_jobs()
+    if stale:
+        built = isa.built_for(OUT)
+        print(f"--link-only: {len(stale)} object{'s' if len(stale) != 1 else ''} not compiled for this build"
+              + (f" (the folder is built for {built}, this build is for {ISA})" if built != ISA else "")
+              + ": build without --link-only")
+        return False
+    return link()
+
+
 def codec_lib(name):
     """libopus or libvpx for the link: cross-compiling, the sysroot's static library; on Linux,
     the system's static one if it has one (then the program needs no copy at run time), else its
@@ -390,8 +408,9 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")
-    if isa.built_for(os.path.join(VKD3D_BUILD, "linux")) != ISA:
-        raise SystemExit(f"vkd3d-shader is built for {isa.built_for(os.path.join(VKD3D_BUILD, 'linux'))}, the game for {ISA}: "
+    vkd3d = isa.recorded(os.path.join(VKD3D_BUILD, "linux"))   # (none: an older version built it, with its own flags)
+    if not vkd3d or vkd3d[0] != ISA:
+        raise SystemExit(f"vkd3d-shader is built for {vkd3d[0] if vkd3d else 'an older version'}, the game for {ISA}: "
                          "run tools/linux/build_vkd3d.py linux")
     print(f"instruction set: {ISA} ({ISA_WHY})")
     dxvk_libs()
@@ -401,7 +420,7 @@ def main():
     if "--runtime-only" not in sys.argv:
         use_tree()
     if "--link-only" in sys.argv:
-        return link()
+        return link_only()
     if not overlay_font():
         return False
     runtime_only = "--runtime-only" in sys.argv

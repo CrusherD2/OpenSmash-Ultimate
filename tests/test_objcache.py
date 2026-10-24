@@ -381,11 +381,41 @@ class WindowsBuildTests(Folder):
         self.assertEqual(self.compile(), (True, ['g0000.c /O1']))
         self.assertNotIn('to compile again', self.said)
 
+    def test_an_older_version_s_objects_are_compiled_again(self):
+        """Every older version compiled the game with /arch:AVX2 -mfma -mf16c (isa.LEGACY_CLANG_CL, its cc.py's), which
+        allows MOVBE and F16C: today's avx2 (-mno-movbe -mno-f16c) neither needs them nor has the program check for
+        them. So a folder an older version built (no objcache.json, no build/isa.txt) is compiled again whole for
+        avx2, its objects not taken as current by date, nor for x86-64-v2 (a fighter module's folder alike)."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        nro = self.module.parent / 'nro' / 'fighter'
+        write(nro / 'manifest.tsv', 'g0000.c\t40000\t5000\n')
+        write(nro / 'g0000.c', '#include "recomp.h"\nvoid f_7100002000(void) {}\n')
+        write(nro / 'g_module.c', '#include "module.h"\n')
+        for target in isa.TARGETS:
+            with self.subTest(target=target), mock.patch.object(cc, 'ISA', target):
+                self.flags[:] = ['/nologo', *isa.LEGACY_CLANG_CL, '/I', str(self.runtime)]   # (the older version's build)
+                self.compile()
+                self.compile(nro)
+                for folder in (self.module, nro):
+                    (folder / objcache.RECORD).unlink()
+                self.assertIsNone(isa.recorded(str(self.module.parent)))
+                self.flags[:] = ['/nologo', *isa.CLANG_CL[target], '/I', str(self.runtime)]   # (today's)
+                self.assertEqual(self.compile(), (True, every))
+                self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+                self.assertNotIn('taken as current', self.said)
+                self.assertNotIn('-mf16c', (self.module / 'g0000.obj').read_text())
+                self.assertIn(isa.CLANG_CL[target][-1], (self.module / 'g0000.obj').read_text())
+                self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
+
     def test_a_folder_an_older_version_built_is_not_compiled_again(self):
         """No record at all (built before objcache.py): an object newer than its C and the runtime headers is taken
         as current, as the old rule (by date) took it, and recorded; an older one, or any after a header changed
-        since, is compiled. A record that is there is never second-guessed by date."""
+        since, is compiled. A record that is there is never second-guessed by date. (Only for a build whose flags
+        are the ones the older version compiled with, which no target's are today: made up here.)"""
         every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        patch = mock.patch.object(isa, 'LEGACY_CLANG_CL', isa.CLANG_CL['avx2'])
+        patch.start()
+        self.addCleanup(patch.stop)
         self.compile()
         record = self.module / objcache.RECORD
         record.unlink()
@@ -407,20 +437,25 @@ class WindowsBuildTests(Folder):
         self.assertEqual(self.compile(), (True, every))
 
     def test_a_folder_an_older_version_built_for_another_instruction_set(self):
-        """Every older version compiled for avx2 (and wrote no build/isa.txt). Built today for x86-64-v2, such a
-        folder's objects are all compiled again, none taken as current by date; built for what build/isa.txt
-        names, they are (a fighter module's folder, build/nro/<name>, goes by build/isa.txt too)."""
+        """Taken as current by date takes both: the folder built for today's instruction set (build/isa.txt, else
+        avx2: every older version's) and today's flags for it the older version's (here made up to be x86-64-v2's).
+        Built today for x86-64-v2, an avx2 folder's objects are all compiled again; one build/isa.txt says is
+        x86-64-v2's is adopted, and is not when the flags differ (a fighter module's folder, build/nro/<name>,
+        goes by build/isa.txt too)."""
         every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
         self.compile()
         record = self.module / objcache.RECORD
         record.unlink()
         self.flags[1:3] = ['/clang:-march=x86-64-v2']
-        with mock.patch.object(cc, 'ISA', 'x86-64-v2'):
+        with mock.patch.object(cc, 'ISA', 'x86-64-v2'), mock.patch.object(isa, 'LEGACY_CLANG_CL', isa.CLANG_CL['x86-64-v2']):
             self.assertEqual(self.compile(), (True, every))
             self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
             self.assertIn('-march=x86-64-v2', (self.module / 'g0000.obj').read_text())
             record.unlink()
             isa.record(str(self.module.parent), 'x86-64-v2', True)   # (what link writes)
+            with mock.patch.object(isa, 'LEGACY_CLANG_CL', ('/arch:SSE4.2',)):   # (not the flags they were compiled with)
+                self.assertEqual(self.compile(), (True, every))
+            record.unlink()
             self.assertEqual(self.compile(), (True, []))
             self.assertIn('3 objects an older version compiled taken as current', self.said)
             nro = self.module.parent / 'nro' / 'fighter'
@@ -540,6 +575,41 @@ class WindowsBuildTests(Folder):
         self.assertEqual(link(), (False, ['kernel.c /O2']))   # (still not compiled: tried again)
         self.assertNotIn('to compile again', self.said)
 
+    def test_link_by_hand_links_only_what_is_compiled_for_this_build(self):
+        """recomp.py link (link_compiled) links a module folder only when its objects are all compiled for this build,
+        so that build/isa.txt, which the link writes, never names today's instruction set over objects compiled for
+        another (avx2 objects labelled x86-64-v2 would pass the processor check on a processor without AVX2)."""
+        exe, linked = self.dir / 'build' / 'ssbu.exe', []
+
+        def link():
+            out = io.StringIO()
+            def link(dirs, exe, rt_dir=None):   # (link's record, as test_runtime has it write)
+                linked.append(dirs)
+                isa.record(str(Path(exe).parent), cc.ISA, False)
+                return True
+            with mock.patch.object(recomp, 'link', link), contextlib.redirect_stdout(out):
+                ok = recomp.link_compiled([str(self.module)], str(exe))
+            self.said = out.getvalue()
+            return ok
+        self.compile()
+        isa.record(str(self.module.parent), 'avx2', False)
+        self.assertTrue(link())
+        self.assertEqual(linked, [[str(self.module)]])
+        with mock.patch.object(cc, 'ISA', 'x86-64-v2'):   # (SSBU_ISA=x86-64-v2 set, say)
+            self.flags[1:3] = ['/clang:-march=x86-64-v2']
+            self.assertFalse(link())
+            self.assertIn('main: 3 objects not compiled for this build (the folder is built for avx2, this build is for '
+                          'x86-64-v2): compile them first', self.said)
+            self.assertIn('main: 3 objects to compile again: the compile command changed', self.said)
+            self.assertEqual(len(linked), 1)
+            self.compile()
+            self.assertTrue(link())
+            self.assertEqual(len(linked), 2)
+            write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')   # (and not with a file's C changed since)
+            self.assertFalse(link())
+            self.assertIn('main: 1 object not compiled for this build: compile them first', self.said)
+        self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
+
 
 # ---- the Linux build -------------------------------------------------------------------------
 class LinuxBuildTests(Folder):
@@ -614,28 +684,86 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (True, ['g0000_cxx.cpp -O2']))   # (now C++: said as a change to its C)
         self.assertNotIn('to compile again', self.said)
 
+    def test_an_older_version_s_objects_are_compiled_again(self):
+        """As on Windows: every older version compiled with -mf16c (isa.LEGACY_CLANG, its toolchain.py's ARCH), which
+        today's avx2 does not, so a folder it built is compiled again whole for avx2 (and for x86-64-v2)."""
+        every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
+        for target in isa.TARGETS:
+            with self.subTest(target=target):
+                with mock.patch.dict(isa.CLANG, {'avx2': isa.LEGACY_CLANG}):
+                    self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')   # (the older version's build)
+                self.build()
+                (self.out / 'main' / objcache.RECORD).unlink()
+                self.assertIsNone(isa.recorded(str(self.out)))
+                self.ns['ISA'], self.tc.CFLAGS = target, self.tc.cflags(target)
+                self.assertEqual(self.build(), (True, every))
+                self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+                self.assertNotIn('taken as current', self.said)
+                self.assertNotIn('-mf16c', (self.out / 'main' / 'g0000.o').read_text())
+
     def test_a_folder_an_older_version_built_is_not_compiled_again(self):
-        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept."""
-        self.build()
-        (self.out / 'main' / objcache.RECORD).unlink()
-        self.assertEqual(self.build(), (True, []))
-        self.assertIn('3 objects an older version compiled taken as current', self.said)
-        self.assertEqual(self.build(), (True, []))
+        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept (for a build
+        whose flags are the ones the older version compiled with, which no target's are today: made up here)."""
+        with mock.patch.object(isa, 'LEGACY_CLANG', isa.CLANG['avx2']):
+            self.build()
+            (self.out / 'main' / objcache.RECORD).unlink()
+            self.assertEqual(self.build(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
+            self.assertEqual(self.build(), (True, []))
 
     def test_a_folder_an_older_version_built_for_another_instruction_set(self):
         """As on Windows: built today for x86-64-v2, an older version's folder (avx2, no build-linux/isa.txt) is
-        compiled again whole; built for what build-linux/isa.txt names, its objects are taken as current."""
+        compiled again whole; built for what build-linux/isa.txt names, with its flags the older version's (made up),
+        its objects are taken as current."""
         every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
         self.build()
         record = self.out / 'main' / objcache.RECORD
         record.unlink()
         self.ns['ISA'], self.tc.CFLAGS = 'x86-64-v2', self.tc.cflags('x86-64-v2')
-        self.assertEqual(self.build(), (True, every))
-        self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+        with mock.patch.object(isa, 'LEGACY_CLANG', isa.CLANG['x86-64-v2']):
+            self.assertEqual(self.build(), (True, every))
+            self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+            record.unlink()
+            isa.record(str(self.out), 'x86-64-v2', True)   # (what link writes)
+            self.assertEqual(self.build(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
         record.unlink()
-        isa.record(str(self.out), 'x86-64-v2', True)   # (what link writes)
-        self.assertEqual(self.build(), (True, []))
-        self.assertIn('3 objects an older version compiled taken as current', self.said)
+        self.assertEqual(self.build(), (True, every))   # (with today's own: not the flags they were compiled with)
+
+    def test_link_only_links_only_what_is_compiled_for_this_build(self):
+        """--link-only (link_only) links only when nothing is to be compiled, so that build-linux/isa.txt, which the link
+        writes, never names today's instruction set over objects compiled for another: not after the instruction set
+        changed, nor with the runtime compiled for another (--runtime-only) in a folder whose record names today's."""
+        linked = []
+        self.ns['link'] = lambda: linked.append(self.ns['ISA']) or True
+
+        def link_only():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), warnings.catch_warnings():
+                warnings.simplefilter('ignore', ResourceWarning)
+                ok = self.ns['link_only']()
+            self.said = out.getvalue()
+            return ok
+        self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')
+        self.build()
+        self.build('runtime')
+        isa.record(str(self.out), 'avx2', False)
+        self.assertTrue(link_only())
+        self.assertEqual(linked, ['avx2'])
+        self.ns['ISA'], self.tc.CFLAGS = 'x86-64-v2', self.tc.cflags('x86-64-v2')   # (SSBU_ISA=x86-64-v2 set, say)
+        self.assertFalse(link_only())
+        self.assertIn('--link-only: 8 objects not compiled for this build (the folder is built for avx2, this build is for '
+                      'x86-64-v2): build without --link-only', self.said)
+        self.build('runtime')   # (--runtime-only: the runtime for x86-64-v2, the game still avx2's)
+        self.assertFalse(link_only())
+        self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')
+        self.assertFalse(link_only())   # (the record names avx2, the runtime is x86-64-v2's)
+        self.assertIn('--link-only: 5 objects not compiled for this build: build without --link-only', self.said)
+        self.assertEqual(linked, ['avx2'])
+        self.build('runtime')
+        self.assertTrue(link_only())
+        self.assertEqual(linked, ['avx2', 'avx2'])
+        self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
 
     def test_landing_sites_found_once(self):
         """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""

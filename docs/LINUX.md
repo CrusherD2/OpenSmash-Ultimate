@@ -374,8 +374,10 @@ installer puts them, and the overlay's font is drawn from the system's monospace
 Both compile for the instruction set [`tools/isa.py`](../tools/isa.py) chooses: `avx2`, or `x86-64-v2` on a processor
 without AVX2 ([the instruction set](BUILDING.md#the-instruction-set)). Set `SSBU_ISA` to choose, for example for a
 package for other PCs: by default it is this machine's processor. `build-linux/isa.txt` says what the game was
-built for and `build-vkd3d/linux/isa.txt` what vkd3d-shader was; `build_linux.py` stops when they differ
-(`build_game.py` builds vkd3d-shader again).
+built for and `build-vkd3d/linux/isa.txt` what vkd3d-shader was; `build_linux.py` stops when they differ, or
+when vkd3d-shader has none (an older version built it, with other flags), and `build_game.py` builds it again.
+`build_linux.py --link-only` links only when nothing is left to compile, so that `build-linux/isa.txt` says
+what all of it is compiled for.
 
 On Windows, the Linux program is cross-compiled next to the Windows build. It compiles the same
 generated C again, so build the game for Windows first (`tools/build_game.py`, or

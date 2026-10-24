@@ -129,6 +129,49 @@ class RecordTests(unittest.TestCase):
             os.environ['SSBU_ISA'] = 'avx2'
             self.assertEqual(isa.target(str(self.dir))[:2], ('avx2', True))
 
+    def test_a_folder_an_older_version_linked(self):
+        """No record, but a program an older version linked there (avx2, as they all built, and its installer stopped
+        for a processor whose name said it had no AVX2): avx2 is its last choice, kept when the processor cannot be
+        asked (Windows before build 19041, a name the installer does not know), not built again for x86-64-v2."""
+        self.assertIsNone(isa.last_choice(str(self.dir)))
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(isa, 'cpu_features', lambda: None):
+            os.environ.pop('SSBU_ISA', None)
+            self.assertEqual(isa.target(str(self.dir))[0], 'x86-64-v2')   # (nothing built here: not asked, not known)
+            for program in isa.PROGRAMS:   # (build/ssbu.exe, build-linux/ssbu)
+                with self.subTest(program=program):
+                    self.dir.mkdir(parents=True, exist_ok=True)
+                    (self.dir / program).write_bytes(b'')
+                    self.assertEqual(isa.last_choice(str(self.dir)), ('avx2', False))
+                    target, told, why = isa.target(str(self.dir))
+                    self.assertEqual((target, told), ('avx2', False))
+                    self.assertIn('as the last build: the processor could not be asked (SSBU_ISA=x86-64-v2 builds for older '
+                                  'processors)', why)
+                    (self.dir / program).unlink()
+            (self.dir / 'ssbu.exe').write_bytes(b'')
+            isa.record(str(self.dir), 'x86-64-v2', False)   # (a record says)
+            self.assertEqual(isa.last_choice(str(self.dir)), ('x86-64-v2', False))
+            self.assertEqual(isa.target(str(self.dir))[0], 'x86-64-v2')
+            (self.dir / isa.RECORD).write_text('sse9\n')   # (one that cannot be read: as none, as built_for has it)
+            self.assertEqual(isa.last_choice(str(self.dir)), ('avx2', False))
+        with mock.patch.object(isa, 'cpu_features', lambda: V2):   # (a processor known to lack AVX2: x86-64-v2 all the same)
+            self.assertEqual(isa.target(str(self.dir))[0], 'x86-64-v2')
+
+    def test_adopts(self):
+        """An older version's objects are kept by date only by a build compiling with its very flags, for the instruction
+        set the folder is built for."""
+        folder = str(self.dir)
+        self.assertTrue(isa.adopts(folder, 'avx2', isa.LEGACY_CLANG_CL, isa.LEGACY_CLANG_CL))   # (no record: avx2's)
+        self.assertFalse(isa.adopts(folder, 'avx2', isa.CLANG_CL['avx2'], isa.LEGACY_CLANG_CL))   # (today's flags differ)
+        self.assertFalse(isa.adopts(folder, 'avx2', isa.CLANG['avx2'], isa.LEGACY_CLANG))
+        self.assertFalse(isa.adopts(folder, 'x86-64-v2', isa.LEGACY_CLANG_CL, isa.LEGACY_CLANG_CL))   # (avx2's folder)
+        isa.record(folder, 'x86-64-v2', True)
+        self.assertTrue(isa.adopts(folder, 'x86-64-v2', ('-march=x86-64-v2',), ('-march=x86-64-v2',)))
+        self.assertFalse(isa.adopts(folder, 'avx2', isa.LEGACY_CLANG_CL, isa.LEGACY_CLANG_CL))
+        # today, no target compiles with the older versions' flags: a folder one built is compiled again whole, once
+        for target in isa.TARGETS:
+            self.assertNotEqual(isa.CLANG_CL[target], isa.LEGACY_CLANG_CL)
+            self.assertNotEqual(isa.CLANG[target], isa.LEGACY_CLANG)
+
 
 class BuildIsCurrentTests(unittest.TestCase):
     """build_game.py: a game compiled for another instruction set than today's is built again (Windows and
@@ -159,6 +202,7 @@ class BuildIsCurrentTests(unittest.TestCase):
 
     def test_target_change(self):
         self.assertTrue(self.current())   # (no record: avx2, as every build before it)
+        self.assertTrue(self.current(None))   # (and the processor not to be asked: avx2 kept, isa.last_choice)
         self.assertFalse(self.current(V2))   # this processor lacks AVX2 now: built again, for x86-64-v2
         self.assertFalse(self.current(env={'SSBU_ISA': 'x86-64-v2'}))
         isa.record(str(self.exe.parent), 'x86-64-v2', True)
@@ -220,6 +264,32 @@ class FlagTests(unittest.TestCase):
         self.assertEqual(cc.BASE_CFLAGS, cc.base_cflags(cc.ISA))
         self.assertTrue(set(isa.CLANG_CL[cc.ISA]) <= set(cc.CFLAGS))
         self.assertFalse(set(isa.CLANG_CL['avx2'] + isa.CLANG_CL['x86-64-v2']) & set(cc.CHECK_CFLAGS))
+
+    # the older versions: main before there was a choice, and phase2/object-cache (#7), this branch's base
+    OLDER = ('b04e6282833dce1243d40869b3fd27be4dea5498', '1c42d682241379f7e345b238033f0e3d3ed6cd72')
+
+    def test_the_older_versions_flags(self):
+        """isa.LEGACY_CLANG_CL and LEGACY_CLANG are what the older versions compiled with (their cc.py's BASE_CFLAGS and
+        toolchain.py's ARCH): read from them where git has them (not in a shallow clone, nor in a download), and
+        written out here, so that neither changes unnoticed."""
+        self.assertEqual(isa.LEGACY_CLANG_CL, ('/arch:AVX2', '-mfma', '-mf16c'))
+        self.assertEqual(isa.LEGACY_CLANG, ('-mavx2', '-mfma', '-mf16c', '-mbmi', '-mbmi2', '-mlzcnt', '-mpopcnt'))
+
+        def show(rev, path):
+            try:
+                r = subprocess.run(['git', 'show', f'{rev}:{path}'], capture_output=True, text=True, cwd=ROOT, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return r.stdout if r.returncode == 0 else None
+        for rev in self.OLDER:
+            with self.subTest(rev=rev[:7]):
+                cc_py, toolchain_py = show(rev, 'tools/cc.py'), show(rev, 'tools/linux/toolchain.py')
+                if cc_py is None or toolchain_py is None:
+                    self.skipTest(f'git does not have {rev[:7]} here')
+                base = re.search(r'^BASE_CFLAGS = \["/nologo", (.*?), "-fno-strict-aliasing"', cc_py, re.M | re.S)
+                self.assertEqual(tuple(re.findall(r'"([^"]*)"', base.group(1))), isa.LEGACY_CLANG_CL)
+                arch = re.search(r'^ARCH = \[(.*?)\]', toolchain_py, re.M)
+                self.assertEqual(tuple(re.findall(r'"([^"]*)"', arch.group(1))), isa.LEGACY_CLANG)
 
     def macros(self, cmd, folder):
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=folder, timeout=120)

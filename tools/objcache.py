@@ -20,9 +20,10 @@ stops half-way, or a file that fails to compile, leaves no key for an object it 
 No record, or one that cannot be read: its objects are compiled again - except in a game folder an
 older version built, which has objects but has never had a record (adopt_by_date): there an object
 newer than its sources and than every runtime header is taken as current, as the old rule (by date)
-took it, and recorded, so updating to this version does not compile the whole game again (when the
-build is for the instruction set the folder was built for, which the callers check: tools/isa.py). One
-there that cannot be opened (another program holding it) stops the build before anything is
+took it, and recorded, so updating to this version does not compile the whole game again - only when
+the build compiles with the flags the older version did (the date cannot say what an object was
+compiled with), which the callers check (tools/isa.py's adopts): no build does today. One there
+that cannot be opened (another program holding it) stops the build before anything is
 compiled or removed."""
 import functools
 import hashlib

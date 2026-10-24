@@ -366,9 +366,14 @@ class BuildOnLinuxTests(unittest.TestCase):
     def test_vkd3d_once(self):
         (self.vkd3d / 'linux').mkdir(parents=True)
         (self.vkd3d / 'linux' / 'libvkd3d-shader.a').write_bytes(b'')
+        # no record: an older version built it, with flags no instruction set has today (tools/isa.py): built again
         self.ns['build'](self.args)
-        self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])   # (no record: avx2, as before there was one)
-        # built for another instruction set (tools/isa.py): built again
+        self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_vkd3d.py', 'build_linux.py'])
+        il.isa.record(str(self.vkd3d / 'linux'), 'avx2', False)   # (what build_vkd3d.py writes)
+        self.calls.clear()
+        self.ns['build'](self.args)
+        self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])
+        # built for another instruction set: built again
         il.isa.record(str(self.vkd3d / 'linux'), 'x86-64-v2', False)
         self.calls.clear()
         self.ns['build'](self.args)
