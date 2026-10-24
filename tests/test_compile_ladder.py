@@ -3,8 +3,9 @@ again on its own, then a level lower (on Linux and macOS as on Windows); a compi
 limit stopped with every process it started and nothing half-written left, then compiled again with
 its longest functions unoptimised (optnone, from a header given before the file), then whole at -O0
 or /Od; what the ladder compiled kept until what it is built from changes (objcache, macOS's
-game_sources.tsv); each file's seconds kept for the next build's order and time left; the report;
-SSBU_OPTNONE_ABOVE; and every compile command as before when nothing goes wrong. Made-up sources and
+game_sources.tsv); a PC asleep or a build stopped (Ctrl+Z) not counted against a time limit; each
+file's seconds kept for the next build's order and time left; the report; SSBU_OPTNONE_ABOVE; and
+every compile command, and the order they start in, as before when nothing goes wrong. Made-up sources and
 the made-up compiler of tests/test_objcache.py; the last tests run the real clang on made-up C, where
 there is one (optnone through -include and /FI, a chain of musttail calls at -O0, a real timeout)."""
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -87,12 +89,38 @@ def started():
 
 
 class Pool(ThreadPoolExecutor):
-    """The ladder's pool, its size kept."""
-    sizes = []
+    """The ladder's pool, its size kept, and the order the files are handed to it (by their names)."""
+    sizes, handed = [], []
 
     def __init__(self, workers):
         Pool.sizes.append(workers)
         super().__init__(workers)
+
+    def submit(self, fn, *args, **kw):
+        Pool.handed.append(os.path.basename(args[0][0]))
+        return super().submit(fn, *args, **kw)
+
+
+@contextlib.contextmanager
+def pool():
+    """Pool as the ladder's, its record started over."""
+    Pool.sizes, Pool.handed = [], []
+    with mock.patch.object(ladder, 'ThreadPoolExecutor', Pool):
+        yield Pool
+
+
+class Clock:
+    """The time module as tools/ladder.py sees it, its clock jumping on by `by` seconds `after` seconds from
+    now: what a PC asleep is to Windows' clock (it counts sleep), and a build stopped with Ctrl+Z to any."""
+    def __init__(self, after, by):
+        self.t0, self.after, self.by = time.monotonic(), after, by
+
+    def monotonic(self):
+        now = time.monotonic()
+        return now + (self.by if now - self.t0 > self.after else 0.0)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 # ---- the parts ---------------------------------------------------------------------------------------------
@@ -178,6 +206,40 @@ class CrashSignTests(unittest.TestCase):
             ladder.crash_files(f'clang: note: diagnostic msg: {temp}\nclang: note: diagnostic msg: {elsewhere}\n')
             self.assertFalse(os.path.exists(temp))
             self.assertTrue(elsewhere.exists())   # (only what clang wrote into the temporary folder)
+
+
+class RunTests(unittest.TestCase):
+    """ladder.run: the time the build did not run is not counted against a time limit, nor in a compile's
+    seconds; a compile that finishes just as its limit comes is kept."""
+    def test_an_hour_asleep_is_not_over_the_limit(self):
+        with mock.patch.object(ladder, 'time', Clock(0.5, 3600.0)):
+            r = ladder.run([sys.executable, '-c', 'import time; time.sleep(2)'], 600.0, threading.Event())
+        self.assertEqual((r.code, r.timed_out), (0, False))
+        self.assertLess(r.seconds, 60)
+
+    def test_over_the_limit_in_the_time_it_ran(self):
+        t0 = time.monotonic()
+        with mock.patch.object(ladder, 'time', Clock(0.5, 3600.0)):
+            r = ladder.run([sys.executable, '-c', 'import time; time.sleep(60)'], 2.0, threading.Event())
+        self.assertTrue(r.timed_out)
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertLess(r.seconds, 10)
+
+    def test_finished_just_as_its_limit_came(self):
+        """Its own result, an object or an error, not a timeout (which would remove the object)."""
+        for code in (0, 1):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as d:
+                obj, asked = Path(d, 'g.o'), []
+
+                def limit():   # (the second look comes once the compile has finished: then its limit is up)
+                    asked.append(1)
+                    if len(asked) > 1:
+                        time.sleep(1.5)
+                    return 100.0 if len(asked) == 1 else 0.0
+                r = ladder.run([sys.executable, '-c', f'import sys, time; time.sleep(1.2); open({str(obj)!r}, "w").write("o"); '
+                                f'sys.exit({code})'], limit, threading.Event())
+                self.assertEqual((r.code, r.timed_out), (code, False))
+                self.assertTrue(obj.exists())
 
 
 class LimitTests(unittest.TestCase):
@@ -322,10 +384,12 @@ class WindowsLadderTests(made_up.Folder):
 
     def test_nothing_goes_wrong_nothing_changes(self):
         """Every compile command byte for byte as it was (cc.compile_command, no header), at normal priority (cc.py
-        never gave clang-cl another), with the jobs asked for; no report; each file's seconds kept."""
-        Pool.sizes = []
-        with started() as starts, mock.patch.object(ladder, 'ThreadPoolExecutor', Pool):
+        never gave clang-cl another), with the jobs asked for, started in the manifest's order (the cost model would
+        start g0001.c first); no report; each file's seconds kept."""
+        with started() as starts, pool():
             self.assertEqual(self.compile(), (True, ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']))
+        self.assertEqual(Pool.handed, ['g0000.c', 'g0001.c', 'g_module.c'])
+        self.assertGreater(P.file_cost(30000, 25000), P.file_cost(40000, 5000))
         m = str(self.module)
         want = sorted([self.cc.name, '/c', level, *self.flags, '-fno-crash-diagnostics', os.path.join(m, n + '.c'),
                        '/Fo' + os.path.join(m, n + '.obj')] for n, level in (('g0000', '/O2'), ('g0001', '/O1'), ('g_module', '/O1')))
@@ -438,10 +502,118 @@ class WindowsLadderTests(made_up.Folder):
             self.assertTrue(gone(self.cc.grandchildren()))
         self.assertEqual([(os.path.basename(t[0]), t[2]) for t in recomp.stale_files(str(self.module))], [('g0001.c', '/O1')])
 
+    def test_a_pc_asleep_is_not_over_the_time_limit(self):
+        """An hour asleep (Windows' clock counts it; a build stopped with Ctrl+Z is the same to any) in the middle of a
+        compile: no file over its time limit, none compiled another way, and the hour not in its time."""
+        self.g0001(generated(('f_7100001000', 50), note='takes 3 s'))
+        with mock.patch.object(ladder, 'time', Clock(1.0, 3600.0)):
+            self.assertEqual(self.compile(), (True, ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']))
+        self.assertNotIn('still compiling', self.said)
+        self.assertNotIn('ladder', self.recorded()['g0001.obj'])
+        times = json.loads(Path(self.dir / 'build', ladder.TIMES_FILE).read_text())['files']['main/g0001.c']
+        self.assertNotIn('how', times)
+        self.assertLess(times['seconds'], 60)
+        self.assertFalse(Path(self.dir / 'build', ladder.REPORT).exists())
+
+    @unittest.skipUnless(POSIX, 'a signal to the main thread')
+    def test_ctrl_c_on_the_main_thread(self):
+        """Ctrl+C reaching the build's main thread while two files compile: their compilers are stopped (kill_running);
+        neither leaves half an object, clang's temporary file or a key, nor is taken for a crash."""
+        made_up.write(self.module / 'g0000.c', generated(('f_7100000000', 30), note='slow'))
+        self.g0001(generated(('f_7100001000', 50), note='slow'))
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
+        timer = threading.Timer(1.5, signal.pthread_kill, (threading.main_thread().ident, signal.SIGINT))
+        t0 = time.time()
+        timer.start()
+        try:
+            with self.assertRaises(KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()) as out:
+                recomp.compile_dir(str(self.module), 2)
+        finally:
+            timer.cancel()
+        self.assertLess(time.time() - t0, 30)
+        self.assertEqual(self.cc.runs(), ['g0000.c /O2', 'g0001.c /O1'])   # (not compiled again as a crash)
+        self.assertNotIn('crashed', out.getvalue())
+        self.assertEqual(self.left_behind(), [])
+        self.assertEqual([n for n in ('g0000.obj', 'g0001.obj') if (self.module / n).exists() or n in self.recorded()], [])
+        self.assertTrue(gone(self.cc.grandchildren()))
+
+    def test_stopped_with_the_build(self):
+        """What compile()'s Ctrl+C handler does (stopping, then kill_running), done from another thread so that the
+        workers' side is tested on every platform (a compiler taskkill stopped exits with 1, not a signal): the
+        compiles end at once, neither is taken for a crash or an error, and neither leaves anything."""
+        made_up.write(self.module / 'g0000.c', generated(('f_7100000000', 30), note='slow'))
+        self.g0001(generated(('f_7100001000', 50), note='slow'))
+        steps = ladder.Ladder(P.level_cost, 'clang-cl')
+        timer = threading.Timer(1.5, lambda: (steps.stopping.set(), ladder.kill_running()))
+        t0 = time.time()
+        timer.start()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            recomp.compile_dir(str(self.module), 2, steps=steps)
+        timer.join()
+        self.assertLess(time.time() - t0, 30)
+        self.assertNotIn('crashed', out.getvalue())
+        self.assertNotIn('FAILED', out.getvalue())
+        self.assertEqual(self.left_behind(), [])
+        self.assertEqual([n for n in ('g0000.obj', 'g0001.obj') if (self.module / n).exists() or n in self.recorded()], [])
+
+    def test_optnone_above_and_the_ladder_kept_apart(self):
+        """What the ladder made of a file is kept only by a build that starts the file the same way: the default build
+        does not keep what it made of SSBU_OPTNONE_ABOVE's way, nor SSBU_OPTNONE_ABOVE's build what it made of the
+        default's."""
+        above = {'SSBU_OPTNONE_ABOVE': '40', **LIMIT}
+        self.g0001(generated(('f_7100001000', 50), ('f_7100001400', 20), note='slow unless optnone on f_7100001000'))
+        self.assertEqual(self.compile(LIMIT)[1], ['g0000.c /O2', 'g0001.c /O1', 'g0001.c /O1', 'g_module.c /O1'])
+        self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/O1', 'above': 40})
+        self.assertEqual(self.compile(above), (True, ['g0001.c /O2']))   # (its own way: f_7100001000 unoptimised, at /O2)
+        self.assertNotIn('ladder', self.recorded()['g0001.obj'])
+        # SSBU_OPTNONE_ABOVE's ladder: optnone above a quarter of 40, at /O2
+        self.g0001(generated(('f_7100001000', 50), ('f_7100001400', 20), note='slow unless optnone on f_7100001400'))
+        self.assertEqual(self.compile(above)[1], ['g0001.c /O2', 'g0001.c /O2'])
+        self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/O2', 'above': 10, 'from': 40})
+        self.assertEqual(self.compile(above), (True, []))
+        self.assertEqual(self.compile(LIMIT)[1], ['g0001.c /O1', 'g0001.c /O1', 'g0001.c /O1'])   # (its own way, then the ladder)
+        self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/O1', 'above': 10})
+        self.assertEqual(self.compile(LIMIT), (True, []))
+
+    def test_a_runtime_file_the_compiler_crashed_on_is_in_the_report(self):
+        """recomp.py link: in the report of a ladder of its own, written beside the exe; build_all's: in the build's,
+        which it writes after the link."""
+        made_up.write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
+        made_up.write(self.runtime / 'host.c', '#include "host.h"\n/* crash at /O2 */\n')
+        made_up.write(self.runtime / 'cpu_check.c', '#include "recomp.h"\n')
+        exe, report = self.dir / 'build' / 'ssbu.exe', self.dir / 'build' / ladder.REPORT
+
+        def link(**kw):
+            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): Path(exe).write_bytes(b'MZ')), \
+                    mock.patch.object(cc, 'SDL3_DLL', None), mock.patch.object(cc, 'CHECK_CFLAGS', ['/nologo']), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertTrue(recomp.link([], str(exe), **kw))
+            return out.getvalue(), self.cc.runs()
+        said, runs = link()
+        self.assertEqual([r for r in runs if r.startswith('host.c')], ['host.c /O1', 'host.c /O2', 'host.c /O2'])
+        self.assertRegex(report.read_text(), r'host.c  \d+ s  /O1  the compiler crashed \(exception 0xC0000005\): compiled again')
+        self.assertIn(f'1 file compiled another way (also in {report}):', said)
+        report.unlink()
+        made_up.write(self.runtime / 'host.c', '#include "host.h"\n/* crash at /O2, again */\n')
+        steps = ladder.Ladder(P.level_cost, 'clang-cl', log=lambda line: None)
+        link(steps=steps)
+        self.assertFalse(report.exists())   # (said at the build's end)
+        self.assertEqual(len(steps.report.lines), 1)
+        steps.end(str(self.dir / 'build'))
+        self.assertIn('host.c', report.read_text())
+
+    def test_a_setting_that_is_not_a_number_stops_the_build_at_once(self):
+        with mock.patch.dict(os.environ, {'SSBU_COMPILE_LIMIT': '2h'}), \
+                mock.patch.object(recomp, 'module_paths', side_effect=AssertionError('the build went on')), \
+                self.assertRaisesRegex(SystemExit, r'^SSBU_COMPILE_LIMIT=2h: the seconds'):
+            recomp.build_all('exefs', str(self.dir / 'build'), 2)
+
     def test_the_longest_first_by_what_they_took(self):
-        with started() as starts:
+        """Once compile_times.json has a time for one of the files to compile, they start the longest first: by what
+        they took, else by the cost model's estimate; before, in the manifest's order (as when nothing goes wrong)."""
+        with pool():
             self.compile()
-        self.assertEqual([os.path.basename(a[-2]) for a, _kw in starts], ['g0001.c', 'g0000.c', 'g_module.c'])   # (the model's)
+        self.assertEqual(Pool.handed, ['g0000.c', 'g0001.c', 'g_module.c'])
         folder = self.dir / 'build'
         digest = {n: objcache.file_sha(str(self.module / n))[0] for n in ('g0000.c', 'g0001.c')}
         (folder / ladder.TIMES_FILE).write_text(json.dumps({'version': 1, 'files': {
@@ -457,9 +629,20 @@ class WindowsLadderTests(made_up.Folder):
         b = P.Build(2, link=None)   # (the time left goes by them)
         b.module('main', 70000, [(t[0], t[3]) for t in todo])
         self.assertAlmostEqual(b.cost[('compile', 'main')], P.makespan([400 / pace, 20 / pace, 1.0], [0.0, 0.0]))
-        with started() as starts:
+        with pool():
             self.compile()
-        self.assertEqual([os.path.basename(a[-2]) for a, _kw in starts], ['g0000.c', 'g0001.c', 'g_module.c'])
+        self.assertEqual(Pool.handed, ['g0000.c', 'g0001.c', 'g_module.c'])
+        # g0001.c measured the longest: first; g0000.c not measured (its C changed): by the cost model, after g_module.c
+        digest.update({n: objcache.file_sha(str(self.module / n))[0] for n in ('g0001.c', 'g_module.c')})
+        (folder / ladder.TIMES_FILE).write_text(json.dumps({'version': 1, 'files': {
+            'main/g0001.c': {'seconds': 900.0, 'level': '/O1', 'model': 10.2, 'source': digest['g0001.c']},
+            'main/g_module.c': {'seconds': 80.0, 'level': '/O1', 'model': 1.0, 'source': digest['g_module.c']},
+            'main/gone.c': {'seconds': 60.0, 'level': '/O2', 'model': 60.0, 'source': 'x'}}}))
+        made_up.write(self.module / 'g0000.c', generated(('f_7100000000', 31)))
+        for n in ('g0001.obj', 'g_module.obj'):
+            (self.module / n).unlink()
+        self.assertEqual([os.path.basename(t[0]) for t in recomp.stale_files(str(self.module))],
+                         ['g0001.c', 'g_module.c', 'g0000.c'])
 
     def test_optnone_above_from_the_start_only_when_asked(self):
         """SSBU_OPTNONE_ABOVE (for benchmarking): a file's functions over it unoptimised from the start, the rest at
@@ -519,7 +702,9 @@ class LinuxLadderTests(made_up.Folder):
 
     def test_nothing_goes_wrong_nothing_changes(self):
         """Each command as toolchain.compile_command made it, run as toolchain.run runs one: nice on Linux, the
-        priority class cross-compiling on Windows; the jobs asked for."""
+        priority class cross-compiling on Windows; the jobs asked for; the biggest source first, as before (the cost
+        model would start g0001's first)."""
+        made_up.write(self.main / 'g0000.c', generated(('f_7100000000', 30), note='x' * 4000))
         o, m = self.out / 'main', self.main
         want = sorted([[self.tc.CLANG, '-c', '-O2', *self.tc.CFLAGS, str(m / 'g0000.c'), '-o', str(o / 'g0000.o')],
                        [self.tc.CLANG, '-c', '-O1', *self.tc.CFLAGS, '-x', 'c++', '-std=gnu++20', '-fexceptions',
@@ -528,15 +713,25 @@ class LinuxLadderTests(made_up.Folder):
         for host_linux in (False, True):
             with self.subTest(host_linux=host_linux):
                 shutil.rmtree(self.out, ignore_errors=True)
-                Pool.sizes = []
-                with mock.patch.object(self.tc, 'HOST_LINUX', host_linux), started() as starts, \
-                        mock.patch.object(ladder, 'ThreadPoolExecutor', Pool):
+                with mock.patch.object(self.tc, 'HOST_LINUX', host_linux), started() as starts, pool():
                     self.assertEqual(self.build(), (True, ['g0000.c -O2', 'g0001_cxx.cpp -O1', 'g_module.c -O1']))
+                self.assertEqual(Pool.handed, ['g0000.c', 'g0001_cxx.cpp', 'g_module.c'])
                 nice = ['nice', '-n', '10'] if host_linux else []
                 self.assertEqual(sorted(args for args, _kw in starts), sorted(nice + w for w in want))
                 self.assertEqual([kw for _a, kw in starts], [{} if host_linux else {'creationflags': self.tc._PRIORITY}] * 3)
                 self.assertEqual(Pool.sizes, [3])
                 self.assertFalse((self.out / ladder.REPORT).exists())
+        self.assertGreater(P.clang_cost(40000, 30000, '-O1', True), P.clang_cost(40000, 5000, '-O2'))
+        # once measured, the longest first by what they took (g_module.c's, g0001.c's), else by the cost model's estimate
+        times = json.loads((self.out / ladder.TIMES_FILE).read_text())
+        times['files']['main/g_module.c']['seconds'], times['files']['main/g0001.c']['seconds'] = 600.0, 100.0
+        del times['files']['main/g0000.c']
+        times['files']['main/gone.c'] = {'seconds': 60.0, 'level': '-O2', 'model': 60.0, 'source': 'x'}
+        (self.out / ladder.TIMES_FILE).write_text(json.dumps(times))
+        shutil.rmtree(self.out / 'main')
+        with pool():
+            self.build()
+        self.assertEqual(Pool.handed, ['g_module.c', 'g0001_cxx.cpp', 'g0000.c'])
 
     def test_a_crash_compiled_again_on_its_own_then_at_O1(self):
         made_up.write(self.main / 'g0000.c', generated(('f_7100000000', 30), note='crash at -O2'))
@@ -556,6 +751,12 @@ class LinuxLadderTests(made_up.Folder):
             made_up.write(self.main / 'g0000.c', generated(('f_7100000000', 31), note='crash by signal at -O2'))
             self.assertEqual(self.build(), (True, ['g0000.c -O1', 'g0000.c -O2', 'g0000.c -O2']))
             self.assertIn('the compiler crashed on main/g0000.c (SIGSEGV): compiling it again on its own\n', self.said)
+            self.assertEqual([n for n in os.listdir(self.out / 'main') if n.endswith('.tmp')], [])   # (what it was writing: gone)
+
+    def test_a_setting_that_is_not_a_number_stops_the_build_at_once(self):
+        with mock.patch.dict(os.environ, {'SSBU_OPTNONE_ABOVE': 'lots'}), \
+                self.assertRaisesRegex(SystemExit, r'^SSBU_OPTNONE_ABOVE=lots: the instructions'):
+            self.ns['main']()   # (before it looks for vkd3d-shader)
 
     def test_a_cxx_file_over_its_time_limit(self):
         """A file with landing sites (compiled as C++: its wrapper includes the C) has the header given before the
@@ -630,9 +831,12 @@ class MacLadderTests(made_up.Folder):
         return [line.split('\t') for line in Path(self.ns['GAME_SOURCES']).read_text().splitlines()[1:]]
 
     def test_nothing_goes_wrong_nothing_changes(self):
-        Pool.sizes = []
-        with started() as starts, mock.patch.object(ladder, 'ThreadPoolExecutor', Pool):
+        """The biggest source first, as before (the cost model would start g0001.c first)."""
+        made_up.write(self.main / 'g0000.c', generated(('f_7100000000', 30), note='x' * 4000))
+        with started() as starts, pool():
             self.assertEqual(self.build(), (True, ['g0000.c -O2', 'g0001.c -O1', 'g_module.c -O1']))
+        self.assertEqual(Pool.handed, ['g0000.c', 'g0001.c', 'g_module.c'])
+        self.assertGreater(P.clang_cost(30000, 25000, '-O1'), P.clang_cost(40000, 5000, '-O2'))
         o = self.obj / 'main'
         want = sorted(['nice', '-n', '10', 'fakeclang', '-c', level, *self.tc.CFLAGS, '-I', str(self.runtime),
                        str(self.main / (n + '.c')), '-o', str(o / (n + '.o'))]
@@ -645,6 +849,11 @@ class MacLadderTests(made_up.Folder):
                           (os.path.join('main', 'g_module.o'), '-O1', 'c', 5)])   # (as before: five fields)
         self.assertFalse(Path(self.ns['OUT'], ladder.REPORT).exists())
         self.assertTrue((self.obj / ladder.TIMES_FILE).exists())
+
+    def test_a_setting_that_is_not_a_number_stops_the_build_at_once(self):
+        with mock.patch.dict(os.environ, {'SSBU_COMPILE_LIMIT': '-1'}), \
+                self.assertRaisesRegex(SystemExit, r'^SSBU_COMPILE_LIMIT=-1: the seconds'):
+            self.ns['main']()   # (before it looks for SDL3)
 
     def test_a_crash_compiled_again(self):
         made_up.write(self.main / 'g0000.c', generated(('f_7100000000', 30), note='crash at -O2'))

@@ -493,7 +493,7 @@ class GenerateOnlyTests(unittest.TestCase):
                 MODULES={'main': 1, 'sdk': 2}, stale_files=lambda target: [],
                 build=lambda nso, target, jobs, per_file: done.append(('build', os.path.basename(target))),
                 compile_dir=lambda target, jobs, shown=None, steps=None: done.append(('compile', target)) or True,
-                link=lambda dirs, exe: done.append(('link', exe)) or True,
+                link=lambda dirs, exe, steps=None: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
                                                write_stamp=lambda t, *x: stamps.append(os.path.basename(t))))
             no_title = unittest.mock.patch.object(g['progress'], 'save_title', return_value=None)   # (the bar's)

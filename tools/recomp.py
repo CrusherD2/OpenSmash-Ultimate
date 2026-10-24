@@ -508,7 +508,8 @@ def plan(outdir, times=None):
     includes recomp.h, g_module.c module.h (_emit, module_table). The key's command names the file and
     its object by their names in the folder: the folder spelled another way (build/main, .\\build\\main,
     a full path), or moved, compiles nothing again. times: the build folder's ladder.Times (read when
-    not given), by which the longest come first."""
+    not given): once it has measured one of them, the longest come first (ladder.longest_first), else
+    the manifest's order."""
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
@@ -531,20 +532,24 @@ def plan(outdir, times=None):
         # very large functions make the optimiser superlinear; build those at a lower level
         opt = "/O1" if left > 20000 or name == "g_module.c" else "/O2"
         key = game_key(record, src, compiler, headers["module.h" if name == "g_module.c" else "recomp.h"])
+        start = own.above if own else 0
         keys[obj] = (key(opt, own.header if own else None),
-                     lambda step, key=key: {**key(step.level, step.header), "ladder": step.record()})
-        reason = ladder.check(record, obj, *keys[obj], src)
+                     lambda step, key=key, start=start: ladder.ladder_entry(key(step.level, step.header), step, start))
+        reason = ladder.check(record, obj, *keys[obj], src, start)
         if reason:
             why[reason] += 1
             model = progress.TABLE if name == "g_module.c" else progress.file_cost(insns, left)
             rel = os.path.relpath(src, build_folder(outdir)).replace(os.sep, "/")
             digest = record.source(src)[0]
-            estimate = times.estimate(rel, digest, opt, model)
+            measured = times.measured(rel, digest, opt)
+            estimate = model if measured is None else measured
             infos[obj] = ladder.Info(src, rel, insns, biggest, False, model, estimate, digest,
-                                     *((own.above, own.header, own.names, own.left) if own else ()))
+                                     *((own.above, own.header, own.names, own.left) if own else ()),
+                                     measured=measured is not None)
             todo.append((src, obj, opt, estimate))
     record.save()   # (the sources' digests: the next look reads only the files that changed)
-    todo.sort(key=lambda t: -t[3])   # the longest first: started last, one would hold up the end
+    # the longest first, once they have been measured: started last, one would hold up the end
+    todo = ladder.longest_first(todo, infos) or todo
     return todo, record, keys, why, infos
 
 
@@ -561,7 +566,7 @@ def game_key(record, src, compiler, headers):
 
 
 def stale_files(outdir):
-    """What compile_dir compiles, in order (the longest first): (source, object, optimisation level,
+    """What compile_dir compiles, in order (plan's): (source, object, optimisation level,
     estimated seconds: what it took last time, else progress.file_cost) of each file whose object is
     missing or not current: compiled from other C, headers or flags, or by another compiler (objcache.py)."""
     return plan(outdir)[0]
@@ -571,6 +576,7 @@ def compile_dir(outdir, jobs, shown=None, steps=None):
     """Compile a module's stale files; `shown`, a progress.Build, follows them. steps: the build's
     ladder.Ladder (tools/ladder.py), else one of its own, whose report is said at the end."""
     import cc
+    ladder.settings()
     times = ladder.Times(build_folder(outdir))
     todo, record, keys, why, infos = plan(outdir, times)
     if objcache.summary(why):
@@ -606,9 +612,11 @@ def compile_dir(outdir, jobs, shown=None, steps=None):
     return not failures
 
 
-def link(dirs, exe, rt_dir=None):
+def link(dirs, exe, rt_dir=None, steps=None):
     """Compile the host runtime and link it with the given module build directories. The
-    runtime's objects go to rt_dir (default: rt beside the exe)."""
+    runtime's objects go to rt_dir (default: rt beside the exe). steps: the build's ladder.Ladder
+    (a runtime file the compiler crashed on is in its report), else one of its own, whose report
+    is said once the runtime is compiled (and written beside the exe)."""
     import cc
     t0 = time.time()
     rt_dir = os.path.abspath(rt_dir or os.path.join(os.path.dirname(exe), "rt"))   # (one spelling: its objects' keys name it)
@@ -656,10 +664,15 @@ def link(dirs, exe, rt_dir=None):
     for _src, obj, _opt in every:   # (as compile_dir: a file that fails to compile leaves no old object)
         if os.path.exists(obj):
             os.remove(obj)
-    failures = []
-    for flags, group in jobs.items():
-        failures += cc.compile_each(group, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]),
-                                    flags=None if flags is None else list(flags))
+    failures, own = [], steps is None
+    steps = steps or ladder.Ladder(progress.level_cost, "clang-cl")
+    try:
+        for flags, group in jobs.items():
+            failures += cc.compile_each(group, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]),
+                                        flags=None if flags is None else list(flags), steps=steps)
+    finally:
+        if own:
+            steps.end(os.path.dirname(os.path.abspath(exe)))
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
@@ -723,6 +736,7 @@ def build_all(exefs, out, jobs, compile_c=True):
     """Every module's C first, then each module's compile, then the link: once the C is there,
     what is left to compile is known, and the progress bar's time left (progress.Build) can say
     how long it takes. compile_c False (--generate-only): the C only."""
+    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
     paths = module_paths(exefs)
     mods = {name: Module(path) for name, path in paths.items()}
     check(exefs, mods)
@@ -766,12 +780,12 @@ def build_all(exefs, out, jobs, compile_c=True):
                 if not compile_dir(targets[name], min(jobs, 16), shown, steps):
                     return False
                 modcache.write_stamp(targets[name], build_ids[name], MODULES[name], name, fp)
+            shown.begin("link")
+            ok = link(list(targets.values()), exe, steps=steps)
+            shown.end("link")
+            return ok
         finally:
             steps.end(out)
-        shown.begin("link")
-        ok = link(list(targets.values()), exe)
-        shown.end("link")
-        return ok
 
 
 def arg(name, default=None):

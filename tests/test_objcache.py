@@ -32,11 +32,12 @@ REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen
 # named by -o or /Fo, as a line naming the source and the rest of the command; a source with "#error"
 # is an error in the code, one with "crash at /O2" makes it crash at /O2 as clang-cl does (and at any
 # other level so named), "crash like clang at -O2" as clang's driver says its compiler crashed,
-# "crash by signal at -O2" by a signal (not on Windows), one with "half-written" leaves half an object
-# and fails. "slow unless optnone on f_<address>" runs (a minute) unless the optnone header given
-# before the file (-include, /FI: tools/ladder.py) names that function, "slow unless O0" unless it
-# is compiled at -O0 or /Od, "slow" always: first it leaves half an object and clang's temporary
-# file, and starts a process of its own, which sleeps too (its id in grandchildren.txt).
+# "crash by signal at -O2" by a signal (not on Windows) once it has written half an object and
+# clang's temporary file, one with "half-written" leaves half an object and fails. "slow unless
+# optnone on f_<address>" runs (a minute) unless the optnone header given before the file (-include,
+# /FI: tools/ladder.py) names that function, "slow unless O0" unless it is compiled at -O0 or /Od,
+# "slow" always: first it leaves half an object and clang's temporary file, and starts a process of
+# its own, which sleeps too (its id in grandchildren.txt). "takes 3 s" compiles in that many seconds.
 # Each run leaves a file of its own in runs/ beside it: "<source> <level>", and one with the whole
 # command and when (commands()). (One shared file would lose lines when two compiles of a parallel
 # build append at once: on Windows, appends aren't atomic.)
@@ -75,15 +76,21 @@ if "crash like clang at " + level in text:
     sys.stderr.write("clang: error: unable to execute command: Segmentation fault: 11\n"
                      "clang: error: clang frontend command failed due to signal (use -v to see invocation)\n")
     sys.exit(254)
+def partial():
+    stem, ext = os.path.splitext(obj)
+    for path in (obj, stem + "-1a2b3c4d" + ext + ".tmp"):
+        with open(path, "w") as f:
+            f.write("half")
 if "crash by signal at " + level in text:
+    partial()
     os.kill(os.getpid(), signal.SIGSEGV)
+takes = re.search(r"takes ([0-9.]+) s", text)
+if takes:
+    time.sleep(float(takes.group(1)))
 wanted = re.search(r"slow unless optnone on (f_[0-9a-f]+)", text)
 if (wanted and wanted.group(1) + "(Cpu *c) __attribute__((optnone, noinline))" not in optnone) or \
         ("slow unless O0" in text and level not in ("-O0", "/Od")) or re.search(r"\bslow\b(?! unless)", text):
-    stem, ext = os.path.splitext(obj)
-    for partial in (obj, stem + "-1a2b3c4d" + ext + ".tmp"):
-        with open(partial, "w") as f:
-            f.write("half")
+    partial()
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     with open(os.path.join(here, "grandchildren.txt"), "a") as f:
         f.write(f"{child.pid}\n")
@@ -563,24 +570,23 @@ class WindowsBuildTests(Folder):
         self.assertIn('FAILED g0001.c', self.said)
         self.assertFalse((self.module / 'g0001.obj').exists())
         self.assertEqual(self.compile()[1], ['g0001.c /O1'])   # (tried again)
-        # stopped during g0000.c's compile (Ctrl+C; g0001.c, the longer, was first): the objects compiled are
-        # kept, g0000's is not
+        # stopped during g0001.c's compile (Ctrl+C): the objects compiled are kept, g0001's is not
         write(self.module / 'g0000.c', '#include "recomp.h"\nint changed;\n')
         write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')
         popen = subprocess.Popen
 
         def interrupted(args, *a, **kw):
-            if any(str(a).endswith('g0000.c') for a in args):
+            if any(str(a).endswith('g0001.c') for a in args):
                 raise KeyboardInterrupt
             return popen(args, *a, **kw)
         with mock.patch.object(subprocess, 'Popen', interrupted), self.assertRaises(KeyboardInterrupt), \
                 contextlib.redirect_stdout(io.StringIO()):
             recomp.compile_dir(str(self.module), 1)
-        self.assertEqual(self.cc.runs(), ['g0001.c /O1'])
+        self.assertEqual(self.cc.runs(), ['g0000.c /O2'])
         recorded = json.loads((self.module / objcache.RECORD).read_text())['objects']
-        self.assertIn('g0001.obj', recorded)
-        self.assertNotIn('g0000.obj', recorded)
-        self.assertEqual(self.compile(), (True, ['g0000.c /O2']))
+        self.assertIn('g0000.obj', recorded)
+        self.assertNotIn('g0001.obj', recorded)
+        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
 
     def test_runtime(self):
         """link's runtime objects: compiled again for a header, the flags (the stamp cflags.txt was) or the compiler."""

@@ -287,8 +287,10 @@ def game_jobs():
             model = progress.TABLE if fname == "g_module.c" else progress.clang_cost(int(insns), own.left if own else int(biggest),
                                                                                      opt, cxx)
             name = key[:-2].replace(os.sep, "/") + ".c"
-            INFOS[obj] = ladder.Info(src, name, int(insns), int(biggest), cxx, model, TIMES.estimate(name, ident, opt, model),
-                                     ident, *((own.above, own.header, own.names, own.left) if own else ()))
+            measured = TIMES.measured(name, ident, opt)
+            INFOS[obj] = ladder.Info(src, name, int(insns), int(biggest), cxx, model, model if measured is None else measured,
+                                     ident, *((own.above, own.header, own.names, own.left) if own else ()),
+                                     measured=measured is not None)
             if why and os.path.exists(obj):
                 print(f"game: {why}: compiling all of it again")
                 why = None
@@ -515,10 +517,11 @@ def new_ladder():
 
 
 def compile_all(jobs, what, compiled=None):
-    """Compile the jobs, the longest first (a game file's estimate, else the biggest source), a crash
-    compiled again and a generated file over its time limit compiled another way (STEPS, else a ladder
-    of its own, whose report is said at the end: tools/ladder.py); compiled(job, level, step) is called
-    for each that compiled (step: the ladder's way, or None)."""
+    """Compile the jobs, biggest first (once a build has measured them, the longest first by what they
+    took: ladder.longest_first), a crash compiled again and a generated file over its time limit
+    compiled another way (STEPS, else a ladder of its own, whose report is said at the end:
+    tools/ladder.py); compiled(job, level, step) is called for each that compiled (step: the ladder's
+    way, or None)."""
     if not jobs:
         print(f"{what}: up to date")
         return True
@@ -530,7 +533,7 @@ def compile_all(jobs, what, compiled=None):
             src = re.findall(r'#include "([^"]+)"', read(src))[-1]
         return os.path.getsize(src)
     # a few files take minutes, and started last they would hold up the end
-    jobs = sorted(jobs, key=lambda job: INFOS[job[1]].estimate if job[1] in INFOS else source_size(job), reverse=True)
+    jobs = ladder.longest_first(jobs, INFOS) or sorted(jobs, key=source_size, reverse=True)
     for job in jobs:
         os.makedirs(os.path.dirname(job[1]), exist_ok=True)
     done, lock = [0], threading.Lock()
@@ -686,6 +689,7 @@ def link():
 
 def main():
     global STEPS
+    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.isfile(os.path.join(SDL3_FRAMEWORK, "Headers", "SDL.h")):
         raise SystemExit(f"SDL3.framework is not in {SDL3_DIR}: Install WindowSmash.command downloads it "

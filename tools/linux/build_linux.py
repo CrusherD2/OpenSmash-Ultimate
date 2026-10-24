@@ -119,9 +119,9 @@ def stale(record, job, inputs, headers, why, info=None):
         return record.entry(inputs, ladder.key_command(command, header), objcache.compiler_id(CLANG), headers)
 
     def key_for(step):
-        return {**key(step.level, step.header), "ladder": step.record()}
+        return ladder.ladder_entry(key(step.level, step.header), step, info.above)
     entry = key(opt, info.header if info else None)
-    reason = ladder.check(record, obj, entry, key_for, info.c) if info else record.check(obj, entry)
+    reason = ladder.check(record, obj, entry, key_for, info.c, info.above) if info else record.check(obj, entry)
     if reason:
         KEYS[obj] = (record, entry, key_for)
         why[reason] += 1
@@ -168,8 +168,9 @@ def game_jobs():
                 job, inputs = (wrapper, obj, opt), [wrapper, src]
             model = progress.TABLE if fname == "g_module.c" else progress.clang_cost(insns, left, opt, cxx)
             rel = os.path.relpath(obj, OUT)[:-2].replace(os.sep, "/") + ".c"
-            info = ladder.Info(src, rel, insns, biggest, cxx, model, TIMES.estimate(rel, digest, opt, model), digest,
-                               *((own.above, own.header, own.names, own.left) if own else ()))
+            measured = TIMES.measured(rel, digest, opt)
+            info = ladder.Info(src, rel, insns, biggest, cxx, model, model if measured is None else measured, digest,
+                               *((own.above, own.header, own.names, own.left) if own else ()), measured=measured is not None)
             if not stale(record, job, inputs, headers["module.h" if fname == "g_module.c" else "recomp.h"], why, info):
                 continue
             jobs.append(job)
@@ -279,8 +280,18 @@ def runtime_jobs():
 
 
 def in_order(jobs):
-    """The longest first (estimate): a few files take minutes, and started last they would hold up the end."""
-    return sorted(jobs, key=estimate, reverse=True)
+    """Biggest first: a few files take minutes, and started last they would hold up the end. Once a build has
+    measured them, the longest first by what they took (ladder.longest_first: compile_times.json)."""
+    measured = ladder.longest_first(jobs, INFOS)
+    if measured:
+        return measured
+
+    def source_size(job):   # (a C++ wrapper's size is that of the generated file it includes)
+        src = job[0]
+        if src.endswith("_cxx.cpp"):
+            src = re.findall(r'#include "([^"]+)"', open(src).read())[-1]
+        return os.path.getsize(src)
+    return sorted(jobs, key=source_size, reverse=True)
 
 
 def forget(jobs):
@@ -427,6 +438,7 @@ def dxvk_libs():
 
 def main():
     global STEPS
+    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")
