@@ -5,6 +5,7 @@
  * runtime/debug_mode.c, os_threads.c, nnsdk.c); hle_fight_test.c runs them on the game. Guest
  * structures are reached through host pointers here, little-endian like the guest. */
 #pragma once
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -269,10 +270,18 @@ static inline int dm_next(DebugMatch *m, FILE *list) {
 }
 
 /* ---- SSBU_DEBUG_END --------------------------------------------------------------------- */
-/* "<n>s": n seconds of fight, n * 60 frames; "<n>": n frames. 0: off (unset, not above 0). */
+/* "<n>s": n seconds of fight, n * 60 frames; "<n>": n frames (an s right after the number, or
+ * after spaces, makes it seconds; anything else after it is not read). 0: off (unset, under one
+ * frame). More than a long long holds: as many as it holds, a run that does not end (rather
+ * than a cast's undefined result, which on x86-64 ends it at once). */
 static inline long long dm_end_parse(const char *text) {
-    if (!text || !(atof(text) > 0)) return 0;
-    return (long long)(strchr(text, 's') ? atof(text) * 60.0 : atof(text));
+    if (!text) return 0;
+    char *end;
+    double n = strtod(text, &end);
+    while (*end == ' ') end++;
+    if (*end == 's') n *= 60.0;
+    if (!(n >= 1)) return 0;
+    return n >= 9.2e18 ? LLONG_MAX : (long long)n;
 }
 
 /* One frame shown: the fight frames so far, counted while the game's ready-go flag is up and

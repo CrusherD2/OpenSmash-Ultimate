@@ -110,7 +110,7 @@ F 1200 e 0 st 1a mot 7fb997a80 mf 41200000 x c1a40000 y 00000000 dmg 41a80000 rn
 - `H`: a running FNV-1a over everything logged so far, with the generators' whole hash. Two logs that agree on `H` at a line agree on every line before it.
 - The part in brackets has the same numbers, for reading.
 
-The line, its fields and their order are ssbu-recomp's, so logs of both can be compared. Lines are written out every 64 fight frames, and when `SSBU_DEBUG_END` ends the run. A run stopped another way can leave its last line cut; [`fight_hash_diff.py`](#comparing-two-logs) leaves that line out. Every 300 fight frames of the first fighter, the log has a line with each generator's call count, how many fight frames each poll of player 1 saw, and how many dropped refreshes the game reported.
+The line, its fields and their order are ssbu-recomp's, so logs of both can be compared. Lines are written out to the file every 64 fight frames, and when `SSBU_DEBUG_END` ends the run. To the standard output, each is written out as it is made, so that no other line of the log lands in the middle of one (on Windows the standard output is not line-buffered). A run stopped another way can leave its last line cut; [`fight_hash_diff.py`](#comparing-two-logs) leaves that line out. Every 300 fight frames of the first fighter, the log has a line with each generator's call count, how many fight frames each poll of player 1 saw, and how many dropped refreshes the game reported.
 
 The first call of a fighter's frame line in the process is the **first battle frame**. The log says so, with the generators' state before it, and `SSBU_SEQ`'s mark `fight` is raised there. Up to 8 fighters are followed: the first 8 the frame line sees in the process. The log is meant for one fight per process: whether a later fight's fighters count as new ones has not been looked at.
 
@@ -230,7 +230,7 @@ The log then has the `[seq]` lines of each step, the `[display] speed:` line eve
 
 ## Comparing two logs
 
-[`tools/dev/fight_hash_diff.py`](../tools/dev/fight_hash_diff.py) compares two hash logs over the lines both have, since two runs end a few frames apart. It prints the first line that differs, with its frame, the fighter's entry id, the fields that differ and the lines around it. Or it says how many lines are the same:
+[`tools/dev/fight_hash_diff.py`](../tools/dev/fight_hash_diff.py) compares two hash logs over the lines both have, since two runs end a few frames apart. Each line is paired with the other log's line of the same frame and fighter, so a line one log lacks moves nothing after it. It prints the first line that differs, with its frame, the fighter's entry id, the fields that differ and the lines around it. Or it says how many lines are the same:
 
 ```sh
 python tools/dev/fight_hash_diff.py run1.fh.txt run2.fh.txt
@@ -240,7 +240,7 @@ python tools/dev/fight_hash_diff.py run1.fh.txt run2.fh.txt
 run1.fh.txt vs run2.fh.txt: first difference at line 2417 of 3214 / 3208: frame 1209 fighter e 1: fields x rngcalls rng
 ```
 
-Only whole hash lines are read, so a cut last line and the game's other output (with `SSBU_FIGHT_HASH=1`) are left out. The exit status is 0 when the logs are the same, 1 when a line differs, and 2 when a log is missing or has no hash lines.
+Only whole hash lines are read, so a cut last line and the game's other output (with `SSBU_FIGHT_HASH=1`) are left out; where a log lacks lines the other has before its end, the tool says how many it left out. When only `H` differs, what differs is something the lines don't show: the generators' whole hash (a line has it folded to 32 bits), on that line or one before it, or the order of the lines before it. The exit status is 0 when the logs are the same, 1 when a line differs (or no frame and fighter is in both), and 2 when a log is missing or has no hash lines.
 
 ## The Phase 2 gate: the fight hash across two runs
 

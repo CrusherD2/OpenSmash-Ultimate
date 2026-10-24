@@ -3,13 +3,14 @@
  * mapped at the game addresses it reads (game_addr.h), as the runtime maps the game. The getters
  * answer from made-up fighters. macOS and Linux (the runtime's POSIX headers); not Windows.
  *
- *   clang -I runtime/macos/include -I runtime/linux/include -I runtime tools/dev/fightruntest.c \
+ *   clang -pthread -I runtime/macos/include -I runtime/linux/include -I runtime tools/dev/fightruntest.c \
  *         runtime/hle_fight_test.c -o fightruntest && ./fightruntest unset
  *
  * One scenario a run, its switches set by the caller (tests/test_fight_test.py): unset, hash,
- * det, off, match, list, seed, end. Prints "<n> checks, 0 failed" (and the numbers the test works
+ * stdout, det, off, match, list, seed, race, end. Prints "<n> checks, 0 failed" (and the numbers the test works
  * out on its own) and exits 0; "end" exits through SSBU_DEBUG_END's own exit. */
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -293,6 +294,24 @@ static void hash(void) {
     fflush(NULL);
 }
 
+/* SSBU_FIGHT_HASH=1 with the standard output fully buffered, as Windows has it written to a file
+ * (here a buffer shorter than a line, so that each line overflows it), and a line of the log on
+ * the standard error after each hash line (the caller sends both to one pipe, as 2>&1): each hash
+ * line is out whole before the log's next line. */
+static void hash_stdout(void) {
+    static char buffer[64];
+    setvbuf(stdout, buffer, _IOFBF, sizeof buffer);
+    test_fight_start();
+    for (int f = 1; f <= 3; f++) {
+        fighter_frame(0, f);
+        fighter_frame(1, f);
+        for (int i = 0; i < 2; i++) {
+            frame_line(i);
+            fprintf(stderr, "[display] speed: a line of the log after a hash line\n");
+        }
+    }
+}
+
 /* SSBU_DETERMINISTIC=1: the generators' fixed state, the report cleared, the steps. */
 static void det(void) {
     test_fight_start();
@@ -409,6 +428,34 @@ static void seed(void) {
     printf("\n");
 }
 
+/* SSBU_FIXED_SEED: the four clock reads from many threads at once, as the game reads the tick:
+ * the log has each one's first time once. */
+enum { RACERS = 16 };
+static volatile int racers_ready, race_go;
+static void *racer(void *unused) {
+    (void)unused;
+    __atomic_add_fetch(&racers_ready, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&race_go, __ATOMIC_ACQUIRE)) {}
+    int said = 1;
+    for (int k = 0; k < 4; k++) said &= test_fixed_clock(k == 0 ? GAME_ADDR(CLOCK_READ_1) : k == 1 ? GAME_ADDR(CLOCK_READ_2) :
+                                                         k == 2 ? GAME_ADDR(CLOCK_READ_3) : GAME_ADDR(CLOCK_READ_4));
+    return said ? racer : NULL;
+}
+static void race(void) {
+    test_fight_start();
+    pthread_t t[RACERS];
+    for (int i = 0; i < RACERS; i++) CHECK(!pthread_create(&t[i], NULL, racer, NULL), "thread %d", i);
+    while (__atomic_load_n(&racers_ready, __ATOMIC_ACQUIRE) < RACERS) {}
+    __atomic_store_n(&race_go, 1, __ATOMIC_RELEASE);
+    int all = 1;
+    for (int i = 0; i < RACERS; i++) {
+        void *r = NULL;
+        pthread_join(t[i], &r);
+        all &= r == racer;
+    }
+    CHECK(all, "every thread's four clock reads: the constant");
+}
+
 /* SSBU_DEBUG_END: frames shown come from the exit's own waits; it ends the run. */
 static int shown_now;
 static void end_tick(void) {
@@ -436,7 +483,8 @@ static void end_run(void) {
 
 int main(int argc, char **argv) {
     static const struct { const char *name; void (*run)(void); } SCENARIOS[] = {
-        {"unset", unset}, {"hash", hash}, {"det", det}, {"off", off}, {"match", match}, {"list", list}, {"seed", seed}, {"end", end_run},
+        {"unset", unset}, {"hash", hash}, {"stdout", hash_stdout}, {"det", det}, {"off", off}, {"match", match}, {"list", list},
+        {"seed", seed}, {"race", race}, {"end", end_run},
     };
     map_guest();
     make_game();
@@ -446,6 +494,6 @@ int main(int argc, char **argv) {
             printf("%d checks, %d failed\n", checks, failures);
             return failures != 0;
         }
-    printf("usage: fightruntest unset|hash|det|off|match|list|seed|end\n");
+    printf("usage: fightruntest unset|hash|stdout|det|off|match|list|seed|race|end\n");
     return 2;
 }

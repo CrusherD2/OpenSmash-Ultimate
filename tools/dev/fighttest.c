@@ -180,7 +180,11 @@ static void test_list(void) {
 /* ---- SSBU_DEBUG_END ---------------------------------------------------------------------- */
 static void test_end(void) {
     CHECK(dm_end_parse("2s") == 120 && dm_end_parse("1.5s") == 90 && dm_end_parse("90") == 90, "seconds of fight are 60 frames each");
-    CHECK(dm_end_parse(NULL) == 0 && dm_end_parse("") == 0 && dm_end_parse("0") == 0 && dm_end_parse("-3s") == 0 && dm_end_parse("x") == 0, "off");
+    CHECK(dm_end_parse(NULL) == 0 && dm_end_parse("") == 0 && dm_end_parse("0") == 0 && dm_end_parse("-3s") == 0 && dm_end_parse("x") == 0 &&
+          dm_end_parse("0.5") == 0 && dm_end_parse("nan") == 0, "off");
+    CHECK(dm_end_parse("5 frames") == 5 && dm_end_parse("5 s") == 300 && dm_end_parse("5sec") == 300, "seconds: an s right after the number");
+    CHECK(dm_end_parse("inf") == LLONG_MAX && dm_end_parse("1e30") == LLONG_MAX && dm_end_parse("1e19s") == LLONG_MAX &&
+          dm_end_parse("9.3e18") == LLONG_MAX && dm_end_parse("1e18") == (long long)1e18, "past a long long: a run that does not end");
     DebugEnd d = {0};
     int ended;
     CHECK(dm_end_frame(&d, 0, &ended) == 0 && !ended, "no fight yet");

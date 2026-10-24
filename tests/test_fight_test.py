@@ -247,7 +247,7 @@ class RuntimeTests(unittest.TestCase):
         cls.addClassCleanup(shutil.rmtree, cls.dir, ignore_errors=True)
         cls.exe = os.path.join(cls.dir, 'fightruntest')
         rt = ROOT / 'runtime'
-        r = subprocess.run([POSIX_CLANG, '-O1', '-Wall', '-Werror', '-I', str(rt / 'macos' / 'include'), '-I', str(rt / 'linux' / 'include'),
+        r = subprocess.run([POSIX_CLANG, '-O1', '-Wall', '-Werror', '-pthread', '-I', str(rt / 'macos' / 'include'), '-I', str(rt / 'linux' / 'include'),
                             '-I', str(rt), str(ROOT / 'tools' / 'dev' / 'fightruntest.c'), str(rt / 'hle_fight_test.c'), '-o', cls.exe],
                            capture_output=True, text=True)
         if r.returncode:
@@ -276,6 +276,17 @@ class RuntimeTests(unittest.TestCase):
     def test_fight_hash_on_stdout(self):
         r = self.run_scenario('hash', SSBU_FIGHT_HASH='1')
         self.assertEqual([line for line in r.stdout.splitlines() if line.startswith('F ')], made_up_hash_lines(3, 2))
+
+    def test_fight_hash_on_stdout_line_by_line(self):
+        """Written to a file, the standard output is fully buffered on Windows: each hash line goes
+        out whole before the next line of the log, which goes to the same file (2>&1)."""
+        env = {k: v for k, v in os.environ.items() if not k.startswith('SSBU_')}
+        env['SSBU_FIGHT_HASH'] = '1'
+        r = subprocess.run([self.exe, 'stdout'], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        lines = r.stdout.splitlines()
+        self.assertEqual([line for line in lines if line.startswith('F ')], made_up_hash_lines(3, 2), r.stdout)
+        self.assertEqual([line[:2] for line in lines if line.startswith(('F ', '[display]'))], ['F ', '[d'] * 6, r.stdout)
 
     def test_fight_hash_0_is_off(self):
         r = self.run_scenario('unset', SSBU_FIGHT_HASH='0', SSBU_DETERMINISTIC='0')
@@ -322,6 +333,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(f'bytes {(s.take(21) + s.take(3)).hex()}\n', r.stdout)
         clocks = re.findall(r'^\[fight\] fixed seed: the clock read at ([0-9a-f]+) gave the constant$', r.stderr, re.M)
         self.assertEqual(clocks, ['7100047d20', '7100138534', '710366d7a0', '710366d938'], 'each once, the first time')
+
+    def test_fixed_seed_from_many_threads(self):
+        r = self.run_scenario('race', SSBU_FIXED_SEED='42')
+        clocks = re.findall(r'^\[fight\] fixed seed: the clock read at ([0-9a-f]+) gave the constant$', r.stderr, re.M)
+        self.assertEqual(sorted(clocks), ['7100047d20', '7100138534', '710366d7a0', '710366d938'], 'each once')
 
     def test_debug_end(self):
         """A fight from frame 3 to 52, then the next from 56: 120 fight frames are the 120th frame of
