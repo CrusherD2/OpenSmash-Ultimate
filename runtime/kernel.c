@@ -197,9 +197,11 @@ static void query_memory(u64 info, u64 addr) {
     st64(info + 32, 0);
 }
 
+static int map_guarded(u64 addr, u64 size);   /* (see "memory mappings") */
+
 /* 8 bytes of guest memory at addr if a region holds them: 0 if that memory is not mapped (hle_fiber.c
- * looks into fiber objects the game may have freed). Under the lock, so it cannot be unmapped
- * between the look and the read. */
+ * looks into fiber objects the game may have freed), or is a mapping's source SSBU_MAP_GUARD made
+ * inaccessible. Under the lock, so it cannot be unmapped between the look and the read. */
 int kernel_read64(u64 addr, u64 *out) {
     int ok = 0;
     EnterCriticalSection(&klock);
@@ -209,7 +211,7 @@ int kernel_read64(u64 addr, u64 *out) {
         if (regions[mid].base + regions[mid].size <= addr) i = mid + 1;
         else hi = mid;
     }
-    if (i < region_count && regions[i].base <= addr && addr + 8 <= regions[i].base + regions[i].size && (regions[i].perm & 1)) {
+    if (i < region_count && regions[i].base <= addr && addr + 8 <= regions[i].base + regions[i].size && (regions[i].perm & 1) && !map_guarded(addr, 8)) {
         *out = ld64(addr);
         ok = 1;
     }
@@ -232,7 +234,10 @@ int kernel_read64(u64 addr, u64 *out) {
  * read what the copy left there or write what the unmap overwrites. Guarded: a source that is
  * read-write memory in the memory map, outside the alias area (where the write watch sets the
  * pages' protection itself, on macOS and on Linux before 6.7); on macOS only the 16 KiB host
- * pages wholly inside it (a host page it shares with other memory stays as it is). */
+ * pages wholly inside it (a host page it shares with other memory stays as it is). svcQueryMemory
+ * reports the source as without the switch; kernel_read64 treats the guarded pages as not mapped
+ * (it would fault on them). A system call writing into them (a file read, say) fails with an
+ * error rather than faulting. */
 #ifdef __APPLE__
 #define HOST_PAGE 0x4000ull
 #else
@@ -266,6 +271,13 @@ static void guard_source(u32 i) {
         return;
     guarded[i].lo = lo; guarded[i].hi = hi;
     maps_guarded++;
+}
+
+/* Whether a guarded source has any of [addr, addr + size) (kernel_read64 must not read there). */
+static int map_guarded(u64 addr, u64 size) {
+    for (u32 i = 0; map_guard && i < 1024; i++)
+        if (guarded[i].hi && addr < guarded[i].hi && guarded[i].lo < addr + size) return 1;
+    return 0;
 }
 
 static void unguard_source(u32 i) {

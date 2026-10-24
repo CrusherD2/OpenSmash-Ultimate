@@ -3,9 +3,9 @@ tools/dev/maptest.c, with no game: a mapping's pages at its destination and back
 the unmap, the destination freed and the renderer told, mappings side by side and from neighbouring
 sources, more mappings than slots, sources in the alias area and in a module, the status line's
 counts; with SSBU_MAP_GUARD=1 the source also inaccessible while mapped (on macOS its 16 KiB pages
-wholly inside it), and only where the switch says; without it (unset, or another value) accessible,
-as before. Built with the platform's compiler: clang-cl on Windows (as tests/test_clock.py builds
-clocktest.c), clang with the platform layer elsewhere (runtime/linux/win32.c, with runtime/macos/'s
+wholly inside it), and only where the switch says, and kernel_read64 refusing it; without it (unset,
+or another value) accessible, as before. Built with the platform's compiler: clang-cl on Windows (as
+tests/test_clock.py builds clocktest.c), clang with the platform layer elsewhere (runtime/linux/win32.c, with runtime/macos/'s
 memory and platform parts on macOS; the Windows types from runtime/macos/include on both). Skipped
 where there is no such compiler, and on hosts the platform layer is not written for (Linux on
 x86-64 and macOS on Apple silicon only, as the game)."""
@@ -70,7 +70,7 @@ class KernelMapMemoryTests(unittest.TestCase):
 
     def test_copies(self):
         out = self.maptest()
-        self.assertRegex(out, r'\[status\] memory mappings: 3014 made \(\d+\.\d MiB in all\), 0 mapped now \(at most 2 at once, of 1024\); \d+\.\d ms copying\n')
+        self.assertRegex(out, r'\[status\] memory mappings: 3016 made \(\d+\.\d MiB in all\), 0 mapped now \(at most 2 at once, of 1024\); \d+\.\d ms copying\n')
         self.assertNotIn('SSBU_MAP_GUARD', out)
 
     def test_guard(self):

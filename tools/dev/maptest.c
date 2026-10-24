@@ -13,14 +13,17 @@
  *       neighbouring sources, unmapped one at a time; 3000 mappings made and unmapped in turn
  *       (more than the 1024 slots); a source in the alias area, its copy-back seen by the write
  *       watch; sources in a made-up module's code and data; an unmap of nothing mapped; the
- *       status line's counts; the source accessible while mapped, as before
+ *       status line's counts and the copies' time; the source accessible while mapped, as before,
+ *       and kernel_read64 reading it
  *   SSBU_MAP_GUARD=1 maptest guard
  *       the same, with the source inaccessible while mapped (on macOS its 16 KiB pages wholly
  *       inside it), its neighbours accessible and unchanged, and the source accessible again, with
- *       the writes, after the unmap; of two neighbouring sources, unmapping one leaves the other
- *       guarded; a source in the alias area, in a module's code, or across its code and data left
- *       accessible, one in its data guarded; the unmap of an unguarded mapping leaving guarded a
- *       source that its slot's earlier mapping had guarded (and another mapping guards now)
+ *       the writes, after the unmap; kernel_read64 refusing the source (it would fault) while it is
+ *       mapped; of two neighbouring sources, unmapping one leaves the other guarded; a source in the
+ *       alias area, in a module's code, across its code and data, from its data into a stretch the
+ *       memory map does not have, or into read-only memory left accessible, one in its data
+ *       guarded; the unmap of an unguarded mapping leaving guarded a source that its slot's earlier
+ *       mapping had guarded (and another mapping guards now)
  *   (SSBU_MAP_GUARD unset, or another value: the first)
  *
  * Exit code 0 when every check passes. tests/test_kernel_map_memory.py builds and runs both. */
@@ -64,10 +67,10 @@ static int failures, checks;
 
 /* ---- is a guest page accessible? (a read, and the byte written back) ------------------------ */
 #ifdef _WIN32
+static __declspec(noinline) void touch(volatile u8 *p) { *p = *p; }
 static int accessible(u64 a) {
     __try {
-        volatile u8 *p = G2H(a);
-        *p = *p;
+        touch(G2H(a));   /* (a call of its own: clang-cl catches a fault inside __try only in a callee; in place, the __try is compiled away) */
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
@@ -144,11 +147,15 @@ static void one_mapping(Cpu *c) {
           "svcQueryMemory at the destination: state %#x, %#llx + %#llx", ld32(INFO + 16), (unsigned long long)base, (unsigned long long)len);
     CHECK(closed(src, size) == (guard ? size / PAGE : 0), "%u of the source's 16 pages inaccessible while mapped", closed(src, size));
     CHECK(!closed(src - PAGE, PAGE) && !closed(src + size, PAGE), "the source's neighbours accessible");
+    u64 v = 0;   /* (kernel_read64, hle_fiber.c's look into memory: a guarded source is not there) */
+    CHECK(kernel_read64(src + 0x100, &v) == !guard && kernel_read64(src - 4, &v) == !guard, "kernel_read64 of the source%s", guard ? " refused" : "");
+    CHECK(kernel_read64(src - 8, &v) && v == word(PAGE - 8, 7), "kernel_read64 of its neighbour");
     CHECK(!closed(dst, size), "the destination accessible");
     fill(dst, size, 2);
     CHECK(holds(dst, size, 2), "written at the destination, read back there");
     CHECK(unmap(c, dst, src, size) == R_OK, "svcUnmapMemory");
     CHECK(!closed(src, size) && holds(src, size, 2), "the source accessible again, with what was written at the destination");
+    CHECK(kernel_read64(src + 0x100, &v) && v == word(0x100, 2), "kernel_read64 of the source after the unmap");
     CHECK(holds(src - PAGE, PAGE, 7) && holds(src + size, PAGE, 8), "the source's neighbours unchanged");
     CHECK(query(c, dst, &base, &len) == GM_FREE, "svcQueryMemory at the destination after the unmap: state %#x", ld32(INFO + 16));
     CHECK(closed(dst, size) == size / PAGE, "the destination decommitted (%u of 16 pages inaccessible)", closed(dst, size));
@@ -265,22 +272,27 @@ static void alias_source(Cpu *c) {
 }
 
 /* A source in a module's image (a static stack in its .bss, say): guarded in its data, which the memory
- * map has as read-write, not in its code, nor across the two. */
+ * map has as read-write, not where any of it is not: in its code, across code and data, from data
+ * into a stretch the memory map does not have (committed, so the copy can read it) and on into more
+ * data, or from data into read-only memory. */
 #define MOD_IMAGE 0x7100000000ull
 static void module_source(Cpu *c) {
-    if (VirtualAlloc(G2H(MOD_IMAGE), 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != G2H(MOD_IMAGE)) { CHECK(0, "a module image at %#llx", MOD_IMAGE); return; }
+    if (VirtualAlloc(G2H(MOD_IMAGE), 0x60000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != G2H(MOD_IMAGE)) { CHECK(0, "a module image at %#llx", MOD_IMAGE); return; }
     kernel_add_region(MOD_IMAGE, 0x20000, GM_CODE, 5);                   /* (as the loader has them) */
     kernel_add_region(MOD_IMAGE + 0x20000, 0x20000, GM_CODE_DATA, 3);
-    static const struct { u64 src; u32 pages; const char *what; } cases[] = {
-        {MOD_IMAGE + 0x28000, 8, "data"}, {MOD_IMAGE + 0x8000, 0, "code"}, {MOD_IMAGE + 0x1C000, 0, "code and data"},
+    kernel_add_region(MOD_IMAGE + 0x50000, 0x8000, GM_CODE_DATA, 3);    /* (after a gap: another module's, say) */
+    kernel_add_region(MOD_IMAGE + 0x58000, 0x8000, GM_CODE, 1);
+    static const struct { u64 src, size; u32 pages; const char *what; } cases[] = {
+        {MOD_IMAGE + 0x28000, 0x8000, 8, "data"}, {MOD_IMAGE + 0x8000, 0x8000, 0, "code"}, {MOD_IMAGE + 0x1C000, 0x8000, 0, "code and data"},
+        {MOD_IMAGE + 0x3C000, 0x18000, 0, "data, a gap and data"}, {MOD_IMAGE + 0x54000, 0x8000, 0, "data and read-only memory"},
     };
-    for (u32 k = 0; k < 3; k++) {
-        u64 src = cases[k].src, dst = DST + 0x800000 + k * 0x10000;
-        fill(src, 0x8000, 51 + k);
-        CHECK(map(c, dst, src, 0x8000) == R_OK && holds(dst, 0x8000, 51 + k), "a source in a module's %s mapped", cases[k].what);
-        CHECK(closed(src, 0x8000) == (guard ? cases[k].pages : 0), "%u pages of a source in a module's %s inaccessible", closed(src, 0x8000), cases[k].what);
-        fill(dst, 0x8000, 61 + k);
-        CHECK(unmap(c, dst, src, 0x8000) == R_OK && !closed(src, 0x8000) && holds(src, 0x8000, 61 + k), "unmapped, the source with the writes");
+    for (u32 k = 0; k < 5; k++) {
+        u64 src = cases[k].src, size = cases[k].size, dst = DST + 0x800000 + k * 0x20000;
+        fill(src, size, 51 + k);
+        CHECK(map(c, dst, src, size) == R_OK && holds(dst, size, 51 + k), "a source in a module's %s mapped", cases[k].what);
+        CHECK(closed(src, size) == (guard ? cases[k].pages : 0), "%u pages of a source in a module's %s inaccessible", closed(src, size), cases[k].what);
+        fill(dst, size, 61 + k);
+        CHECK(unmap(c, dst, src, size) == R_OK && !closed(src, size) && holds(src, size, 61 + k), "unmapped, the source with the writes");
     }
 }
 
@@ -313,10 +325,11 @@ int main(int argc, char **argv) {
     module_source(c);
     int before = told;
     CHECK(unmap(c, DST + 0x900000, SRC, 0x4000) == R_OK && told == before, "an unmap of nothing mapped: nothing done");
-    CHECK(maps_made == 3014 && maps_live == 0 && maps_peak == 2 &&
-          map_bytes == 0x10000 * 2 + 0x9000 + 0xB000 + 0x13000 + 3000 * 0x4000 + 0x8000 * 2 + 0x4000 * 2 + 0x8000 * 3,
+    CHECK(maps_made == 3016 && maps_live == 0 && maps_peak == 2 &&
+          map_bytes == 0x10000 * 2 + 0x9000 + 0xB000 + 0x13000 + 3000 * 0x4000 + 0x8000 * 2 + 0x4000 * 2 + 0x8000 * 4 + 0x18000,
           "the counts: %llu made, %u live, at most %u, %llu bytes", (unsigned long long)maps_made, maps_live, maps_peak, (unsigned long long)map_bytes);
     CHECK(maps_guarded == (guard ? 3010 : 0), "%llu sources guarded", (unsigned long long)maps_guarded);
+    CHECK(map_copy_ns > 0, "the copies' time counted (%llu ns)", (unsigned long long)map_copy_ns);
     kernel_map_status();
     printf("%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
