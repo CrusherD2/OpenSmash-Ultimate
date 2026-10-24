@@ -87,6 +87,9 @@ class Reading(unittest.TestCase):
 
     def test_what_stops_the_build(self):
         for source, why in (('HLE_WRAP_EXPORT(nn-a) {}\n', 'is not'),
+                            ('HLE_WRAP_EXPORT( nn_a ) {}\n', 'is not'),
+                            ('HLE_WRAP_EXPORT(7100001000) {}\n', 'is not'),   # (not a C name: HLE_WRAP's own)
+                            ('HLE_WRAP_EXPORT(café) {}\n', 'is not'),
                             ('HLE_WRAP_EXPORT(nn_a) {}\nHLE_WRAP_EXPORT(nn_a) {}\n', 'wrapped twice'),
                             ('HLE(nn_a) {}\nHLE_WRAP_EXPORT(nn_a) {}\n', 'both replaced'),
                             ('/* signature: 3 words, sha256 0123 */\nHLE_WRAP_EXPORT(nn_a) {}\n', 'not in the form'),
@@ -94,6 +97,26 @@ class Reading(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(SystemExit) as e:
                 self.wraps(source)
             self.assertIn(why, str(e.exception))
+
+    def test_a_use_it_would_not_read_stops_the_build(self):
+        """Each of these compiles, and the function would stay unwrapped without a word: an
+        export wrap names no module's function, so nothing fails to link either."""
+        for source in ('HLE_WRAP_EXPORT (nn_a) {}\n', '  HLE_WRAP_EXPORT(nn_a) {}\n', 'static HLE_WRAP_EXPORT(nn_a) {}\n',
+                       'HLE_WRAP (7100001000) {}\n', '\tHLE_WRAP(7100001000) {}\n', 'int x; HLE_WRAP(7100001000) {}\n',
+                       'HLE_WRAP_EXPORT\n(nn_a) {}\n', '/*\nHLE_WRAP_EXPORT(nn_a) {}\n*/\n',
+                       'HLE_WRAP_EXPORT(nn_b) {}\n#if 0 /* x */\n HLE_WRAP_EXPORT(nn_a) {}\n#endif\n'):
+            with self.subTest(source=source), self.assertRaises(SystemExit) as e:
+                self.wraps(source)
+            self.assertIn('at the start of a line, outside comments', str(e.exception))
+        # what is no use of one: comments and strings that only mention it
+        self.assertEqual(self.wraps('/* HLE_WRAP_EXPORT(nn_x) wraps... */\n// HLE_WRAP(7100002000) {}\n'
+                                    'const char *s = "HLE_WRAP_EXPORT /* (";\nHLE_WRAP_EXPORT(nn_a) {}\n'
+                                    "char q = '\"'; /* HLE_WRAP(7100003000) */\nHLE_WRAP(7100001000) {}\n"),
+                         ({0x7100001000: None}, {'nn_a': None}))
+
+    def test_in_the_order_of_the_sources(self):
+        self.assertEqual(list(self.wraps('HLE_WRAP_EXPORT(nn_b) {}\nHLE_WRAP_EXPORT(nn_a) {}\nHLE_WRAP_EXPORT(nn_c) {}\n')[1]),
+                         ['nn_b', 'nn_a', 'nn_c'])
 
     def test_the_names_are_part_of_the_tools_fingerprint(self):
         def fingerprint(source):
@@ -103,6 +126,9 @@ class Reading(unittest.TestCase):
         self.assertNotEqual(fingerprint('HLE(nn_b) {}\nHLE_WRAP_EXPORT(nn_a) {}\n'), plain)
         self.assertNotEqual(fingerprint('HLE(nn_b) {}\nHLE_WRAP_EXPORT(nn_c) {}\n'),
                             fingerprint('HLE(nn_b) {}\nHLE_WRAP_EXPORT(nn_a) {}\n'))
+        # (their order too: the order of the wrappers of a function exported under both)
+        self.assertNotEqual(fingerprint('HLE_WRAP_EXPORT(nn_a) {}\nHLE_WRAP_EXPORT(nn_c) {}\n'),
+                            fingerprint('HLE_WRAP_EXPORT(nn_c) {}\nHLE_WRAP_EXPORT(nn_a) {}\n'))
 
 
 class Resolving(unittest.TestCase):
@@ -128,13 +154,28 @@ class Resolving(unittest.TestCase):
             self.resolve(f'{comment}\nHLE_WRAP_EXPORT({NAME}) {{}}\n', [export(NAME, 0x40)], changed)
         self.assertIn('does not begin as its signature says', str(e.exception))
 
+    def test_one_function_under_several_wrapped_names_has_each_wrapper(self):
+        """(An alias, or identical code folded into one: nnosGetSystemTick and nn::os::GetSystemTick
+        could be one function.) The first in the sources is the one callers reach."""
+        exports = [export('nn_alias', 0x40), export(NAME, 0x40), export('nn_third', 0x40)]
+        self.assertEqual(self.resolve(f'HLE_WRAP_EXPORT({NAME}) {{}}\nHLE_WRAP_EXPORT(nn_alias) {{}}\n', exports),
+                         {0x40: ('wrap', f'hle_wrap_{NAME}', 'export', 'hle_wrap_nn_alias')})
+        self.assertEqual(self.resolve(f'HLE_WRAP_EXPORT(nn_third) {{}}\nHLE_WRAP_EXPORT(nn_alias) {{}}\n'
+                                      f'HLE_WRAP_EXPORT({NAME}) {{}}\n', exports),
+                         {0x40: ('wrap', 'hle_wrap_nn_third', 'export', 'hle_wrap_nn_alias', f'hle_wrap_{NAME}')})
+        # each name's signature is checked against the one function
+        funcs = {0x40: WORDS}
+        comment = recomp.signature_comment(recomp.signature(fake_module(funcs, []), 0x40, 4 * len(WORDS)))
+        with self.assertRaises(SystemExit) as e:
+            self.resolve(f'{comment}\nHLE_WRAP_EXPORT({NAME}) {{}}\n/* signature: 2 words, sha256 0123456789abcdef */\n'
+                         'HLE_WRAP_EXPORT(nn_alias) {}\n', [export(NAME, 0x40, 44), export('nn_alias', 0x40, 44)], funcs)
+        self.assertIn('HLE_WRAP_EXPORT(nn_alias): the function does not begin as its signature says', str(e.exception))
+
     def test_what_stops_the_build(self):
         source = f'HLE_WRAP_EXPORT({NAME}) {{}}\n'
         for exports, why, extra in (([export(NAME, 0x40, info=0x11)], 'not as a function', ''),
                                     ([export(NAME, 0x44)], 'no function starts', ''),
-                                    ([export(NAME, 0x40), export('nn_alias', 0x40)], 'both replaced', 'HLE(nn_alias) {}\n'),
-                                    ([export(NAME, 0x40), export('nn_alias', 0x40)], 'wrapped already',
-                                     'HLE_WRAP_EXPORT(nn_alias) {}\n')):
+                                    ([export(NAME, 0x40), export('nn_alias', 0x40)], 'both replaced', 'HLE(nn_alias) {}\n')):
             with self.subTest(why=why), self.assertRaises(SystemExit) as e:
                 self.resolve(source + extra, exports)
             self.assertIn(why, str(e.exception))
@@ -154,6 +195,16 @@ class Resolving(unittest.TestCase):
         table = recomp.module_table(fake_module(M1_FUNCS, [export(NAME, 0x40)]), 'm1', M1, sorted(sizes(M1_FUNCS).items()), set())[0]
         self.assertIn('{0x7100000040ull, f_7100000040},', table)
         self.assertNotIn('_orig', table)
+
+    def test_lifted_several_wrappers_one_inside_the_other(self):
+        forward = {0x40: ('wrap', 'hle_wrap_nn_a', 'export', 'hle_wrap_nn_b', 'hle_wrap_nn_c')}
+        text = lift.Lifter(fake_module(M1_FUNCS, []).image, set(M1_FUNCS), forward=forward).lift_function(0x40, 8)[0]
+        self.assertIn('void hle_wrap_nn_a(Cpu *c, GuestFn *orig);\nvoid hle_wrap_nn_b(Cpu *c, GuestFn *orig);\n'
+                      'void hle_wrap_nn_c(Cpu *c, GuestFn *orig);\nGuestFn f_7100000040_orig;\n'
+                      'static void f_7100000040_w2(Cpu *c) { hle_wrap_nn_c(c, f_7100000040_orig); }\n'
+                      'static void f_7100000040_w1(Cpu *c) { hle_wrap_nn_b(c, f_7100000040_w2); }\n'
+                      'void f_7100000040(Cpu *c) { hle_wrap_nn_a(c, f_7100000040_w1); }\n', text)
+        self.assertIn('void f_7100000040_orig(Cpu *c)', text)
 
 
 HARNESS = r'''
@@ -199,12 +250,58 @@ int main(void) {
 '''
 
 
+# Module 1 again, its W exported under two names, each wrapped: both wrappers run, the first in
+# the sources outermost, then the original (each wrapper adds its digit to x0 after).
+HARNESS_TWO = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include "module.h"
+#include "host.h"
+
+extern const RtModule rt_module_m1;
+GuestFn f_7100000040_orig;
+static char order[16];
+static int n;
+HLE_WRAP_EXPORT(NAME) { order[n++] = 'A'; orig(c); c->x[0] = c->x[0] * 10 + 1; }
+HLE_WRAP_EXPORT(nn_alias) { order[n++] = 'B'; orig(c); c->x[0] = c->x[0] * 10 + 2; }
+
+GuestFn *rt_lookup(u64 a) {
+    for (u32 k = 0; k < rt_module_m1.func_count; k++)
+        if (rt_module_m1.funcs[k].addr == a) return rt_module_m1.funcs[k].fn;
+    printf("no function at %llx\n", (unsigned long long)a);
+    exit(3);
+}
+GuestFn *rt_lookup_cached(u64 a, RtCache *cache) { (void)cache; return rt_lookup(a); }
+void rt_trap(Cpu *c, u64 pc, const char *why) { (void)c; printf("trap %llx %s\n", (unsigned long long)pc, why); exit(4); }
+
+static u8 stack[4096] __attribute__((aligned(16)));
+static void run(u64 a) {
+    static Cpu c;
+    c.sp = H2G(stack + sizeof stack);
+    c.x[0] = 5;
+    n = 0;
+    rt_lookup(a)(&c);
+    printf("%llx %llu %.*s\n", (unsigned long long)a, (unsigned long long)c.x[0], n, order);
+}
+int main(void) {
+    u64 m1 = rt_module_m1.base;
+    run(m1); run(m1 + 0x80); run(m1 + 0xC0); run(m1 + 0x40);
+    static Cpu c;
+    c.x[0] = 5;
+    n = 0;
+    f_7100000040_orig(&c);
+    printf("orig %llu %d\n", (unsigned long long)c.x[0], n);
+    return 0;
+}
+'''
+
+
 @unittest.skipUnless(ON_ARM64_MAC, 'needs an arm64 Mac with clang (the Command Line Tools)')
 class MacRunTests(unittest.TestCase):
-    def generate(self, tmp, name, funcs, base):
+    def generate(self, tmp, name, funcs, base, source=f'HLE_WRAP_EXPORT({NAME}) {{ orig(c); }}\n', exports=(NAME,)):
         """The module's C as build writes it (one chunk and its loader table), wrapped as the runtime says."""
-        mod = fake_module(funcs, [export(NAME, 0x40)])
-        with runtime_with(f'HLE_WRAP_EXPORT({NAME}) {{ orig(c); }}\n') as root, mock.patch.object(recomp, 'ROOT', root):
+        mod = fake_module(funcs, [export(n, 0x40) for n in exports])
+        with runtime_with(source) as root, mock.patch.object(recomp, 'ROOT', root):
             forward = recomp.forwards(mod, base, set(funcs), sorted(sizes(funcs).items()), name)
         out = Path(tmp) / name
         out.mkdir()
@@ -219,20 +316,35 @@ class MacRunTests(unittest.TestCase):
                                      encoding='utf-8')
         return [str(out / 'g0000.c'), str(out / 'table.c')]
 
+    def build_and_run(self, tmp, sources, harness_text):
+        harness = Path(tmp) / 'harness.c'
+        harness.write_text(harness_text, encoding='utf-8')
+        exe = Path(tmp) / 'run'
+        includes = ['-I', str(ROOT / 'runtime' / 'macos' / 'include'), '-I', str(ROOT / 'runtime' / 'linux' / 'include'),
+                    '-I', str(ROOT / 'runtime')]
+        r = subprocess.run([CLANG, *MAC_CFLAGS, '-O2', *includes, *sources, str(harness), '-o', str(exe)],
+                           capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.splitlines()
+
+    def test_one_function_under_two_wrapped_names_runs_both_wrappers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = self.generate(tmp, 'm1', M1_FUNCS, M1, f'HLE_WRAP_EXPORT({NAME}) {{}}\nHLE_WRAP_EXPORT(nn_alias) {{}}\n',
+                                    ('nn_alias', NAME))
+            self.assertEqual(self.build_and_run(tmp, sources, HARNESS_TWO.replace('NAME', NAME)), [
+                f'{M1:x} 1021 AB',         # a direct call: A, which runs B, which runs the original (5 * 2), then B's 2, A's 1
+                f'{M1 + 0x80:x} 1021 AB',  # a tail call
+                f'{M1 + 0xC0:x} 1021 AB',  # a call through a register
+                f'{M1 + 0x40:x} 1021 AB',  # looked up by address
+                'orig 10 0',               # the original alone: no wrapper
+            ])
+
     def test_every_way_of_reaching_it_runs_the_wrapper_with_its_own_modules_original(self):
         with tempfile.TemporaryDirectory() as tmp:
             sources = self.generate(tmp, 'm1', M1_FUNCS, M1) + self.generate(tmp, 'm2', M2_FUNCS, M2)
-            harness = Path(tmp) / 'harness.c'
-            harness.write_text(HARNESS.replace('NAME', NAME), encoding='utf-8')
-            exe = Path(tmp) / 'run'
-            includes = ['-I', str(ROOT / 'runtime' / 'macos' / 'include'), '-I', str(ROOT / 'runtime' / 'linux' / 'include'),
-                        '-I', str(ROOT / 'runtime')]
-            r = subprocess.run([CLANG, *MAC_CFLAGS, '-O2', *includes, *sources, str(harness), '-o', str(exe)],
-                               capture_output=True, text=True, timeout=300)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertEqual(r.stdout.splitlines(), [
+            self.assertEqual(self.build_and_run(tmp, sources, HARNESS.replace('NAME', NAME)), [
                 f'{M1:x} 1010 1 5',            # a direct call: the wrapper, then module 1's original (5 * 2)
                 f'{M1 + 0x80:x} 1010 2 5',     # a tail call
                 f'{M1 + 0xC0:x} 1010 3 5',     # a call through a register

@@ -129,18 +129,32 @@ def hle_names():
 # `/* signature: 16 words, sha256 0123456789abcdef */`, then `HLE_WRAP(<address>)` or
 # `HLE_WRAP_EXPORT(<exported name>)` on the next line
 WRAP = re.compile(r"^(?:/\* signature: (\d+) words?, sha256 ([0-9a-f]{16}) \*/\r?\n)?"
-                  r"HLE_WRAP(?:\(([0-9a-fA-F]+)\)|_EXPORT\((\w+)\))", re.M)
+                  r"HLE_WRAP(?:\(([0-9a-fA-F]+)\)|_EXPORT\(([A-Za-z_][A-Za-z0-9_]*)\))", re.M)
 # any signature comment on the line before an HLE_WRAP, well-formed or not
 ANY_SIGNATURE = re.compile(r"^/\* signature:.*\r?\nHLE_WRAP(?:_EXPORT)?\(", re.M)
 # the old form, the masked words themselves (`/* signature: 0123abcd 4567ef89 9....... */`): the game's code
 WORDS_SIGNATURE = re.compile(r"/\* signature: [0-9a-f.]{8}(?: |\*/)")
+# C's comments, and the strings and characters one could seem to open inside of
+C_COMMENT = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
+# a use of an HLE_WRAP macro anywhere: `HLE_WRAP_EXPORT (x)`, indented, after `static`...
+ANY_WRAP = re.compile(r"\bHLE_WRAP\w*\s*\(")
+
+
+def wrap_uses_unread(text):
+    """Whether text uses an HLE_WRAP macro (outside comments) other than at the start of a line
+    in one of WRAP's forms, or has one of those forms inside a comment. Either compiles without
+    a word, and the function stays unwrapped (an export's: nothing fails to link either)."""
+    code = C_COMMENT.sub(lambda m: m.group() if m.group()[0] in "\"'" else re.sub(r"[^\n]", " ", m.group()), text)
+    return ({text.rindex("HLE_WRAP", m.start(), m.end()) for m in WRAP.finditer(text)}
+            != {m.start() for m in ANY_WRAP.finditer(code)})
 
 
 def runtime_wraps():
     """The runtime's wraps, ({address: signature}, {exported name: signature}): `HLE_WRAP(<address>)`
-    and `HLE_WRAP_EXPORT(<name>)` in its sources (hle_wraps, hle_export_wraps). A signature is
-    (word count, hash), or None. A line that starts with HLE_WRAP but is neither form, one
-    wrapped twice and a name both replaced (HLE) and wrapped stop the build."""
+    and `HLE_WRAP_EXPORT(<name>)` in its sources (hle_wraps, hle_export_wraps), in the order of the
+    sources (file names', then lines'). A signature is (word count, hash), or None. A use of
+    either macro not in its form at the start of a line (wrap_uses_unread), one wrapped twice
+    and a name both replaced (HLE) and wrapped stop the build."""
     by_address, by_name, replaced = {}, {}, set()
     runtime = os.path.join(ROOT, "runtime")
     for name in sorted(os.listdir(runtime)):
@@ -154,9 +168,9 @@ def runtime_wraps():
             if len(ANY_SIGNATURE.findall(text)) != sum(1 for n, _d, _a, _s in wraps if n):
                 raise SystemExit(f"runtime/{name}: an HLE_WRAP signature is not in the form "
                                  "`/* signature: <n> words, sha256 <16 hex digits> */`")
-            if len(re.findall(r"^HLE_WRAP\w*\(", text, re.M)) != len(wraps):
-                raise SystemExit(f"runtime/{name}: a line starts with HLE_WRAP but is not "
-                                 "`HLE_WRAP(<hex address>)` or `HLE_WRAP_EXPORT(<exported name>)`")
+            if "HLE_WRAP" in text and wrap_uses_unread(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP is not `HLE_WRAP(<hex address>)` or "
+                                 "`HLE_WRAP_EXPORT(<exported name>)` at the start of a line, outside comments")
             replaced |= set(re.findall(r"^HLE\((\w+)\)", text, re.M))
             for n, digest, a, symbol in wraps:
                 key, found = (int(a, 16), by_address) if a else (symbol, by_name)
@@ -192,7 +206,8 @@ def hle_export_wraps():
     handed the original it was reached through (HLE_WRAP_EXPORT in host.h), so it names no
     module's function: two modules that define the name each keep their own, and a build in
     which no module defines it (until that module is compiled in, or a made-up game's) links
-    as it is, with nothing for rt_wrap_missing to stand in for."""
+    as it is, with nothing for rt_wrap_missing to stand in for. A function exported under
+    several of the names has each one's wrapper, one inside the other (resolve_wraps)."""
     return runtime_wraps()[1]
 
 
@@ -238,12 +253,15 @@ def signature_matches(mod, off, size, sig):
 
 def resolve_wraps(mod, base, sizes, name):
     """This module's wraps: {offset: ("wrap", wrapper)} for each HLE_WRAP at an address in it, and
-    {offset: ("wrap", wrapper, "export")} for each function it exports under an HLE_WRAP_EXPORT
-    name. Each wrapped function must start at its address and begin as its signature says: the
+    {offset: ("wrap", wrapper, "export", *inner)} for each function it exports under HLE_WRAP_EXPORT
+    names. A function exported under several of them (aliases, or identical code folded into
+    one) has each name's wrapper, in the order of the runtime's sources: callers reach the
+    first, and each is handed the next (inner) as its original, the last the function itself.
+    Each wrapped function must start at its address and begin as its signature says: the
     addresses are 13.0.5's, and one that isn't there (the runtime wrapping a function that moved)
     stops the build rather than leave a hook out. So do a wrapped name this module exports as
-    something other than a function, and a function wrapped both ways."""
-    forward = {}
+    something other than a function, and a function wrapped both by address and by name."""
+    forward, by_export = {}, {}
     by_address, by_name = runtime_wraps()
     for a, sig in sorted(by_address.items()):
         if max((b for b in MODULES.values() if b <= a), default=None) != base:
@@ -269,7 +287,11 @@ def resolve_wraps(mod, base, sizes, name):
         if off in forward:
             raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): the function at {base + off:#x} is wrapped already "
                              f"({forward[off][1]})")
-        forward[off] = ("wrap", f"hle_wrap_{n}", "export")
+        by_export.setdefault(off, []).append(n)
+    order = {n: i for i, n in enumerate(by_name)}
+    for off, names in by_export.items():
+        first, *inner = (f"hle_wrap_{n}" for n in sorted(names, key=order.get))
+        forward[off] = ("wrap", first, "export", *inner)
     return forward
 
 
@@ -485,7 +507,8 @@ def tools_fingerprint():
     hooks = sorted(hook_list().items())
     return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + "\n" + repr(hooks)
                                 + f"\nregcache {int(lift.REGCACHE)}"
-                                + (f"\nexport wraps {sorted(by_name.items())!r}" if by_name else ""))
+                                # (in the sources' order: the order of the wrappers of a function exported under several)
+                                + (f"\nexport wraps {list(by_name.items())!r}" if by_name else ""))
 
 
 def write_if_changed(path, text):

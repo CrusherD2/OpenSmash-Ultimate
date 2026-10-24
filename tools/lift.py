@@ -185,9 +185,13 @@ class Lifter(SimdMixin):
             return (f"GuestFn {native};\nvoid f_{self.base + start:x}(Cpu *c) {{ {native}(c); }}",
                     Counter(), set())
         name, wrapper = f"f_{self.base + start:x}", ""
-        if isinstance(native, tuple) and native[2:] == ("export",):   # wrapped by name: handed this original
-            wrapper = (f"void {native[1]}(Cpu *c, GuestFn *orig);\nGuestFn {name}_orig;\n"
-                       f"void {name}(Cpu *c) {{ {native[1]}(c, {name}_orig); }}\n")
+        if isinstance(native, tuple) and native[2:3] == ("export",):   # wrapped by name: handed this original
+            chain, inner = (native[1], *native[3:]), f"{name}_orig"   # (several names: each handed the next)
+            wrapper = "".join(f"void {w}(Cpu *c, GuestFn *orig);\n" for w in chain) + f"GuestFn {inner};\n"
+            for i in range(len(chain) - 1, 0, -1):
+                wrapper += f"static void {name}_w{i}(Cpu *c) {{ {chain[i]}(c, {inner}); }}\n"
+                inner = f"{name}_w{i}"
+            wrapper += f"void {name}(Cpu *c) {{ {chain[0]}(c, {inner}); }}\n"
             name += "_orig"
         elif isinstance(native, tuple):   # wrapped natively: callers reach the wrapper, which may call this one
             wrapper = f"GuestFn {native[1]};\nvoid {name}(Cpu *c) {{ {native[1]}(c); }}\n"
