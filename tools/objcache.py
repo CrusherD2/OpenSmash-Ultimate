@@ -5,7 +5,8 @@ of its own: tools/mac/build_mac.py.)
 An object is current when the key it was compiled with is this build's. The key is a SHA-256 over
   - the content of its sources (the generated C; on Linux also the C++ file that includes it),
   - the content of the runtime headers it is built with (header_files: for the generated C,
-    recomp.h or module.h and what they include from runtime/),
+    recomp.h or module.h and what they include from runtime/; a file with hook slots
+    includes hookable.h too: game_headers),
   - the compiler: its path and what it prints for --version (compiler_id, once per build),
   - the whole compile command: optimisation level, instruction set, defines, include folders.
 So another flag, header or compiler compiles the objects built with it again, and a file saved
@@ -40,6 +41,11 @@ VERSION = 1
 # two (FAT, exFAT, some shares) would give a file changed in the same second the same time.
 RECENT_NS = 3 * 10**9
 INCLUDE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+# What a generated file with hook slots holds (tools/recomp.py writes it, runtime/hookable.h): a
+# Record's scan finds it, and game_headers then keys the file on hookable.h's headers too.
+HOOK_SLOTS = b'#include "hookable.h"'
+# The header sets a generated file is built with (header_files' names): game_headers picks one.
+GAME_HEADERS = (("recomp.h",), ("recomp.h", "hookable.h"), ("module.h",))
 
 # why an object is compiled; the last four are worth a line in the build's log (summary)
 NEW, CHANGED = "no object yet", "its source changed"
@@ -88,6 +94,15 @@ def header_files(folder, *names):
         with open(path, "rb") as f:
             todo += [(os.path.dirname(path), m.decode("utf-8", "replace")) for m in INCLUDE.findall(f.read())]
     return sorted(found)
+
+
+def game_headers(name, found):
+    """Which of GAME_HEADERS the generated file `name` is built with: g_module.c module.h, a file
+    holding HOOK_SLOTS (`found`: Record.source's scan) recomp.h and hookable.h, the rest recomp.h.
+    So a change to hookable.h compiles again only the files with hook slots."""
+    if name == "g_module.c":
+        return ("module.h",)
+    return GAME_HEADERS[1] if HOOK_SLOTS in found else GAME_HEADERS[0]
 
 
 def digest_files(paths):

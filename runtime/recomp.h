@@ -183,6 +183,68 @@ static inline u64 rev32_64(u64 v) { return ((u64)__builtin_bswap32((u32)(v >> 32
 static inline u64 umulh64(u64 a, u64 b) { return (u64)(((unsigned __int128)a * b) >> 64); }
 static inline u64 smulh64(u64 a, u64 b) { return (u64)(((__int128)(i64)a * (i64)b) >> 64); }
 
+/* crc32b/h/w/x and crc32cb/ch/cw/cx: the reflected CRC of the low 8, 16, 32 or 64 bits of v,
+ * least significant bit first, continuing acc, with no inversion before or after. The bitwise
+ * form is the definition; the host's instruction where it has one (x86's crc32 is CRC-32C only),
+ * else for CRC-32 tables made from the bitwise form. */
+#define RT_CRC32_POLY 0xEDB88320u    /* 0x04C11DB7, reflected */
+#define RT_CRC32C_POLY 0x82F63B78u   /* 0x1EDC6F41 (Castagnoli), reflected */
+static inline u32 rt_crc32_bits(u32 acc, u64 v, int bits, u32 poly) {
+    u64 x = acc ^ v;
+    for (int i = 0; i < bits; i++) x = (x >> 1) ^ (poly & (0u - (u32)(x & 1)));
+    return (u32)x;
+}
+#if defined(__ARM_FEATURE_CRC32)
+static inline u32 rt_crc32b(u32 acc, u8 v)  { return __builtin_arm_crc32b(acc, v); }
+static inline u32 rt_crc32h(u32 acc, u16 v) { return __builtin_arm_crc32h(acc, v); }
+static inline u32 rt_crc32w(u32 acc, u32 v) { return __builtin_arm_crc32w(acc, v); }
+static inline u32 rt_crc32x(u32 acc, u64 v) { return __builtin_arm_crc32d(acc, v); }
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return __builtin_arm_crc32cb(acc, v); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_arm_crc32ch(acc, v); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return __builtin_arm_crc32cw(acc, v); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return __builtin_arm_crc32cd(acc, v); }
+#else
+/* CRC-32 by slicing: t[256 * k + b] is the CRC of byte b followed by k zero bytes. The tables are
+ * built on first use by one thread (the others take the bitwise form meanwhile): 8 KB in each
+ * file that uses them. (The building is out of line, not in every crc32 the lifter writes.) */
+static inline __attribute__((noinline)) void rt_crc32_build(u32 *t) {
+    for (int i = 0; i < 8 * 256; i++) t[i] = rt_crc32_bits(0, (u64)(i & 255), 8 + 8 * (i >> 8), RT_CRC32_POLY);
+}
+static inline const u32 *rt_crc32_tables(void) {
+    static u32 t[8 * 256];
+    static int state;   /* 0 not built, 1 being built, 2 built */
+    int s = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
+    if (s == 2) return t;
+    if (s || !__atomic_compare_exchange_n(&state, &s, 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 0;
+    rt_crc32_build(t);
+    __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    return t;
+}
+static inline u32 rt_crc32_sliced(u32 acc, u64 v, int bytes) {
+    const u32 *t = rt_crc32_tables();
+    if (!t) return rt_crc32_bits(acc, v, 8 * bytes, RT_CRC32_POLY);
+    u64 x = acc ^ v;
+    u32 r = bytes < 4 ? (u32)(x >> 8 * bytes) : 0;   /* (the bits of acc above v's, shifted down) */
+    for (int i = 0; i < bytes; i++) r ^= t[256 * (bytes - 1 - i) + (x >> 8 * i & 255)];
+    return r;
+}
+static inline u32 rt_crc32b(u32 acc, u8 v)  { return rt_crc32_sliced(acc, v, 1); }
+static inline u32 rt_crc32h(u32 acc, u16 v) { return rt_crc32_sliced(acc, v, 2); }
+static inline u32 rt_crc32w(u32 acc, u32 v) { return rt_crc32_sliced(acc, v, 4); }
+static inline u32 rt_crc32x(u32 acc, u64 v) { return rt_crc32_sliced(acc, v, 8); }
+#if defined(__SSE4_2__)
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return __builtin_ia32_crc32qi(acc, v); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return __builtin_ia32_crc32hi(acc, v); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return __builtin_ia32_crc32si(acc, v); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return (u32)__builtin_ia32_crc32di(acc, v); }
+#else
+static inline u32 rt_crc32cb(u32 acc, u8 v)  { return rt_crc32_bits(acc, v, 8, RT_CRC32C_POLY); }
+static inline u32 rt_crc32ch(u32 acc, u16 v) { return rt_crc32_bits(acc, v, 16, RT_CRC32C_POLY); }
+static inline u32 rt_crc32cw(u32 acc, u32 v) { return rt_crc32_bits(acc, v, 32, RT_CRC32C_POLY); }
+static inline u32 rt_crc32cx(u32 acc, u64 v) { return rt_crc32_bits(acc, v, 64, RT_CRC32C_POLY); }
+#endif
+#endif
+
 /* ---- floating point: AArch64 semantics where they differ from x86 -------------- */
 static inline i32 f2i32(f64 v) { return v != v ? 0 : v >= 2147483648.0 ? INT32_MAX : v <= -2147483649.0 ? INT32_MIN : (i32)v; }
 static inline u32 f2u32(f64 v) { return v != v ? 0 : v >= 4294967296.0 ? UINT32_MAX : v <= -1.0 ? 0 : (u32)v; }
@@ -216,11 +278,16 @@ static inline f64 rt_frsqrts64(f64 a, f64 b) {
 /* Reciprocal and reciprocal-square-root estimates: the architecture's table algorithm,
  * which x86's rcpps / rsqrtps do not reproduce. */
 static inline u32 rt_recip_est(u32 a) { a = a * 2 + 1; return ((1u << 19) / a + 1) / 2; }
+/* (The manual's loop - b = 512; while (a * (b + 1)^2 < 2^28) b++; return (b + 1) / 2 - takes up
+ * to 500 steps: k = b + 1 is found from sqrt and corrected exactly instead, the same for every a,
+ * which tests/test_recomp_helpers.py checks.) */
 static inline u32 rt_rsqrt_est(u32 a) {
     a = a < 256 ? a * 2 + 1 : ((a & ~1u) + 1) * 2;
-    u32 b = 512;
-    while ((u64)a * (b + 1) * (b + 1) < (1ull << 28)) b++;
-    return (b + 1) / 2;
+    u32 k = (u32)sqrt((f64)(1u << 28) / a);
+    if (k < 513) k = 513;
+    while (k > 513 && (u64)a * (k - 1) * (k - 1) >= (1ull << 28)) k--;
+    while ((u64)a * k * k < (1ull << 28)) k++;
+    return k / 2;
 }
 #define RT_FRAC52 0xFFFFFFFFFFFFFull
 static inline u64 rt_frecpe_frac(u64 frac, int *exp, int top) {

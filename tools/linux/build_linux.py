@@ -121,15 +121,16 @@ def stale(record, job, inputs, headers, why):
 
 
 def game_jobs():
-    # what the generated files include: recomp.h, g_module.c module.h (tools/recomp.py)
-    headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, h)) for h in ("recomp.h", "module.h")}
+    # what the generated files include: recomp.h, one with hook slots hookable.h too, g_module.c
+    # module.h (tools/recomp.py; objcache.game_headers)
+    headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, *h)) for h in objcache.GAME_HEADERS}
     jobs, why = [], Counter()
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
     adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
              if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     for name, src_dir, out_dir in modules():
-        record = objcache.Record(out_dir, scan=(LANDING_SITES,), adopt_by_date=adopt)
+        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt)
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
@@ -152,7 +153,7 @@ def game_jobs():
                     with open(wrapper, "w") as f:
                         f.write(text)
                 job, inputs = (wrapper, obj, opt), [wrapper, src]
-            if not stale(record, job, inputs, headers["module.h" if fname == "g_module.c" else "recomp.h"], why):
+            if not stale(record, job, inputs, headers[objcache.game_headers(fname, record.source(src)[1])], why):
                 continue
             jobs.append(job)
             ESTIMATES[jobs[-1][0]] = (progress.TABLE if fname == "g_module.c" else

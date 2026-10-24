@@ -469,6 +469,17 @@ class WindowsBuildTests(Folder):
             (nro / objcache.RECORD).unlink()
             self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
 
+    def test_hook_slots_are_keyed_on_hookable_h(self):
+        """A file with hook slots includes hookable.h (tools/recomp.py): a change to it compiles that file
+        again, and only that one; the files without slots keep their keys."""
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100001000(void) {}\n')
+        self.compile()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n')
+        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
+        self.assertIn('main: 1 object to compile again: the runtime headers changed', self.said)
+        self.assertEqual(self.compile(), (True, []))
+
     def test_the_folder_spelled_another_way_or_moved(self):
         """The key names a file and its object by their names in the folder: build/main, ./build/main, the
         full path (build\\main on Windows), or the build folder moved, compile nothing again."""
@@ -771,6 +782,16 @@ class LinuxBuildTests(Folder):
         self.assertTrue(link_only())
         self.assertEqual(linked, ['avx2', 'avx2'])
         self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
+
+    def test_hook_slots_are_keyed_on_hookable_h(self):
+        """As on Windows: a change to hookable.h compiles again only the files that include it."""
+        main = self.tree / 'build' / 'main'
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100000000(void) {}\n')
+        self.build()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n')
+        self.assertEqual(self.build(), (True, ['g0000.c -O2']))
+        self.assertEqual(self.build(), (True, []))
 
     def test_landing_sites_found_once(self):
         """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""
