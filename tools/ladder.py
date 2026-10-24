@@ -25,10 +25,11 @@ model, tools/progress.py, or what it took on this PC last time if that is more: 
 PC's pace: the seconds it has taken for an estimated second in this build so far (Pace; the last
 builds' pace until enough is compiled, PACE_UNKNOWN before any; never less than 1). The pace is
 asked again every second, so a big file started first gets a limit that follows what the build
-learns. Time the build does not run, a PC asleep or a build stopped with Ctrl+Z, does not count
-(run). SSBU_COMPILE_LIMIT=<seconds> gives every generated file that limit instead (0: none; then
-the files the ladder compiled another way are compiled again the normal way). The runtime's files
-have no time limit: only the crash retry.
+learns. Time the compiler does not run, a PC asleep (clock) or a build stopped with Ctrl+Z
+(stopped), does not count; a PC too busy to look on time counts in full (run).
+SSBU_COMPILE_LIMIT=<seconds> gives every generated file that limit instead (0: none; then the files
+the ladder compiled another way are compiled again the normal way). The runtime's files have no
+time limit: only the crash retry.
 
 A file the ladder compiled another way is recorded with the command it was compiled with: its level
 and the optnone header's content are in its key (check, key_command; on macOS its line in
@@ -38,15 +39,17 @@ SSBU_OPTNONE_ABOVE changed (ladder_entry). A crash retry keeps its own level's k
 (tools/objcache.py).
 
 Each generated file's compile seconds and level go into the build folder's compile_times.json
-(Times): the next build starts the longest first (longest_first; before any is measured, each build
-keeps the order it always had), and its progress bar's estimate goes by them. Each time the ladder
-steps in it is said in the build's log, listed again at the end and added to the build folder's
-ladder_report.txt (Report).
+(Times): the next build's progress bar estimates by them, and so do its time limits. Each build
+starts its files in the order it always has (the Windows one the manifest's, the Linux and macOS
+ones the biggest source first). Each time the ladder steps in it is said in the build's log, listed
+again at the end and added to the build folder's ladder_report.txt (Report).
 
-SSBU_OPTNONE_ABOVE=<instructions> (off unless set; for benchmarking) compiles every generated file
+For benchmarking, off unless set: SSBU_OPTNONE_ABOVE=<instructions> compiles every generated file
 with a function longer than that with those functions unoptimised from the start, and the rest of
 the file at the level it would have without them (eager): the way ssbu-recomp's build_opt.py
-compiles. The default build compiles a file with a function over 20,000 instructions at /O1, whole."""
+compiles. The default build compiles a file with a function over 20,000 instructions at /O1, whole.
+SSBU_LONGEST_FIRST=1 starts the files the longest first by what they took last time
+(longest_first)."""
 import glob
 import hashlib
 import json
@@ -60,14 +63,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
-LIMIT_ENV, OPTNONE_ENV = "SSBU_COMPILE_LIMIT", "SSBU_OPTNONE_ABOVE"
+LIMIT_ENV, OPTNONE_ENV, ORDER_ENV = "SSBU_COMPILE_LIMIT", "SSBU_OPTNONE_ABOVE", "SSBU_LONGEST_FIRST"
 FLOOR = 600.0           # seconds: no generated file is stopped sooner (most take a few)
 TIMES = 4.0             # its estimate times this, at this PC's pace (the biggest files take up to 1.5 times theirs)
 PACE_UNKNOWN = 4.0      # this PC's pace taken to be this until it is measured
 MEASURED = 60.0         # estimated seconds compiled before a pace counts (as tools/progress.py's)
 THRESHOLDS = (20000, 5000, 1250)   # optnone on the functions longer than these (instructions), in turn
 POLL = 1.0              # how often a running compile's limit is asked again
-PAUSED = 5.0            # a look this much later than asked: the build did not run meanwhile (run)
+PAUSED = 5.0            # a look this much later than asked, its compiler not seen stopped: asked again (run)
 REPORT, TIMES_FILE = "ladder_report.txt", "compile_times.json"
 
 # A crash is told from an error in the code by what clang prints (it exits with 1 either way): its crash
@@ -114,10 +117,17 @@ def optnone_setting(env=None):
                     "the instructions above which a function is compiled unoptimised (0: none)", integer=True) or None
 
 
+def longest_first_setting(env=None):
+    """SSBU_LONGEST_FIRST: whether the files start the longest first by what they took last time
+    (longest_first); off unless set to 1 (for benchmarking: the order is the build's speed)."""
+    return bool(_setting(os.environ if env is None else env, ORDER_ENV,
+                         "1 to start the files the longest first by what they took last time (0: off)", integer=True))
+
+
 def settings(env=None):
-    """(limit_setting, optnone_setting), which a build reads before it does anything else: a value that is
-    not a number stops it then, not once the C is written."""
-    return limit_setting(env), optnone_setting(env)
+    """(limit_setting, optnone_setting, longest_first_setting), which a build reads before it does anything
+    else: a value that is not a number stops it then, not once the C is written."""
+    return limit_setting(env), optnone_setting(env), longest_first_setting(env)
 
 
 def duration(seconds):
@@ -188,21 +198,77 @@ class Stopped(Exception):
 _running, _running_lock = set(), threading.Lock()
 
 
+def _clock():
+    """The clock compiles are timed by (run), in seconds: one that does not count the time the PC is asleep.
+    Linux's and macOS's time.monotonic do not (CLOCK_MONOTONIC, mach_absolute_time); Windows' does, so there
+    it is QueryUnbiasedInterruptTime, which leaves out sleep and hibernation."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            query = ctypes.WinDLL("kernel32").QueryUnbiasedInterruptTime
+            query.argtypes, query.restype = [ctypes.POINTER(ctypes.c_ulonglong)], ctypes.c_int
+            if query(ctypes.byref(ctypes.c_ulonglong())):
+                def unbiased():
+                    t = ctypes.c_ulonglong()
+                    query(ctypes.byref(t))
+                    return t.value / 1e7   # (100 ns units)
+                return unbiased
+        except (ImportError, AttributeError, OSError):
+            pass
+    return time.monotonic
+
+
+clock = _clock()
+
+
+def stopped(proc):
+    """Whether a running compiler has been stopped, or let go on, since this was last asked: what a build
+    stopped with Ctrl+Z does to every process in it, its compilers too (they stay in its process group).
+    waitid reports that of a child without taking one that has ended from subprocess (macOS reports the
+    stop as well as the going on). Never on Windows, where nothing stops a build so."""
+    if os.name == "nt" or not hasattr(os, "waitid") or proc.returncode is not None:
+        return False
+    found = False
+    for _ in range(4):
+        try:
+            r = os.waitid(os.P_PID, proc.pid, os.WCONTINUED | os.WNOHANG)
+        except (OSError, ValueError):   # (ChildProcessError: it has ended, and subprocess has it)
+            return found
+        if r is None:
+            return found
+        found = found or r.si_code in (os.CLD_STOPPED, os.CLD_CONTINUED)
+    return found
+
+
+def _killed(proc):
+    """Whether kill_tree stopped a running compiler, not one that had just ended by itself with its own exit
+    code: on Linux and macOS one it stopped ends with SIGKILL; on Windows taskkill ends it with 1, which is
+    an error's exit code too, so any but 0 is taken for it there."""
+    return proc.returncode != 0 if os.name == "nt" else proc.returncode == -signal.SIGKILL
+
+
 def run(argv, limit=None, stop=None, **popen):
     """Runs a compiler: Run(exit code, what it printed, seconds, whether its time limit stopped it). limit:
     None, seconds, or a function giving them (or None), asked again every POLL seconds; stop: an Event
     that stops it (Stopped). A compile stopped either way, or by an exception here (Ctrl+C), is stopped
-    with every process it started. Its seconds leave out the time the build did not run: a look more
-    than PAUSED seconds later than the wait before it asked for means the PC was asleep (Windows' clock
-    counts that) or the build stopped with Ctrl+Z meanwhile, and the time limit moves on by that much."""
-    t0 = last = time.monotonic()
+    with every process it started. Its seconds leave out the time the compiler did not run, so that the
+    time limit moves on by that much: a PC asleep (clock does not count it), and the time between two
+    looks in which the compiler was stopped and let go on (a build stopped with Ctrl+Z: stopped). A look
+    late only because the PC is too busy (paging, say, as a compile running away with the memory makes
+    it) counts in full."""
+    t0 = last = clock()
     paused, wait = 0.0, 0.0
 
-    def look():   # (the time now, past every pause so far)
+    def look():   # (the time now, past every stop so far)
         nonlocal last, paused
-        now = time.monotonic()
-        if now - last - wait > PAUSED:
-            paused += now - last - wait
+        now = clock()
+        late = now - last - wait
+        held = stopped(proc)   # (asked at every look: a stop long before is not taken for this look's)
+        if not held and late > PAUSED:   # (the build can be let go on a moment before its compiler is)
+            time.sleep(0.05)
+            held = stopped(proc)
+        if held and late > 0:
+            paused += late
         last = now
         return now - t0 - paused
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", **popen)
@@ -217,13 +283,13 @@ def run(argv, limit=None, stop=None, **popen):
                 if not finished:
                     kill_tree(proc)
                 out, err = _drain(proc)
-                # (one that finished by itself meanwhile: its own result, and its object kept)
-                return Run(proc.returncode, out + err, spent, not finished and proc.returncode != 0)
+                # (one that finished by itself meanwhile, an error or a crash too: its own result, and its object kept)
+                return Run(proc.returncode, out + err, spent, not finished and _killed(proc))
             if stop is not None and stop.is_set():
                 raise Stopped
             if limit is None and stop is None:
                 out, err = proc.communicate()
-                return Run(proc.returncode, out + err, time.monotonic() - t0)
+                return Run(proc.returncode, out + err, clock() - t0)
             wait = POLL if allowed is None else min(POLL, allowed - spent)
             try:
                 out, err = proc.communicate(timeout=wait)
@@ -378,6 +444,24 @@ def optnone_header(sizes, above):
 def header_name(obj):
     """The optnone header's file, beside the object (written for a compile, removed after it)."""
     return os.path.splitext(obj)[0] + ".optnone.h"
+
+
+def _write_header(path, text):
+    """Writes the optnone header: None, or why it could not be (a full disk; on Windows the file still held
+    a moment after the compiler stopped before it let go, so tried again for a moment, as remove_partial)."""
+    for attempt in range(5):
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return None
+        except OSError as e:
+            failed = e
+            time.sleep(0.1 * (attempt + 1))
+    try:   # (what was written of it)
+        os.remove(path)
+    except OSError:
+        pass
+    return failed
 
 
 def digest(text):
@@ -615,12 +699,13 @@ class Info(NamedTuple):
     measured: bool = False   # whether estimate is what it took last time (Times.measured)
 
 
-def longest_first(jobs, infos):
-    """The jobs (src, obj, ...) the longest first by their estimates (Info.estimate: what each took last
-    time, else the cost model's) once this build folder has measured one of them; else None, and each
-    build keeps the order it had before compile_times.json (the Windows one the manifest's, the Linux
-    and macOS ones the biggest source first)."""
-    if not any(infos[job[1]].measured for job in jobs if job[1] in infos):
+def longest_first(jobs, infos, env=None):
+    """With SSBU_LONGEST_FIRST=1 (for benchmarking), the jobs (src, obj, ...) the longest first by their
+    estimates (Info.estimate: what each took last time, else the cost model's) once this build folder
+    has measured one of them. Else None: each build keeps the order it has always had (the Windows one
+    the manifest's, the Linux and macOS ones the biggest source first), which is its speed when nothing
+    goes wrong until a benchmark says otherwise."""
+    if not longest_first_setting(env) or not any(infos[job[1]].measured for job in jobs if job[1] in infos):
         return None
     return sorted(jobs, key=lambda job: infos[job[1]].estimate if job[1] in infos else 0.0, reverse=True)
 
@@ -655,12 +740,12 @@ class Ladder:
     def __init__(self, cost, compiler, log=print, popen=None, env=None):
         env = os.environ if env is None else env
         self.cost, self.compiler, self.log, self.popen = cost, compiler, log, dict(popen or {})
-        self.setting, self.above = limit_setting(env), optnone_setting(env)
+        self.setting, self.above, self.longest = limit_setting(env), optnone_setting(env), longest_first_setting(env)
         self.pace, self.report = Pace(), Report()
         self.stopping = threading.Event()
 
     def describe(self):
-        """The time limits and SSBU_OPTNONE_ABOVE, for the report."""
+        """The time limits, SSBU_OPTNONE_ABOVE and SSBU_LONGEST_FIRST, for the report."""
         if self.setting == 0:
             limit = f"no time limit ({LIMIT_ENV}=0)"
         elif self.setting:
@@ -669,7 +754,8 @@ class Ladder:
             pace = self.pace.value()
             limit = (f"time limit: the larger of {duration(FLOOR)} and {TIMES:g} times a file's estimate at this PC's pace "
                      + (f"({pace:.2f})" if pace else "(not measured)"))
-        return limit + (f"; {OPTNONE_ENV}={self.above}" if self.above else "") + f"; {self.compiler}"
+        return (limit + (f"; {OPTNONE_ENV}={self.above}" if self.above else "") + (f"; {ORDER_ENV}=1" if self.longest else "")
+                + f"; {self.compiler}")
 
     def end(self, folder):
         """At the end of a build: the report, listed and written into `folder`."""
@@ -727,8 +813,9 @@ class Ladder:
         obj = job[1]
         header = header_name(obj) if step.header else None
         if header:
-            with open(header, "w", encoding="utf-8", newline="\n") as f:
-                f.write(step.header)
+            failed = _write_header(header, step.header)
+            if failed:   # (this try fails as an error would: the ladder goes on to the next, /Od needing none)
+                return Run(1, f"could not write {header} ({failed})", 0.0)
         try:
             r = run(argv(job, step.level, header), self.limit(info, step, first), self.stopping, **self.popen)
         except BaseException:

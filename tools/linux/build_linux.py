@@ -280,8 +280,9 @@ def runtime_jobs():
 
 
 def in_order(jobs):
-    """Biggest first: a few files take minutes, and started last they would hold up the end. Once a build has
-    measured them, the longest first by what they took (ladder.longest_first: compile_times.json)."""
+    """Biggest first: a few files take minutes, and started last they would hold up the end. With
+    SSBU_LONGEST_FIRST=1, once a build has measured them, the longest first by what they took
+    (ladder.longest_first: compile_times.json)."""
     measured = ladder.longest_first(jobs, INFOS)
     if measured:
         return measured
@@ -438,7 +439,7 @@ def dxvk_libs():
 
 def main():
     global STEPS
-    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
+    ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")

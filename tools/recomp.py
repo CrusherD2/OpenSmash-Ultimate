@@ -508,8 +508,8 @@ def plan(outdir, times=None):
     includes recomp.h, g_module.c module.h (_emit, module_table). The key's command names the file and
     its object by their names in the folder: the folder spelled another way (build/main, .\\build\\main,
     a full path), or moved, compiles nothing again. times: the build folder's ladder.Times (read when
-    not given): once it has measured one of them, the longest come first (ladder.longest_first), else
-    the manifest's order."""
+    not given), which the estimates go by. In the manifest's order (with SSBU_LONGEST_FIRST=1, once
+    one of them is measured, the longest first: ladder.longest_first)."""
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
@@ -548,7 +548,7 @@ def plan(outdir, times=None):
                                      measured=measured is not None)
             todo.append((src, obj, opt, estimate))
     record.save()   # (the sources' digests: the next look reads only the files that changed)
-    # the longest first, once they have been measured: started last, one would hold up the end
+    # (SSBU_LONGEST_FIRST=1, for benchmarking: the longest first, once they have been measured)
     todo = ladder.longest_first(todo, infos) or todo
     return todo, record, keys, why, infos
 
@@ -736,7 +736,7 @@ def build_all(exefs, out, jobs, compile_c=True):
     """Every module's C first, then each module's compile, then the link: once the C is there,
     what is left to compile is known, and the progress bar's time left (progress.Build) can say
     how long it takes. compile_c False (--generate-only): the C only."""
-    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
+    ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
     paths = module_paths(exefs)
     mods = {name: Module(path) for name, path in paths.items()}
     check(exefs, mods)

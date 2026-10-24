@@ -517,9 +517,9 @@ def new_ladder():
 
 
 def compile_all(jobs, what, compiled=None):
-    """Compile the jobs, biggest first (once a build has measured them, the longest first by what they
-    took: ladder.longest_first), a crash compiled again and a generated file over its time limit
-    compiled another way (STEPS, else a ladder of its own, whose report is said at the end:
+    """Compile the jobs, biggest first (with SSBU_LONGEST_FIRST=1, once a build has measured them, the
+    longest first by what they took: ladder.longest_first), a crash compiled again and a generated file
+    over its time limit compiled another way (STEPS, else a ladder of its own, whose report is said at the end:
     tools/ladder.py); compiled(job, level, step) is called for each that compiled (step: the ladder's
     way, or None)."""
     if not jobs:
@@ -689,7 +689,7 @@ def link():
 
 def main():
     global STEPS
-    ladder.settings()   # (SSBU_COMPILE_LIMIT and SSBU_OPTNONE_ABOVE: one that is not a number stops the build now)
+    ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.isfile(os.path.join(SDL3_FRAMEWORK, "Headers", "SDL.h")):
         raise SystemExit(f"SDL3.framework is not in {SDL3_DIR}: Install WindowSmash.command downloads it "

@@ -610,12 +610,13 @@ The game checks the processor as it starts, before any of its own code runs. One
 
 `tools/recomp.py all` translates each module (`main`, `subsdk0`, `sdk` and the fighter modules) to C, makes the relocation images and registries, compiles everything with `clang-cl`, compiles the runtime, and links `build/ssbu.exe`. Builds after the first are incremental: a file is compiled again when its C, the runtime headers it includes, the compile flags or the compiler change ([how](TECHNICAL.md#incremental-builds)). The first build gives each fighter module an address and records it in `dump/nro/bases.txt`; keep that file with your build, and don't copy it from another build.
 
-A file the compiler crashes on is compiled again on its own once the others are done, then at `/O1`. A file still compiling well past its estimate (never sooner than 10 minutes; time the PC spends asleep doesn't count) is stopped and compiled again with its longest functions unoptimised, then whole at `/Od` ([the compile ladder](TECHNICAL.md#the-compile-ladder)). Such a file stays compiled that way until its C or the flags change. Each file's compile time is kept in `build\compile_times.json`, so the next build starts the longest files first and its time left is closer. Two switches, set before building:
+A file the compiler crashes on is compiled again on its own once the others are done, then at `/O1`. A file still compiling well past its estimate (never sooner than 10 minutes; time the PC spends asleep doesn't count) is stopped and compiled again with its longest functions unoptimised, then whole at `/Od` ([the compile ladder](TECHNICAL.md#the-compile-ladder)). Such a file stays compiled that way until its C or the flags change. Each file's compile time is kept in `build\compile_times.json`, so the next build's time left is closer. Three switches, set before building:
 
 | Switch | What it does |
 | :--- | :--- |
 | `SSBU_COMPILE_LIMIT=<seconds>` | Every game file gets this time limit instead of one from its estimate. `0`: no limit, and files compiled another way are compiled again the normal way. |
 | `SSBU_OPTNONE_ABOVE=<instructions>` | For benchmarking only; off unless set. Compiles every function longer than this unoptimised from the start, and the rest of its file at the level it would have without them. |
+| `SSBU_LONGEST_FIRST=1` | For benchmarking only; off unless set. Starts the files that took longest last time first, instead of in the manifest's order. |
 
 Before compiling, it lists imported symbols that nothing provides in `build/imports.unresolved.txt`; a *strong* one there is the first sign that the game needs something the runtime doesn't have yet ([the imports check](TECHNICAL.md#the-imports-check)). It also checks that each of the runtime's hooks into the game's code finds the 13.0.5 function it expects, and stops if one doesn't ([code tied to the game version](TECHNICAL.md#code-tied-to-the-game-version)).
 
