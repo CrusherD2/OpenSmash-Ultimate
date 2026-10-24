@@ -168,6 +168,19 @@ class Player:
             out.append((ip, name.rstrip(b"\0"), flags & 1, (pip, pport), (lip, lport), secret, flags))
         return version, out
 
+    def introduced(self, ip, wait=3.0):
+        """The first PEERS (within wait seconds) that has ip introduced: (version, [entries]), or the
+        newest one if none does (None if none came). For a change the lobby may send late: it sends a
+        player two PEERS PEERS_GAP apart at the soonest, and a slow runner can add to that."""
+        newest, until = None, time.monotonic() + wait
+        while time.monotonic() < until:
+            got = self.peers(0.1)
+            if got:
+                newest = got
+                if any(e[0] == ip and e[2] for e in got[1]):
+                    break
+        return newest
+
     def bcast(self, skip, payload, dst=BCAST, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.header(R.BCAST) + bytes((len(skip),)) + b"".join(struct.pack(">I", ip) for ip in skip) +
                   struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
@@ -598,8 +611,8 @@ class Peers(LobbyTest):
         a.ldn(host.ip, R.LM_JOIN, session + bytes(34))
         host.advertise(session, [a.ip])
         talk(host, a)
-        self.assertEqual(host.peers()[1][0][4], (0x0A000006, 6000))   # (both 127.0.0.1: same router)
-        self.assertEqual(a.peers()[1][0][4], (0x0A000005, 5000))
+        self.assertEqual({e[0]: e for e in host.introduced(a.ip)[1]}[a.ip][4], (0x0A000006, 6000))   # (both 127.0.0.1: same router)
+        self.assertEqual({e[0]: e for e in a.introduced(host.ip)[1]}[host.ip][4], (0x0A000005, 5000))
         try:
             far = self.player(name="Far", ext=True, lan=(0x0A000007, 7000), bind="127.0.0.2")
         except OSError:
@@ -607,9 +620,10 @@ class Peers(LobbyTest):
         far.ldn(host.ip, R.LM_JOIN, session + bytes(34))
         host.advertise(session, [a.ip, far.ip])
         talk(host, far)
-        entries = {e[0]: e for e in host.peers()[1]}
+        entries = {e[0]: e for e in host.introduced(far.ip)[1]}   # (late by a PEERS_GAP: the advert just changed)
         self.assertEqual(entries[far.ip][2:5], (1, (R.address_number("127.0.0.2"), far.s.getsockname()[1]), (0, 0)))
-        self.assertEqual(far.peers()[1][0][4], (0, 0))
+        to_host = {e[0]: e for e in far.introduced(host.ip)[1]}[host.ip]
+        self.assertEqual(to_host[2:5], (1, (LOCAL, host.s.getsockname()[1]), (0, 0)))   # (another router: no LAN address)
 
     def test_leaving_empties_and_coming_back_is_a_new_secret(self):
         host, session, (a, b) = self.room(2, ext=True)
