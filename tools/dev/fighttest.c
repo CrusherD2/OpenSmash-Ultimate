@@ -1,6 +1,7 @@
 /* Offline checks of the fight test switches' logic (runtime/fight_test.h, docs/TESTING-RUNS.md)
  * on made-up numbers and structures: the refresh report, the sequence's steps across a fight's
- * start and end, the debug match's parsing, list and writes, and SSBU_DEBUG_END's count. Plain C,
+ * start and end, the hash line's length, the debug match's parsing, list and writes, and
+ * SSBU_DEBUG_END's count. Plain C,
  * no runtime: any compiler.
  *
  *   clang -I runtime tools/dev/fighttest.c -o fighttest && ./fighttest
@@ -9,6 +10,7 @@
  * numbers tests/test_fight_test.py works out on its own instead: the hash line and its FNV-1a,
  * the generators' fixed state, Hash40 and XXH64 values, and SSBU_FIXED_SEED's streams. */
 #define _CRT_SECURE_NO_WARNINGS
+#include <float.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -64,6 +66,20 @@ static void test_steps(void) {
     FightSteps t = {0};
     fight_steps(&t, -2, 0);   /* (before any fight: a lower count is no tick, counted as 0) */
     CHECK(t.hist[0] == 1, "a poll with no new frame is counted");
+}
+
+/* ---- SSBU_FIGHT_HASH --------------------------------------------------------------------- */
+static void test_line_length(void) {
+    /* every number at its widest: the longest line there is */
+    FightFrame wide = {-9223372036854775807ll - 1, -2147483647 - 1, -1, ~0ull, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, 4294967295u, ~0ull};
+    char line[FIGHT_LINE_MAX + 1], cut[320];
+    uint64_t run = FIGHT_FNV_BASIS, run2 = FIGHT_FNV_BASIS;
+    int n = fight_hash_line(line, sizeof line, &run, &wide);
+    CHECK(n == FIGHT_LINE_MAX && strlen(line) == FIGHT_LINE_MAX && line[n - 1] == '\n', "the widest line: %d bytes, whole", n);
+    n = fight_hash_line(cut, sizeof cut, &run2, &wide);
+    CHECK(n == (int)sizeof cut - 1 && strlen(cut) == sizeof cut - 1 && !memcmp(cut, line, sizeof cut - 1) && run2 == run,
+          "a buffer too small: the length written (%d), not the length wanted", n);
+    CHECK(fight_hash_line(cut, 0, &run2, &wide) == 0, "no buffer: nothing written");
 }
 
 /* ---- SSBU_DEBUG_MATCH -------------------------------------------------------------------- */
@@ -246,6 +262,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "dump")) return dump();
     test_frame_end();
     test_steps();
+    test_line_length();
     test_parse();
     test_player();
     test_stage();

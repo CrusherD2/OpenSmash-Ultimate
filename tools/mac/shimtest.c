@@ -1231,6 +1231,7 @@ static void test_profiler(void) {
 /* ---- the loader and kernel, on a made-up game (-DSHIMTEST_HOST) -------------------------- */
 #ifdef SHIMTEST_HOST
 #include "host.h"
+#include "fight_test.h"   /* (SSBU_FIXED_SEED's entropy) */
 
 int rt_host_main(int argc, char **argv);   /* (runtime/host.c's main, renamed) */
 u64 rt_guest_copy(const void *data, size_t size);
@@ -1323,6 +1324,19 @@ static void g_start(Cpu *c) {   /* nn::init::Start, standing in for the game */
     c->x[0] = HEAP_BASE + 0x4000; c->x[2] = HEAP_BASE + 0x10;
     rt_svc(c, 0x06);
     say(ld64(HEAP_BASE + 0x4000) == HEAP_BASE && ld32(HEAP_BASE + 0x4010) == 5, "svcQueryMemory");
+    /* svcGetInfo 11, the random entropy (sub-ids 0 and 3): the clock's, unless SSBU_FIXED_SEED (test_host's SSBU_CWD run) */
+    u64 entropy[2], seed, ok = 1;
+    for (int i = 0; i < 2; i++) {
+        c->x[1] = 11; c->x[2] = 0; c->x[3] = i ? 3 : 0;
+        rt_svc(c, 0x29);
+        ok &= c->x[0] == 0;
+        entropy[i] = c->x[1];
+    }
+    if (fixed_seed_parse(getenv("SSBU_FIXED_SEED"), &seed))
+        say(ok && entropy[0] == fixed_entropy(seed, 0) && entropy[1] == fixed_entropy(seed, 3), "svcGetInfo 11 with SSBU_FIXED_SEED: the seed's");
+    else   /* (golden * (sub + 1) ^ the clock's ns, which had not gone on by a second since) */
+        say(ok && rt_clock_ns() - (entropy[0] ^ FIXED_GOLDEN) < 1000000000ull && rt_clock_ns() - (entropy[1] ^ FIXED_GOLDEN * 4) < 1000000000ull,
+            "svcGetInfo 11: the clock's");
     c->x[0] = ALIAS_BASE + 0x100000; c->x[1] = 0x20000;
     rt_svc(c, 0x2C);
     st32(ALIAS_BASE + 0x105000, 1);   /* (a write the write watch takes, in host.c's handler) */
@@ -1457,6 +1471,7 @@ static void test_host(void) {
     snprintf(path, sizeof path, "%s/modules", dir);
     write_images(path);
     static char out[1 << 17];
+    unsetenv("SSBU_FIXED_SEED");   /* (set only for the SSBU_CWD run, below) */
     int status = run_game(dir, "crash", out, sizeof out);
     if (getenv("SHIMTEST_VERBOSE")) printf("%s", out);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5, "the game's exit status %#x (want 5: a crash report)", status);
@@ -1465,7 +1480,7 @@ static void test_host(void) {
     CHECK(strstr(out, "[mem] write watch: page protection"), "the write watch's line");
     int oks = 0;
     for (const char *at = out; (at = strstr(at, ": ok\n")); at++) oks++;
-    CHECK(oks == 18 && !strstr(out, ": FAIL"), "the game's own checks: %d ok\n%s", oks, out);
+    CHECK(oks == 19 && !strstr(out, ": FAIL") && strstr(out, "svcGetInfo 11: the clock's: ok"), "the game's own checks: %d ok\n%s", oks, out);
     const char *d0 = strstr(out, "the thread dump:\n"), *d1 = strstr(out, "the thread dump's end");
     const char *t3 = d0 ? strstr(d0, "  thread 3 (priority 45): running or in a system call\n      main+0x200\n") : NULL;
     CHECK(t3 && t3 < d1 && strstr(d0, "  thread 1 (priority 44)"), "the thread dump (each guest thread stopped, its stack read):\n%.*s", d0 && d1 ? (int)(d1 - d0) : 0, d0 ? d0 : "");
@@ -1507,15 +1522,18 @@ static void test_host(void) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5 && strstr(out, "loaded 3 modules") && strstr(out, "/root/v13/build-mac/WindowSmash.app/Contents/MacOS/ssbu, built"),
           "the app, started from / (status %#x), its SSBU_LOG:\n%s", status, out);
     CHECK(newest_report(root, want, sizeof want), "the app's crash report not in the root's reports/: %s", root);
-    /* SSBU_CWD: the working folder given */
+    /* SSBU_CWD: the working folder given (and SSBU_FIXED_SEED: the kernel's entropy the seed's) */
     snprintf(path, sizeof path, "%s/cwd", dir);
     mkdir(path, 0755);
     snprintf(want, sizeof want, "%s/out_cwd.txt", dir);
     char modules[600];
     snprintf(modules, sizeof modules, "%s/modules", dir);
     char *cwd_args[] = {(char *)rt_exe_path(), "--host", modules, "--status", "0", NULL};
+    setenv("SSBU_FIXED_SEED", "42", 1);
     status = spawn_game(rt_exe_path(), cwd_args, "/", "crash", want, 0, path, out, sizeof out);
+    unsetenv("SSBU_FIXED_SEED");
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 5 && newest_report(path, want, sizeof want), "SSBU_CWD: no report in %s (status %#x)", path, status);
+    CHECK(strstr(out, "svcGetInfo 11 with SSBU_FIXED_SEED: the seed's: ok") != NULL, "SSBU_FIXED_SEED=42: svcGetInfo 11's entropy\n%s", out);
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (!getenv("SHIMTEST_KEEP")) system(cmd);
 }

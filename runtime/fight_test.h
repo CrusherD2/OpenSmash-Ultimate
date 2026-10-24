@@ -80,7 +80,9 @@ _Static_assert(sizeof(FightRec) == 48, "ssbu-recomp's 48-byte record");
 typedef struct FightFrame { long long f; int entry, st; uint64_t mot; float mf, x, y, dmg; uint32_t rngcalls; uint64_t rh; } FightFrame;
 
 /* One fighter's fight frame: ssbu-recomp's line, field for field, into out (the running hash
- * *run taken on first). Returns the line's length. */
+ * *run taken on first). Returns the length written: the line's, or size - 1 where it was cut
+ * short (357 bytes and its 0 hold the longest, every number at its widest). */
+enum { FIGHT_LINE_MAX = 357 };
 static inline int fight_hash_line(char *out, size_t size, uint64_t *run, const FightFrame *fr) {
     FightRec rec;
     memset(&rec, 0, sizeof rec);
@@ -89,10 +91,11 @@ static inline int fight_hash_line(char *out, size_t size, uint64_t *run, const F
     *run = fight_fnv(*run, &rec, sizeof rec);
     uint32_t bx, by, bm, bd;
     memcpy(&bx, &fr->x, 4); memcpy(&by, &fr->y, 4); memcpy(&bm, &fr->mf, 4); memcpy(&bd, &fr->dmg, 4);
-    return snprintf(out, size, "F %lld e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)\n",
-                    fr->f, fr->entry, (unsigned)fr->st, (unsigned long long)fr->mot, bm, bx, by, bd, fr->rngcalls,
-                    (unsigned)(fr->rh ^ fr->rh >> 32), (unsigned long long)*run, (double)fr->x, (double)fr->y, (double)fr->mf,
-                    (double)fr->dmg);
+    int n = snprintf(out, size, "F %lld e %d st %x mot %llx mf %08x x %08x y %08x dmg %08x rngcalls %u rng %08x H %016llx  (%.3f %.3f frame %.2f %.2f%%)\n",
+                     fr->f, fr->entry, (unsigned)fr->st, (unsigned long long)fr->mot, bm, bx, by, bd, fr->rngcalls,
+                     (unsigned)(fr->rh ^ fr->rh >> 32), (unsigned long long)*run, (double)fr->x, (double)fr->y, (double)fr->mf,
+                     (double)fr->dmg);
+    return n < 0 || !size ? 0 : (size_t)n >= size ? (int)(size - 1) : n;
 }
 
 /* ---- SSBU_DETERMINISTIC ----------------------------------------------------------------- */

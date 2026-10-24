@@ -145,7 +145,7 @@ static void frame_line(Cpu *c) {
     u32 w[FIGHT_RNG_WORDS];
     for (int i = 0; rb && i < FIGHT_RNG_WORDS; i++) w[i] = ld32(rb + 4ull * i);
     fight_rng_sum(rb ? w : NULL, &fr.rngcalls, &fr.rh);
-    char line[320];
+    char line[512];   /* (room to spare: the longest line is FIGHT_LINE_MAX bytes) */
     int n = fight_hash_line(line, sizeof line, &hash_run, &fr);
     fwrite(line, 1, (size_t)n, hash_out);
     if ((fr.f & 63) == 0) fflush(hash_out);
@@ -276,20 +276,22 @@ static int fights;
 static DebugEnd end;
 static volatile long long end_fired, end_count;
 
-void rt_upnp_remove(void);
-/* As the guest's own exit (svcExitProcess, kernel.c), the hash log written out first. */
+#ifndef _WIN32
+void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
+#endif
+/* As the window's close button ends the game (gpu_d3d11.c, linux/window.c, macos/window.m), the
+ * hash log written out first: ExitProcess, which runs no atexit handlers or libraries' destructors
+ * under the game's threads, still running mid-fight (on Linux the shim's is fflush and _exit). */
 static DWORD WINAPI end_watch(LPVOID unused) {
     (void)unused;
     while (!end_fired) Sleep(5);
     fprintf(stderr, "[fight] SSBU_DEBUG_END: %lld fight frames at frame %lld shown: the run ends\n", end_count, end_fired);
     if (hash_out) fflush(hash_out);
     fflush(NULL);
-#ifdef __APPLE__
+#ifndef _WIN32
     rt_upnp_remove();
-    ExitProcess(0);
-#else
-    exit(0);
 #endif
+    ExitProcess(0);
     return 0;
 }
 
@@ -317,6 +319,8 @@ void test_fight_start(void) {
     const char *h = getenv("SSBU_FIGHT_HASH"), *d = getenv("SSBU_DETERMINISTIC"), *o = getenv("SSBU_DET_OFF");
     const char *m = getenv("SSBU_DEBUG_MATCH"), *list = getenv("SSBU_DEBUG_MATCH_LIST");
     u64 n;
+    if (m && !*m) m = NULL;   /* (set but empty: unset, as for the others) */
+    if (list && !*list) list = NULL;
     det = d && d[0] && d[0] != '0';
     det_off = o ? atoi(o) : 0;
     if (h && h[0] && h[0] != '0') {

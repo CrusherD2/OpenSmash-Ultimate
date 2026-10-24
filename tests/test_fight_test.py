@@ -281,6 +281,12 @@ class RuntimeTests(unittest.TestCase):
         r = self.run_scenario('unset', SSBU_FIGHT_HASH='0', SSBU_DETERMINISTIC='0')
         self.assertEqual(r.stderr, '')
 
+    def test_set_but_empty_is_off(self):
+        """(As a script clears a switch: SSBU_DEBUG_MATCH= and the rest.)"""
+        r = self.run_scenario('unset', **{k: '' for k in ('SSBU_FIGHT_HASH', 'SSBU_DETERMINISTIC', 'SSBU_DET_OFF', 'SSBU_FIXED_SEED',
+                                                           'SSBU_DEBUG_MATCH', 'SSBU_DEBUG_MATCH_LIST', 'SSBU_DEBUG_END')})
+        self.assertEqual(r.stderr, '')
+
     def test_deterministic(self):
         r = self.run_scenario('det', SSBU_DETERMINISTIC='1')
         self.assertIn('[fight] SSBU_DETERMINISTIC: the 9 script random generators set to a fixed state, counters 0', r.stderr)
@@ -329,6 +335,9 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(re.findall(r'\] fight (\d+) on .* at frame (\d+) shown', r.stderr), [('1', '3'), ('2', '56')])
                 with open(path) as f:
                     self.assertEqual(len(f.read().splitlines()), 19, 'the hash lines written out at the end')
+                # as the window's close: the relay's port mapping removed, then ExitProcess (no atexit handlers)
+                self.assertTrue(r.stderr.endswith('the run ends\n(the relay\'s port mapping removed)\n'), r.stderr[-300:])
+                self.assertNotIn('atexit', r.stdout)
 
 
 class WrapTests(unittest.TestCase):

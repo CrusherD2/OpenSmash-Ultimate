@@ -419,7 +419,10 @@ static void end_tick(void) {
     test_fight_presented();
     if (shown_now > 1000) { printf("FAIL: no end after 1000 frames shown\n"); exit(5); }
 }
+/* (the end is the window close's, ExitProcess: no atexit handler runs under the game's threads) */
+static void at_exit(void) { printf("FAIL: an atexit handler ran at the end\n"); }
 static void end_run(void) {
+    atexit(at_exit);
     test_fight_start();
     CHECK(threads == 1 && thread_fn, "the exit's thread");
     printf("%d checks, %d failed\n", checks, failures);
