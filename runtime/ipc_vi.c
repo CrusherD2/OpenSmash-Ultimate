@@ -17,6 +17,8 @@
 #include "gpu.h"   /* (gpu_queue_mark / gpu_queue_wait) */
 #include "input_seq.h"
 
+void test_fight_presented(void);   /* (hle_fight_test.c) SSBU_DEBUG_END's count of fight frames */
+
 #define DISPLAY_ID 1
 #define LAYER_ID 1
 #define BINDER_ID 1
@@ -86,6 +88,7 @@ static void show(void) {
     gpu_queue_wait(shown_mark);   /* the frame drawn: what was submitted before it was queued has run */
     if (report_draws) input_seq_presented(gpu_queue_draws(shown_mark));
     present_frame(shown, shown_size);
+    test_fight_presented();
     kernel_signal_event(queue.buffer_event);
     WakeAllConditionVariable(&queue.freed);
 }

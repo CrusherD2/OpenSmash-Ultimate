@@ -68,6 +68,17 @@ class TestRunToolTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(r.stdout, '7 steps\n')
 
+    def test_documented_gate_sequence_parses(self):
+        text = DOC.read_text(encoding='utf-8')
+        m = re.search(r'<!-- gate sequence[^>]*-->\n```text\n(.*?)```', text, re.S)
+        self.assertIsNotNone(m, 'no gate sequence in docs/TESTING-RUNS.md')
+        path = os.path.join(self.dir, 'gate.seq')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(m.group(1))
+        r = self.run_test(path)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout, '58 steps\n')
+
 
 class SpeedLoopTests(unittest.TestCase):
     """SSBU_SPEED has no clock of refreshes (docs/TESTING-RUNS.md): runtime/ipc_vi.c's speed loop
@@ -88,7 +99,10 @@ class DocumentedTests(unittest.TestCase):
     """Each switch is read where the documentation says, and documented (CONTRIBUTING: one line
     where the switches are listed)."""
     SWITCHES = {'SSBU_SPEED': 'gpu_display.c', 'SSBU_SEQ': 'hle_hid.c', 'SSBU_SEQ_LOG': 'hle_hid.c',
-                'SSBU_SEQ_KEYBOARD': 'hle_hid.c', 'SSBU_SKIP_MOVIES': 'hle_movie_skip.c'}
+                'SSBU_SEQ_KEYBOARD': 'hle_hid.c', 'SSBU_SKIP_MOVIES': 'hle_movie_skip.c',
+                'SSBU_FIGHT_HASH': 'hle_fight_test.c', 'SSBU_DETERMINISTIC': 'hle_fight_test.c', 'SSBU_DET_OFF': 'hle_fight_test.c',
+                'SSBU_FIXED_SEED': 'hle_fight_test.c', 'SSBU_DEBUG_MATCH': 'hle_fight_test.c',
+                'SSBU_DEBUG_MATCH_LIST': 'hle_fight_test.c', 'SSBU_DEBUG_END': 'hle_fight_test.c'}
 
     def test_switches(self):
         doc, technical = DOC.read_text(encoding='utf-8'), (ROOT / 'docs' / 'TECHNICAL.md').read_text(encoding='utf-8')
@@ -97,6 +111,12 @@ class DocumentedTests(unittest.TestCase):
                 self.assertIn('getenv("%s")' % name, (ROOT / 'runtime' / source).read_text(encoding='utf-8'))
                 self.assertIn('`%s=' % name, doc)
                 self.assertIn('`%s`' % name, technical)
+
+    def test_every_fight_switch_is_listed(self):
+        text = (ROOT / 'runtime' / 'hle_fight_test.c').read_text(encoding='utf-8')
+        read = set(re.findall(r'getenv\("(SSBU_\w+)"\)', text))
+        self.assertEqual(read - set(self.SWITCHES), set())
+        self.assertEqual(len(read), 7)
 
 
 if __name__ == '__main__':

@@ -11,7 +11,7 @@ Usage:
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N] [--generate-only]
   recomp.py check    <exefs dir>
-  recomp.py wrap-sig <nso> <address>
+  recomp.py wrap-sig <nso> <address | exported name>
 
 The game is version 13.0.5 (tools/game_version.py); its modules are this folder's dump/exefs
 and dump/nro (the fighter modules).
@@ -28,8 +28,8 @@ all       image + build + compile every module of an ExeFS, then link; a module 
           tools/linux/build_linux.py; so does the macOS one, tools/mac/build_mac.py, and on
           macOS all always stops there)
 check     list each module's imports that no module exports and the runtime does not implement
-wrap-sig  print the code signature (a hash) of a guest function, for an HLE_WRAP (see hle_wraps)
-          or a tools/hooks.txt entry
+wrap-sig  print the code signature (a hash) of a guest function, for an HLE_WRAP (see hle_wraps),
+          an HLE_WRAP_EXPORT (by its exported name: hle_export_wraps) or a tools/hooks.txt entry
 
 Each module is recompiled for a fixed load address (see MODULES); a function is named after
 its guest address, so names are unique across modules. A module function whose exported
@@ -126,12 +126,68 @@ def hle_names():
     return names
 
 
-# `/* signature: 16 words, sha256 0123456789abcdef */`, then `HLE_WRAP(<address>)` on the next line
-WRAP = re.compile(r"^(?:/\* signature: (\d+) words?, sha256 ([0-9a-f]{16}) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", re.M)
+# `/* signature: 16 words, sha256 0123456789abcdef */`, then `HLE_WRAP(<address>)` or
+# `HLE_WRAP_EXPORT(<exported name>)` on the next line
+WRAP = re.compile(r"^(?:/\* signature: (\d+) words?, sha256 ([0-9a-f]{16}) \*/\r?\n)?"
+                  r"HLE_WRAP(?:\(([0-9a-fA-F]+)\)|_EXPORT\(([A-Za-z_][A-Za-z0-9_]*)\))", re.M)
 # any signature comment on the line before an HLE_WRAP, well-formed or not
-ANY_SIGNATURE = re.compile(r"^/\* signature:.*\r?\nHLE_WRAP\(", re.M)
+ANY_SIGNATURE = re.compile(r"^/\* signature:.*\r?\nHLE_WRAP(?:_EXPORT)?\(", re.M)
 # the old form, the masked words themselves (`/* signature: 0123abcd 4567ef89 9....... */`): the game's code
 WORDS_SIGNATURE = re.compile(r"/\* signature: [0-9a-f.]{8}(?: |\*/)")
+# C's comments, strings and characters (each one's text, which may seem to open another)
+C_COMMENT = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
+# any name that starts as the macros' do, in code: `HLE_WRAP_EXPORT (x)`, indented, after
+# `static`, `#define W HLE_WRAP_EXPORT`, `HLE_WRAP_##k`, a name a line splice cuts in two...
+ANY_WRAP = re.compile(r"\bHLE_WRAP\w*")
+
+
+def wrap_uses_unread(text):
+    """Whether text names an HLE_WRAP macro in code (not in a comment or a string) other than
+    at the start of a line in one of WRAP's forms, or has one of those forms inside a comment.
+    Each compiles, or could, with the function left unwrapped without a word (an export's:
+    nothing fails to link either). Not followed: the preprocessor's conditions (`#if 0`) and a
+    line splice that makes a comment of the next line, under which a form WRAP reads is no wrap
+    to the compiler (the build then fails to link, where a module has the function)."""
+    code = C_COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+    return ({text.rindex("HLE_WRAP", m.start(), m.end()) for m in WRAP.finditer(text)}
+            != {m.start() for m in ANY_WRAP.finditer(code)})
+
+
+def runtime_wraps():
+    """The runtime's wraps, ({address: signature}, {exported name: signature}): `HLE_WRAP(<address>)`
+    and `HLE_WRAP_EXPORT(<name>)` in its sources (hle_wraps, hle_export_wraps), in the order of the
+    sources (file names', then lines'). A signature is (word count, hash), or None. A use of
+    either macro not in its form at the start of a line, or another name in code that starts as
+    theirs do (wrap_uses_unread), one wrapped twice and a name both replaced (HLE) and wrapped
+    stop the build."""
+    by_address, by_name, replaced = {}, {}, set()
+    runtime = os.path.join(ROOT, "runtime")
+    for name in sorted(os.listdir(runtime)):
+        if name.endswith(".c") and not name.startswith("._"):
+            with open(os.path.join(runtime, name), encoding="utf-8") as f:
+                text = f.read()
+            if WORDS_SIGNATURE.search(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature spells out the game's instruction words; "
+                                 "give its hash instead (`tools/recomp.py wrap-sig <module> <address>` prints it)")
+            wraps = WRAP.findall(text)
+            if len(ANY_SIGNATURE.findall(text)) != sum(1 for n, _d, _a, _s in wraps if n):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature is not in the form "
+                                 "`/* signature: <n> words, sha256 <16 hex digits> */`")
+            if "HLE_WRAP" in text and wrap_uses_unread(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP is not `HLE_WRAP(<hex address>)` or "
+                                 "`HLE_WRAP_EXPORT(<exported name>)` at the start of a line, outside comments "
+                                 "(and code names no other that starts as they do: a string or comment may)")
+            replaced |= set(re.findall(r"^HLE\((\w+)\)", text, re.M))
+            for n, digest, a, symbol in wraps:
+                key, found = (int(a, 16), by_address) if a else (symbol, by_name)
+                if key in found:
+                    raise SystemExit(f"runtime/{name}: {f'HLE_WRAP({a})' if a else f'HLE_WRAP_EXPORT({symbol})'} "
+                                     "is wrapped twice")
+                found[key] = (int(n), digest) if n else None
+    both = sorted(replaced & set(by_name))
+    if both:
+        raise SystemExit(f"runtime: {both[0]} is both replaced (HLE) and wrapped (HLE_WRAP_EXPORT): one or the other")
+    return by_address, by_name
 
 
 def hle_wraps():
@@ -144,22 +200,21 @@ def hle_wraps():
     game's code (CONTRIBUTING.md, rule 1), so a comment that spells them out stops the build.
     A build of modules that lack it (a made-up game's: tools/mac/boottest) links its
     f_<address>_orig to rt_wrap_missing (link)."""
-    found = {}
-    runtime = os.path.join(ROOT, "runtime")
-    for name in sorted(os.listdir(runtime)):
-        if name.endswith(".c") and not name.startswith("._"):
-            with open(os.path.join(runtime, name), encoding="utf-8") as f:
-                text = f.read()
-            if WORDS_SIGNATURE.search(text):
-                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature spells out the game's instruction words; "
-                                 "give its hash instead (`tools/recomp.py wrap-sig <module> <address>` prints it)")
-            wraps = WRAP.findall(text)
-            if len(ANY_SIGNATURE.findall(text)) != sum(1 for n, _d, _a in wraps if n):
-                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature is not in the form "
-                                 "`/* signature: <n> words, sha256 <16 hex digits> */`")
-            for n, digest, a in wraps:
-                found[int(a, 16)] = (int(n), digest) if n else None
-    return found
+    return runtime_wraps()[0]
+
+
+def hle_export_wraps():
+    """Exported guest functions wrapped natively by name: `HLE_WRAP_EXPORT(<name>)` in the runtime
+    sources, name -> signature as hle_wraps has it. For a function whose address is not the same
+    in every install (a fighter module's: each install places those modules itself). Every
+    module that exports a function under that name has it wrapped as an HLE_WRAP is: the
+    function stays, as f_<address>_orig, and every caller reaches the wrapper. The wrapper is
+    handed the original it was reached through (HLE_WRAP_EXPORT in host.h), so it names no
+    module's function: two modules that define the name each keep their own, and a build in
+    which no module defines it (until that module is compiled in, or a made-up game's) links
+    as it is, with nothing for rt_wrap_missing to stand in for. A function exported under
+    several of the names has each one's wrapper, one inside the other (resolve_wraps)."""
+    return runtime_wraps()[1]
 
 
 def signature(mod, off, size, n=16):
@@ -203,11 +258,18 @@ def signature_matches(mod, off, size, sig):
 
 
 def resolve_wraps(mod, base, sizes, name):
-    """This module's wraps: {offset: ("wrap", wrapper)}. Each wrapped function must start at its
-    address and begin as its signature says: the addresses are 13.0.5's, and one that isn't there
-    (the runtime wrapping a function that moved) stops the build rather than leave a hook out."""
-    forward = {}
-    for a, sig in sorted(hle_wraps().items()):
+    """This module's wraps: {offset: ("wrap", wrapper)} for each HLE_WRAP at an address in it, and
+    {offset: ("wrap", wrapper, "export", *inner)} for each function it exports under HLE_WRAP_EXPORT
+    names. A function exported under several of them (aliases, or identical code folded into
+    one) has each name's wrapper, in the order of the runtime's sources: callers reach the
+    first, and each is handed the next (inner) as its original, the last the function itself.
+    Each wrapped function must start at its address and begin as its signature says: the
+    addresses are 13.0.5's, and one that isn't there (the runtime wrapping a function that moved)
+    stops the build rather than leave a hook out. So do a wrapped name this module exports as
+    something other than a function, and a function wrapped both by address and by name."""
+    forward, by_export = {}, {}
+    by_address, by_name = runtime_wraps()
+    for a, sig in sorted(by_address.items()):
         if max((b for b in MODULES.values() if b <= a), default=None) != base:
             continue   # another module's
         off = a - base
@@ -218,6 +280,26 @@ def resolve_wraps(mod, base, sizes, name):
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): the function there does not begin as its signature says "
                              "(the runtime's hooks are for game version 13.0.5)")
         forward[off] = ("wrap", f"hle_wrap_{a:x}")
+    for n, off, _size, info, _shndx in mod.exports if by_name else ():
+        if n not in by_name:
+            continue
+        if info & 0xF != 2:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): this module exports that name, but not as a function")
+        if off not in sizes:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): no function starts at its address {base + off:#x}")
+        if not signature_matches(mod, off, sizes[off], by_name[n]):
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): the function does not begin as its signature says "
+                             "(the runtime's hooks are for game version 13.0.5)")
+        if off in forward:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): the function at {base + off:#x} is wrapped already "
+                             f"({forward[off][1]})")
+        names = by_export.setdefault(off, [])
+        if n not in names:   # (a name the symbol table has twice for it: one wrapper, once)
+            names.append(n)
+    order = {n: i for i, n in enumerate(by_name)}
+    for off, names in by_export.items():
+        first, *inner = (f"hle_wrap_{n}" for n in sorted(names, key=order.get))
+        forward[off] = ("wrap", first, "export", *inner)
     return forward
 
 
@@ -428,10 +510,13 @@ def resolve_hooks(mod, base, sizes, name, entries=None, imports=None, native=())
 def tools_fingerprint():
     """What the generated C depends on besides the module and its address (modcache)."""
     import lift
-    wraps = sorted(hle_wraps().items())
+    by_address, by_name = runtime_wraps()
+    wraps = sorted(by_address.items())
     hooks = sorted(hook_list().items())
     return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + "\n" + repr(hooks)
-                                + f"\nregcache {int(lift.REGCACHE)}")
+                                + f"\nregcache {int(lift.REGCACHE)}"
+                                # (in the sources' order: the order of the wrappers of a function exported under several)
+                                + (f"\nexport wraps {list(by_name.items())!r}" if by_name else ""))
 
 
 def write_if_changed(path, text):
@@ -699,11 +784,16 @@ def module_table(mod, name, base, funcs, missing):
 
 def forwards(mod, base, found, funcs, name):
     """{offset: what replaces the function there}: the native function of an exported name
-    the runtime implements (hle_names), libunwind's jumpto, and the wraps (resolve_wraps)."""
+    the runtime implements (hle_names), libunwind's jumpto, and the wraps (resolve_wraps). A
+    function both replaced and wrapped (two names for it) stops the build."""
     hle = hle_names()
     forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
     forward.update(unwind_jumpto(mod, found))
-    forward.update(resolve_wraps(mod, base, dict(funcs), name))
+    for off, wrap in sorted(resolve_wraps(mod, base, dict(funcs), name).items()):
+        if off in forward:
+            raise SystemExit(f"{name}: the function at {base + off:#x} is both replaced ({forward[off]}) "
+                             f"and wrapped ({wrap[1]})")
+        forward[off] = wrap
     return forward
 
 
@@ -954,10 +1044,16 @@ if __name__ == "__main__":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), compile_c) else 1)
     elif cmd == "check":
         check(nso)
-    elif cmd == "wrap-sig":
+    elif cmd == "wrap-sig":   # (an address, or for HLE_WRAP_EXPORT the exported name)
         m = Module(nso)
-        a = int(sys.argv[3], 16)
-        off = a - base_of(nso)
+        if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", sys.argv[3]):
+            a = int(sys.argv[3], 16)
+            off = a - base_of(nso)
+        else:
+            off = next((v for n, v, _s, info, _x in m.exports if n == sys.argv[3] and info & 0xF == 2), None)
+            if off is None:
+                sys.exit(f"{nso} exports no function named {sys.argv[3]}")
+            a = base_of(nso) + off
         sizes = dict(load(nso)[2])
         if off not in sizes:
             sys.exit(f"{a:x} is not a function start in {nso}")

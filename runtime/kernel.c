@@ -18,6 +18,7 @@
 
 #include "host.h"
 #include "gpu.h"   /* (gpu_memory_unmapping) */
+#include "fight_test.h"   /* (SSBU_FIXED_SEED) */
 
 #ifdef __APPLE__
 void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
@@ -549,7 +550,13 @@ static u32 get_info(Cpu *c, u32 id, u64 sub, u64 *out) {
     case 6: case 21: *out = 0xCD500000ull; break;       /* memory an application gets on the console */
     case 7: case 22: *out = image + heap_size; break;
     case 8: *out = 0; break;                            /* no debugger */
-    case 11: *out = 0x9E3779B97F4A7C15ull * (sub + 1) ^ now_ns(); break;   /* entropy */
+    case 11: {   /* entropy; with SSBU_FIXED_SEED a function of the seed (docs/TESTING-RUNS.md) */
+        static int fixed = -1;
+        static u64 seed;
+        if (fixed < 0) fixed = fixed_seed_parse(getenv("SSBU_FIXED_SEED"), &seed);
+        *out = fixed ? fixed_entropy(seed, sub) : 0x9E3779B97F4A7C15ull * (sub + 1) ^ now_ns();
+        break;
+    }
     case 12: *out = ASPACE_BASE; break;
     case 13: *out = ASPACE_SIZE; break;
     case 14: *out = STACK_BASE; break;

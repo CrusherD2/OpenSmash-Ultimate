@@ -27,6 +27,9 @@
 /* `HLE_WRAP(address) { ... }` wraps a guest function no module exports, at that (hex) address:
  * the recompiler keeps it as f_<address>_orig and sends every caller here instead. */
 #define HLE_WRAP(addr) GuestFn f_##addr##_orig; void hle_wrap_##addr(Cpu *c)
+/* `HLE_WRAP_EXPORT(name) { ... }` wraps the function exported under that (mangled) name in every
+ * module that defines it, wherever the module lies (a fighter module's); `orig(c)` runs it. */
+#define HLE_WRAP_EXPORT(sym) void hle_wrap_##sym(Cpu *c, GuestFn *orig)
 /* Guest memory is mapped RT_MEMBASE above the guest's addresses (recomp.h: 0 but on macOS), so
  * a guest address handed to the host - as a pointer, to the C library, to the OS - goes through
  * these, as recomp.h's ld and st helpers do. */
