@@ -415,6 +415,22 @@ class WindowsBuildTests(Folder):
         self.assertIn('main: 1 object to compile again: the runtime headers changed', self.said)
         self.assertEqual(self.compile(), (True, []))
 
+    def test_no_object_older_than_hookable_h_taken_as_current(self):
+        """A folder with no record: an object is taken as current by date only when it is newer than hookable.h
+        too. A file with hook slots is keyed on it, so the key recorded for an object compiled before it changed
+        would say it was compiled with the new one."""
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100001000(void) {}\n')
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.compile(), (True, []))   # (newer than hookable.h: taken as current)
+        record.unlink()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n', age=-7200)
+        self.assertEqual(self.compile(), (True, ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']))
+        self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+        self.assertEqual(self.compile(), (True, []))
+
     def test_the_folder_spelled_another_way_or_moved(self):
         """The key names a file and its object by their names in the folder: build/main, ./build/main, the
         full path (build\\main on Windows), or the build folder moved, compile nothing again."""
@@ -599,6 +615,21 @@ class LinuxBuildTests(Folder):
         self.build()
         write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n')
         self.assertEqual(self.build(), (True, ['g0000.c -O2']))
+        self.assertEqual(self.build(), (True, []))
+
+    def test_no_object_older_than_hookable_h_taken_as_current(self):
+        """As on Windows: with no record, an object older than hookable.h is not taken as current."""
+        main = self.tree / 'build' / 'main'
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100000000(void) {}\n')
+        self.build()
+        record = self.out / 'main' / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.build(), (True, []))   # (newer than hookable.h: taken as current)
+        record.unlink()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n', age=-7200)
+        self.assertEqual(self.build(), (True, ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']))
+        self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
         self.assertEqual(self.build(), (True, []))
 
     def test_landing_sites_found_once(self):

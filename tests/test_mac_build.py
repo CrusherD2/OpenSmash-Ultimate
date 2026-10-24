@@ -265,6 +265,37 @@ class BuildMacTests(unittest.TestCase):
         again = [os.path.relpath(j[1], self.ns['OBJ']) for j in self.ns['game_jobs']()]
         self.assertEqual(again, [os.path.join('main', 'g0000.o')])
 
+    def test_hook_slots_looked_for_in_the_head_of_the_c(self):
+        """Once hookable.h has changed, the objects of files without slots stay older than it, so they are
+        asked about at every build: only the head of the C is read for that, not the whole file."""
+        runtime = self.top / 'runtime'
+        for n in ('recomp.h', 'module.h', 'hookable.h'):
+            write(runtime / n, '#pragma once\n')
+        self.ns['RUNTIME'] = str(runtime)
+        write(self.tree / 'build' / 'main' / 'g0000.c', '#include "recomp.h"\n\nvoid f(void) {\n' + '    x = x + 1;\n' * 4000 + '}\n')
+        self.compile(self.ns['game_jobs']())   # (objects an hour from now)
+        later = time.time() + 7200
+        os.utime(runtime / 'hookable.h', (later, later))
+        read, real = [], open
+
+        class Spy(io.BytesIO):
+            def close(self):
+                read.append(self.tell())
+                super().close()
+
+        def spy(path, mode='r', *args, **kwargs):   # (the C opened as bytes: how much of it is read)
+            if 'b' in mode and str(path).endswith('.c'):
+                with real(path, mode) as f:
+                    return Spy(f.read())
+            return real(path, mode, *args, **kwargs)
+        self.ns['open'] = spy
+        try:
+            self.assertEqual(self.ns['game_jobs'](), [])
+        finally:
+            del self.ns['open']
+        self.assertTrue(read)
+        self.assertLessEqual(max(read), 256)
+
     def test_stopped_half_way(self):
         """What a build stopped part of the way through compiled is kept: each object is recorded
         as it is compiled."""
