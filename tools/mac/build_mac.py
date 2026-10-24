@@ -28,7 +28,8 @@ game's compile command changed (the runtime's: obj/rt/cflags.txt). <out> holds o
 tree's into another <out>, or give --replace to start this one over (also this tree's own).
 A file the compiler crashes on, or a generated one that runs over its time limit, is compiled again
 another way (tools/ladder.py: <out>/ladder_report.txt lists them, and its line in game_sources.tsv
-says how); obj/compile_times.json keeps what each generated file took, for the next build's order."""
+says how); obj/compile_times.json keeps what each generated file took, for the next build's time
+left and time limits (its order too, only with SSBU_LONGEST_FIRST=1)."""
 import os
 import plistlib
 import re

@@ -21,7 +21,8 @@ the link writes (tools/isa.py), says what all of it is compiled for. <out> holds
 progress bar shows how far it has got and the time left (tools/progress.py). A file the compiler
 crashes on, or a generated one that runs over its time limit, is compiled again another way
 (tools/ladder.py: <out>/ladder_report.txt lists them); <out>/compile_times.json keeps what each
-generated file took, for the next build's order and time left."""
+generated file took, for the next build's time left and time limits (its order too, only with
+SSBU_LONGEST_FIRST=1)."""
 import os
 import re
 import shutil

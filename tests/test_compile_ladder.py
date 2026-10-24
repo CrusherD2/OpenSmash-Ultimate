@@ -4,7 +4,8 @@ limit stopped with every process it started and nothing half-written left, then 
 its longest functions unoptimised (optnone, from a header given before the file), then whole at -O0
 or /Od; what the ladder compiled kept until what it is built from changes (objcache, macOS's
 game_sources.tsv); a build stopped (Ctrl+Z) not counted against a time limit, a build too busy to
-look counted; each file's seconds kept for the next build's time left (and its order, with
+look counted where waitid tells the two apart (else, as on Windows, a late look taken for a pause such
+as Modern Standby); a header that cannot be written; each file's seconds kept for the next build's time left (and its order, with
 SSBU_LONGEST_FIRST=1); the report; SSBU_OPTNONE_ABOVE; and every compile command, and the order they
 start in, as before when nothing goes wrong, on a first build and on the next. Made-up sources and
 the made-up compiler of tests/test_objcache.py; the last tests run the real clang on made-up C, where
@@ -112,15 +113,19 @@ def pool():
 
 class Clock:
     """ladder.clock jumping on by `by` seconds `after` seconds from now: time that went by while the build did
-    not look. held: the compilers were stopped meanwhile (a build stopped with Ctrl+Z), which ladder.stopped
-    tells each compile once, at its first look past the jump; else the build was only too busy to look (a PC
-    paging hard), and nothing tells it so."""
-    def __init__(self, after, by, held=True):
-        self.t0, self.after, self.by, self.held = time.monotonic(), after, by, held
+    not look. held: True, the compilers were stopped meanwhile (a build stopped with Ctrl+Z), which
+    ladder.stopped tells each compile once, at its first ask after the jump; False, the build was only too busy
+    to look (a PC paging hard), and nothing tells it so; None, what Windows sees (and macOS's Python before
+    3.13): ladder.stopped cannot tell either. in_ask: the stop comes while a look asks ladder.stopped, which
+    then tells it (asked after the going on), and the jump starts there."""
+    def __init__(self, after, by, held=True, in_ask=False):
+        self.t0, self.after, self.by, self.held, self.in_ask = time.monotonic(), after, by, held, in_ask
         self.local = threading.local()   # (each compile looks from a thread of its own)
 
     def __call__(self):
         now = time.monotonic()
+        if self.in_ask:
+            return now + self.by if getattr(self.local, 'jumped', False) else now
         if now - self.t0 <= self.after:
             return now
         if not getattr(self.local, 'told', False):
@@ -128,6 +133,13 @@ class Clock:
         return now + self.by
 
     def stopped(self, proc):
+        if self.held is None:
+            return None
+        if self.in_ask:
+            if getattr(self.local, 'jumped', False) or time.monotonic() - self.t0 <= self.after:
+                return False
+            self.local.jumped = True
+            return True
         told, self.local.pending = getattr(self.local, 'pending', False), False
         return told and self.held
 
@@ -240,6 +252,48 @@ class RunTests(unittest.TestCase):
         self.assertLess(time.monotonic() - t0, 30)
         self.assertLess(r.seconds, 10)
 
+    def test_stopped_in_the_middle_of_a_look(self):
+        """A Ctrl+Z that comes as a look asks whether the compiler was stopped: the time is read after that ask, so
+        the stop is inside this look's time, which the ask's answer leaves out (read before it, the stop fell in the
+        next look's time, which nothing tells, and the file went over its limit)."""
+        with Clock(0.5, 3600.0, in_ask=True).patched():
+            r = ladder.run([sys.executable, '-c', 'import time; time.sleep(2)'], 600.0, threading.Event())
+        self.assertEqual((r.code, r.timed_out), (0, False))
+        self.assertLess(r.seconds, 60)
+
+    def test_where_nothing_tells_a_late_look_is_a_pause(self):
+        """Windows (and macOS's Python before 3.13): ladder.stopped cannot tell (None), so a look more than
+        ladder.PAUSED seconds late is taken for a pause, such as Modern Standby, which suspends the build and its
+        compilers while Windows' clock runs on. An hour of it is not over the limit, nor in the compile's seconds."""
+        with Clock(0.5, 3600.0, held=None).patched():
+            r = ladder.run([sys.executable, '-c', 'import time; time.sleep(2)'], 600.0, threading.Event())
+        self.assertEqual((r.code, r.timed_out), (0, False))
+        self.assertLess(r.seconds, 60)
+
+    def test_what_stopped_can_tell(self):
+        """ladder.stopped: None where nothing tells (no waitid: Windows, macOS's Python before 3.13), else whether
+        the compiler was stopped or let go on since it was last asked; False once it has ended."""
+        self.assertEqual(ladder.waitid is None, os.name == 'nt' or not hasattr(os, 'waitid'))
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        with mock.patch.object(ladder, 'waitid', None):
+            self.assertIsNone(ladder.stopped(p))
+        if ladder.waitid is None:
+            self.assertIsNone(ladder.stopped(p))
+            return
+        self.assertIs(ladder.stopped(p), False)
+        os.kill(p.pid, signal.SIGSTOP)
+        os.kill(p.pid, signal.SIGCONT)
+        end = time.monotonic() + 10
+        while not ladder.stopped(p) and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertLess(time.monotonic(), end)
+        self.assertIs(ladder.stopped(p), False)   # (told once)
+        p.kill()
+        p.wait()
+        self.assertIs(ladder.stopped(p), False)
+
     def test_a_late_look_counts_when_the_compiler_ran(self):
         """An hour in which the build did not look (a PC paging hard, as a compile running away with its memory makes
         it), its compiler not stopped: counted, so that compile is stopped as soon as the build looks again."""
@@ -256,34 +310,46 @@ class RunTests(unittest.TestCase):
         ladder.PAUSED) half a second in. The build stopped with Ctrl+Z, its compiler with it (its process group:
         SIGSTOP stops it as Ctrl+Z's SIGTSTP does): the stop is not counted, and the file compiles. The build alone
         stopped (what a PC too busy to look does to it), its compiler working on: counted, and the compile stopped by
-        its limit as soon as the build looks again."""
-        script = ('import sys, threading, time\nsys.path.insert(0, sys.argv[1])\nimport ladder\n'
+        its limit as soon as the build looks again. Each also with a Python without os.waitid (macOS's before 3.13),
+        where nothing tells the two apart: both stops taken for a pause, the busy compile stopped by its limit only
+        once it has had its 4 s of running."""
+        script = ('import os, sys, threading, time\nsys.path.insert(0, sys.argv[1])\n'
+                  'if sys.argv[3] == "untold": os.__dict__.pop("waitid", None)\nimport ladder\n'
                   'work = [sys.executable, "-c", "import sys, time\\nwhile time.process_time() < float(sys.argv[1]): pass", '
                   'sys.argv[2]]\nprint("ready", flush=True)\nt0 = time.monotonic()\n'
                   'r = ladder.run(work, 4.0, threading.Event())\n'
                   'print(r.code, r.seconds, r.timed_out, time.monotonic() - t0, flush=True)\n')
         builds = {}
-        for name, work in (('ctrl+z', '1.5'), ('busy', '60')):
-            builds[name] = p = subprocess.Popen([sys.executable, '-c', script, str(ROOT / 'tools'), work],
-                                                stdout=subprocess.PIPE, text=True, start_new_session=True)
-            self.addCleanup(self.end, p)
+        for told in ('told', 'untold'):
+            for name, work in (('ctrl+z', '1.5'), ('busy', '60')):
+                builds[name, told] = p = subprocess.Popen([sys.executable, '-c', script, str(ROOT / 'tools'), work, told],
+                                                          stdout=subprocess.PIPE, text=True, start_new_session=True)
+                self.addCleanup(self.end, p)
         for p in builds.values():
             self.assertEqual(p.stdout.readline(), 'ready\n')
         time.sleep(0.5)
-        os.killpg(builds['ctrl+z'].pid, signal.SIGSTOP)   # (the build and its compiler)
-        os.kill(builds['busy'].pid, signal.SIGSTOP)       # (the build alone)
+        for told in ('told', 'untold'):
+            os.killpg(builds['ctrl+z', told].pid, signal.SIGSTOP)   # (the build and its compiler)
+            os.kill(builds['busy', told].pid, signal.SIGSTOP)       # (the build alone)
         time.sleep(7)
-        os.killpg(builds['ctrl+z'].pid, signal.SIGCONT)
-        os.kill(builds['busy'].pid, signal.SIGCONT)
-        said = {name: p.communicate(timeout=60)[0].split() for name, p in builds.items()}
-        code, seconds, timed_out, took = said['ctrl+z']
-        self.assertEqual((int(code), timed_out), (0, 'False'))
-        self.assertLess(float(seconds), 4)
-        self.assertGreater(float(took) - float(seconds), 6)   # (the stop, not counted)
-        code, seconds, timed_out, took = said['busy']
-        self.assertEqual(timed_out, 'True')
-        self.assertGreater(float(seconds), 7)
-        self.assertLess(float(took), 12)
+        for told in ('told', 'untold'):
+            os.killpg(builds['ctrl+z', told].pid, signal.SIGCONT)
+            os.kill(builds['busy', told].pid, signal.SIGCONT)
+        said = {key: p.communicate(timeout=60)[0].split() for key, p in builds.items()}
+        for told in ('told', 'untold'):
+            with self.subTest(told):
+                code, seconds, timed_out, took = said['ctrl+z', told]
+                self.assertEqual((int(code), timed_out), (0, 'False'))
+                self.assertLess(float(seconds), 4)
+                self.assertGreater(float(took) - float(seconds), 6)   # (the stop, not counted)
+                code, seconds, timed_out, took = said['busy', told]
+                self.assertEqual(timed_out, 'True')
+                if told == 'told' and hasattr(os, 'waitid'):
+                    self.assertGreater(float(seconds), 7)
+                    self.assertLess(float(took), 12)
+                else:   # (the stop taken for a pause: 4 s of running, after it)
+                    self.assertLess(float(seconds), 7)
+                    self.assertGreater(float(took), 10)
 
     def end(self, p):
         """A build of the test above gone, with whatever it started."""
@@ -376,8 +442,9 @@ class LimitTests(unittest.TestCase):
             ladder.optnone_setting({'SSBU_OPTNONE_ABOVE': '2.5'})
         self.assertEqual([ladder.longest_first_setting(env) for env in ({}, {'SSBU_LONGEST_FIRST': '0'}, {'SSBU_LONGEST_FIRST': '1'})],
                          [False, False, True])   # (off unless set)
-        with self.assertRaises(SystemExit):
-            ladder.longest_first_setting({'SSBU_LONGEST_FIRST': 'yes'})
+        for bad in ('yes', '2', '-1'):
+            with self.subTest(bad), self.assertRaisesRegex(SystemExit, f'^SSBU_LONGEST_FIRST={bad}: 1 to start'):
+                ladder.longest_first_setting({'SSBU_LONGEST_FIRST': bad})
         self.assertIn('; SSBU_LONGEST_FIRST=1; clang',
                       ladder.Ladder(lambda *a: 1.0, 'clang', env={'SSBU_LONGEST_FIRST': '1'}).describe())
 
@@ -582,11 +649,10 @@ class WindowsLadderTests(made_up.Folder):
         self.assertEqual(self.left_behind(), [])
         self.assertEqual(self.compile(LIMIT), (True, []))
 
-    def test_a_header_that_cannot_be_written(self):
+    @contextlib.contextmanager
+    def no_header(self):
         """The optnone header cannot be written (a full disk; on Windows the file still held a moment after a compiler
-        was stopped): that try fails as an error would, and the ladder goes on to /Od, which needs no header, rather
-        than the build stopping."""
-        self.g0001(generated(('f_7100001000', 50), note='slow unless O0'))
+        was stopped)."""
         real = open
 
         def held(path, *args, **kw):
@@ -594,13 +660,51 @@ class WindowsLadderTests(made_up.Folder):
                 raise PermissionError(13, 'Permission denied', str(path))
             return real(path, *args, **kw)
         with mock.patch.object(ladder, 'open', held, create=True):
+            yield
+
+    def test_a_header_that_cannot_be_written(self):
+        """The optnone header cannot be written: that try is not made, and the ladder goes on to /Od, which needs no
+        header, rather than the build stopping. A file still over its time limit at /Od is explained as one, not by
+        the header."""
+        self.g0001(generated(('f_7100001000', 50), note='slow unless O0'))
+        with self.no_header():
             self.assertEqual(self.compile(LIMIT), (True, ['g0000.c /O2', 'g0001.c /O1', 'g0001.c /Od', 'g_module.c /O1']))
         self.assertIn(' /Od ', (self.module / 'g0001.obj').read_text())
         self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/Od'})
+        self.assertIn('main/g0001.c: could not write ', self.said)
         self.assertRegex(Path(self.dir / 'build', ladder.REPORT).read_text(),
                          r'main/g0001.c  \d+ s  /Od  over its time limit \(2 s\) at /O1; with its one function over 40 instructions '
-                         r'unoptimised \(optnone\), the rest at /O1: an error; compiled whole at /Od\n')
+                         r'unoptimised \(optnone\), the rest at /O1: could not write \S+g0001.optnone.h \(\[Errno 13\] Permission '
+                         r'denied: \S+\); compiled whole at /Od\n')
         self.assertEqual(self.left_behind(), [])
+        self.g0001(generated(('f_7100001000', 50), note='slow'))
+        with self.no_header():
+            ok, runs = self.compile(LIMIT)
+        self.assertEqual((ok, runs), (False, ['g0001.c /O1', 'g0001.c /Od']))
+        self.assertIn('FAILED g0001.c:\nmain/g0001.c did not finish compiling within its time limit, unoptimised either', self.said)
+        self.assertEqual(self.left_behind(), [])
+
+    def test_optnone_above_s_header_that_cannot_be_written(self):
+        """SSBU_OPTNONE_ABOVE's header cannot be written: the file compiled whole at its own level instead, recorded as
+        the ladder's way from there (kept by the next build that starts it the same way), and said; a crash then
+        compiled again at its level, then lower, without the header."""
+        above = {'SSBU_OPTNONE_ABOVE': '40'}
+        with self.no_header():
+            self.assertEqual(self.compile(above), (True, ['g0000.c /O2', 'g0001.c /O2', 'g_module.c /O1']))
+        self.assertNotIn('/FI', (self.module / 'g0001.obj').read_text())
+        self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/O2', 'from': 40})
+        self.assertIn(f'could not write {self.module / "g0001.optnone.h"} ', self.said)
+        self.assertIn(': compiling main/g0001.c whole at /O2 instead', self.said)
+        self.assertRegex(Path(self.dir / 'build', ladder.REPORT).read_text(),
+                         r'main/g0001.c  \d+ s  /O2  its optnone header could not be written: compiled whole at /O2\n')
+        self.assertEqual(self.left_behind(), [])
+        self.assertEqual(self.compile(above), (True, []))
+        self.g0001(generated(('f_7100001000', 50), ('f_7100001400', 20), note='crash at /O2'))
+        with self.no_header():
+            self.assertEqual(self.compile(above), (True, ['g0001.c /O1', 'g0001.c /O2', 'g0001.c /O2']))   # (its own level, again, then /O1)
+        self.assertNotIn('/FI', (self.module / 'g0001.obj').read_text())
+        self.assertEqual(self.recorded()['g0001.obj']['ladder'], {'level': '/O1', 'from': 40})
+        self.assertEqual(self.compile(above), (True, []))
 
     def test_a_file_that_never_finishes_stops_the_build_with_an_explanation(self):
         self.g0001(generated(('f_7100001000', 50), note='slow'))
@@ -643,11 +747,13 @@ class WindowsLadderTests(made_up.Folder):
             self.assertTrue(gone(self.cc.grandchildren()))
         self.assertEqual([(os.path.basename(t[0]), t[2]) for t in recomp.stale_files(str(self.module))], [('g0001.c', '/O1')])
 
-    def test_a_build_stopped_is_not_over_the_time_limit(self):
-        """An hour stopped with Ctrl+Z, its compilers with it, in the middle of a compile (a PC asleep is not in
-        ladder.clock at all): no file over its time limit, none compiled another way, and the hour not in its time."""
+    def test_a_build_paused_is_not_over_the_time_limit(self):
+        """An hour in which the build did not run, its compilers with it, in the middle of a compile: Modern Standby,
+        which Windows' clock counts (a PC asleep is not in it at all), and of which nothing tells (ladder.stopped:
+        None, as on Windows). Taken for a pause: no file over its time limit, none compiled another way, and the hour
+        not in its time."""
         self.g0001(generated(('f_7100001000', 50), note='takes 3 s'))
-        with Clock(1.0, 3600.0).patched():
+        with Clock(1.0, 3600.0, held=None).patched():
             self.assertEqual(self.compile(), (True, ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']))
         self.assertNotIn('still compiling', self.said)
         self.assertNotIn('ladder', self.recorded()['g0001.obj'])

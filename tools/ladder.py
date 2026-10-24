@@ -26,7 +26,9 @@ PC's pace: the seconds it has taken for an estimated second in this build so far
 builds' pace until enough is compiled, PACE_UNKNOWN before any; never less than 1). The pace is
 asked again every second, so a big file started first gets a limit that follows what the build
 learns. Time the compiler does not run, a PC asleep (clock) or a build stopped with Ctrl+Z
-(stopped), does not count; a PC too busy to look on time counts in full (run).
+(stopped), does not count; a PC too busy to look on time counts in full (run) where stopped can
+tell the two apart (Linux; macOS from Python 3.13), and is taken for a pause where it cannot
+(Windows, where Modern Standby pauses the build in a clock that runs on; macOS before 3.13).
 SSBU_COMPILE_LIMIT=<seconds> gives every generated file that limit instead (0: none; then the files
 the ladder compiled another way are compiled again the normal way). The runtime's files have no
 time limit: only the crash retry.
@@ -70,7 +72,7 @@ PACE_UNKNOWN = 4.0      # this PC's pace taken to be this until it is measured
 MEASURED = 60.0         # estimated seconds compiled before a pace counts (as tools/progress.py's)
 THRESHOLDS = (20000, 5000, 1250)   # optnone on the functions longer than these (instructions), in turn
 POLL = 1.0              # how often a running compile's limit is asked again
-PAUSED = 5.0            # a look this much later than asked, its compiler not seen stopped: asked again (run)
+PAUSED = 5.0            # a look this much later than asked: its compiler asked again, or taken for a pause (run)
 REPORT, TIMES_FILE = "ladder_report.txt", "compile_times.json"
 
 # A crash is told from an error in the code by what clang prints (it exits with 1 either way): its crash
@@ -119,9 +121,13 @@ def optnone_setting(env=None):
 
 def longest_first_setting(env=None):
     """SSBU_LONGEST_FIRST: whether the files start the longest first by what they took last time
-    (longest_first); off unless set to 1 (for benchmarking: the order is the build's speed)."""
-    return bool(_setting(os.environ if env is None else env, ORDER_ENV,
-                         "1 to start the files the longest first by what they took last time (0: off)", integer=True))
+    (longest_first); off unless set to 1 (for benchmarking: the order is the build's speed). 1 or 0."""
+    env = os.environ if env is None else env
+    what = "1 to start the files the longest first by what they took last time (0: off)"
+    value = _setting(env, ORDER_ENV, what, integer=True)
+    if value not in (None, 0, 1):
+        raise SystemExit(f"{ORDER_ENV}={env.get(ORDER_ENV).strip()}: {what}")
+    return value == 1
 
 
 def settings(env=None):
@@ -221,17 +227,25 @@ def _clock():
 clock = _clock()
 
 
+# (None where it cannot tell a compiler stopped: Windows, and macOS's Python before 3.13, which has no waitid)
+waitid = None if os.name == "nt" else getattr(os, "waitid", None)
+
+
 def stopped(proc):
     """Whether a running compiler has been stopped, or let go on, since this was last asked: what a build
     stopped with Ctrl+Z does to every process in it, its compilers too (they stay in its process group).
     waitid reports that of a child without taking one that has ended from subprocess (macOS reports the
-    stop as well as the going on). Never on Windows, where nothing stops a build so."""
-    if os.name == "nt" or not hasattr(os, "waitid") or proc.returncode is not None:
+    stop as well as the going on). None where nothing tells (waitid): on Windows, where Modern Standby
+    pauses every desktop program, the build and its compilers, while the clock runs on (it is the
+    working state, S0), and on macOS with a Python before 3.13."""
+    if waitid is None:
+        return None
+    if proc.returncode is not None:
         return False
     found = False
     for _ in range(4):
         try:
-            r = os.waitid(os.P_PID, proc.pid, os.WCONTINUED | os.WNOHANG)
+            r = waitid(os.P_PID, proc.pid, os.WCONTINUED | os.WNOHANG)
         except (OSError, ValueError):   # (ChildProcessError: it has ended, and subprocess has it)
             return found
         if r is None:
@@ -255,18 +269,26 @@ def run(argv, limit=None, stop=None, **popen):
     time limit moves on by that much: a PC asleep (clock does not count it), and the time between two
     looks in which the compiler was stopped and let go on (a build stopped with Ctrl+Z: stopped). A look
     late only because the PC is too busy (paging, say, as a compile running away with the memory makes
-    it) counts in full."""
+    it) counts in full. Where stopped cannot tell (None: Windows, macOS's Python before 3.13), a look
+    more than PAUSED seconds later than asked is taken for a pause (Modern Standby, Ctrl+Z), as a PC too
+    busy to look is not told from it there."""
     t0 = last = clock()
     paused, wait = 0.0, 0.0
 
     def look():   # (the time now, past every stop so far)
         nonlocal last, paused
+        # (asked at every look, a stop long before not taken for this look's; before the time is read, so that a
+        # stop that comes between the two is inside this look's time, and found by the asking again below)
+        held = stopped(proc)
         now = clock()
         late = now - last - wait
-        held = stopped(proc)   # (asked at every look: a stop long before is not taken for this look's)
-        if not held and late > PAUSED:   # (the build can be let go on a moment before its compiler is)
+        if held is False and late > PAUSED:   # (the build can be let go on a moment before its compiler is)
             time.sleep(0.05)
             held = stopped(proc)
+            now = clock()
+            late = now - last - wait
+        if held is None:   # (nothing tells: a look this late is taken for a pause)
+            held = late > PAUSED
         if held and late > 0:
             paused += late
         last = now
@@ -446,17 +468,22 @@ def header_name(obj):
     return os.path.splitext(obj)[0] + ".optnone.h"
 
 
+class NoHeader(Exception):
+    """The optnone header could not be written (_write_header): a try that needs it is not made."""
+
+
 def _write_header(path, text):
     """Writes the optnone header: None, or why it could not be (a full disk; on Windows the file still held
     a moment after the compiler stopped before it let go, so tried again for a moment, as remove_partial)."""
     for attempt in range(5):
+        if attempt:
+            time.sleep(0.1 * attempt)
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             return None
         except OSError as e:
             failed = e
-            time.sleep(0.1 * (attempt + 1))
     try:   # (what was written of it)
         os.remove(path)
     except OSError:
@@ -795,7 +822,7 @@ class Ladder:
             failures = []
             for job, result in zip(jobs, results):   # (the crashes: each on its own, once the others are done)
                 if result is not None and result[0] == "crash":
-                    result = self._after_crash(job, argv, infos.get(job[1]), result[1], hooks, compiled, times)
+                    result = self._after_crash(job, argv, infos.get(job[1]), *result[1:], hooks, compiled, times)
                 if result is not None:
                     failures.append(result[1])
             return failures
@@ -809,13 +836,14 @@ class Ladder:
                 times.save()
 
     def _attempt(self, job, argv, step, info, first=False):
-        """One try at a job, the step's way: Run. Stopped when the build is interrupted."""
+        """One try at a job, the step's way: Run. Stopped when the build is interrupted; NoHeader when its
+        optnone header cannot be written (the try is not made)."""
         obj = job[1]
         header = header_name(obj) if step.header else None
         if header:
             failed = _write_header(header, step.header)
-            if failed:   # (this try fails as an error would: the ladder goes on to the next, /Od needing none)
-                return Run(1, f"could not write {header} ({failed})", 0.0)
+            if failed:
+                raise NoHeader(f"could not write {header} ({failed})")
         try:
             r = run(argv(job, step.level, header), self.limit(info, step, first), self.stopping, **self.popen)
         except BaseException:
@@ -847,50 +875,68 @@ class Ladder:
         """A job's own way: its level, with SSBU_OPTNONE_ABOVE's header if it has one."""
         return Step(job[2], info.above, info.header, info.names, info.left) if info else Step(job[2])
 
+    def _own_attempt(self, job, argv, step, info, first=False):
+        """_attempt the job's own way (or a crash retry's level of it): (Run, the step it was compiled with).
+        SSBU_OPTNONE_ABOVE's header that cannot be written: the file compiled whole at that level instead,
+        which the ladder still follows (the default build's way at that level)."""
+        try:
+            return self._attempt(job, argv, step, info, first), step
+        except NoHeader as e:
+            whole = Step(step.level)
+            self.log(f"{e}: compiling {self._label(job, info)} {whole.describe()} instead")
+            return self._attempt(job, argv, whole, info, first), whole
+
     def _first(self, job, argv, info, hooks, compiled, times):
-        """A job's own compile, then the ladder if it ran over its time limit. None, or ("crash", Run) to
-        compile it again once the others are done, or ("fail", (src, error text))."""
+        """A job's own compile, then the ladder if it ran over its time limit. None, or ("crash", Run, its
+        step) to compile it again once the others are done, or ("fail", (src, error text))."""
         if self.stopping.is_set():
             return None
-        step = self._own(job, info)
+        own = self._own(job, info)
         hooks.started(job)
         try:
-            r = self._attempt(job, argv, step, info, first=True)
+            r, step = self._own_attempt(job, argv, own, info, first=True)
         except Stopped:
             return None
         if not r.code and not r.timed_out:
-            if info:
-                self.pace.add(r.seconds, info.model)
-            self._settled(job, info, None, r.seconds, "", hooks, compiled, times)
+            if step is own:
+                if info:
+                    self.pace.add(r.seconds, info.model)
+                self._settled(job, info, None, r.seconds, "", hooks, compiled, times)
+            else:   # (recorded as the ladder's way, under its own key: ladder.check)
+                self._settled(job, info, step, r.seconds, f"its optnone header could not be written: compiled {step.describe()}",
+                              hooks, compiled, times, level=step.level)
             return None
         if r.timed_out:
             return self._down(job, argv, info, step, r.seconds, r.seconds, [], hooks, compiled, times)
         if crashed(r.code, r.out):
             hooks.requeued(job, self._cost(info, step))
-            return "crash", r
+            return "crash", r, step
         hooks.finished(job, r.seconds)
         return "fail", (job[0], r.out)
 
-    def _after_crash(self, job, argv, info, r, hooks, compiled, times):
-        """A job the compiler crashed on, compiled again on its own (RETRY)."""
-        src, level = job[0], job[2]
-        label, cause, step0 = self._label(job, info), crash_cause(r.code, r.out), self._own(job, info)
+    def _after_crash(self, job, argv, info, r, step0, hooks, compiled, times):
+        """A job the compiler crashed on (its own way: step0), compiled again on its own (RETRY)."""
+        src, level, own = job[0], job[2], self._own(job, info)
+        label, cause = self._label(job, info), crash_cause(r.code, r.out)
         retries, spent, code, out = RETRY.get(level, (level, level)), r.seconds, r.code, r.out
         hooks.restarted(job)
         for again in retries:
             self.log(f"the compiler crashed on {label} ({crash_cause(code, out)}): compiling it again on its own"
                      + (f", at {again}" if again != level else ""))
-            step = step0._replace(level=again)
             try:
-                r = self._attempt(job, argv, step, info)
+                r, step = self._own_attempt(job, argv, step0._replace(level=again), info)
             except Stopped:
                 return None
+            step0 = step._replace(level=step0.level)
             spent += r.seconds
             what = f"the compiler crashed ({cause}): compiled again on its own" + (f", at {again}" if again != level else "")
             if not r.code and not r.timed_out:
                 self.log(f"{label} compiled" + (f" (at {again}: a little less optimised, works the same)" if again != level else "")
                          + f" in {duration(r.seconds)}")
-                self._settled(job, info, None, spent, what, hooks, compiled, times, level=again)
+                if step.above != own.above:
+                    what += f"; its optnone header could not be written: compiled {step.describe()}"
+                self._settled(job, info, None if step.above == own.above else step, spent, what, hooks, compiled, times,
+                              level=again)
                 return None
             if r.timed_out:
                 return self._down(job, argv, info, step, r.seconds, spent, [f"the compiler crashed ({cause})"], hooks,
@@ -922,6 +968,10 @@ class Ladder:
                 r = self._attempt(job, argv, nxt, info)
             except Stopped:
                 return None
+            except NoHeader as e:   # (the ladder goes on to the next, /Od needing none)
+                self.log(f"{label}: {e}")
+                what.append(f"{nxt.describe()}: {e}")
+                continue
             spent += r.seconds
             if not r.code and not r.timed_out:
                 self.log(f"{label} compiled {nxt.describe()} in {duration(r.seconds)} ({duration(spent)} in all)")
