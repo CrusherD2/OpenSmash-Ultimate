@@ -538,7 +538,7 @@ class WindowsBuildTests(Folder):
         self.assertIn('main: 1 object to compile again: the runtime headers changed', self.said)
         self.assertEqual(self.compile(), (True, []))
 
-    def test_no_object_older_than_hookable_h_taken_as_current(self):
+    def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
         """A folder with no record: the object of a file with hook slots is taken as current by date only when it
         is newer than hookable.h too. Such a file is keyed on it, so the key recorded for an object compiled before
         it changed would say it was compiled with the new one. The others go by their own headers alone. (Only for
@@ -873,7 +873,7 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (True, ['g0000.c -O2']))
         self.assertEqual(self.build(), (True, []))
 
-    def test_no_object_older_than_hookable_h_taken_as_current(self):
+    def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
         """As on Windows: with no record, the object of a file with hook slots older than hookable.h is not taken
         as current; the others are (for a build whose flags are the ones the older version compiled with, which no
         target's are today: made up here)."""

@@ -511,4 +511,33 @@ def exclusive_sequences(rng):
     return out
 
 
-SEQUENCES = [("exclusive monitor", exclusive_sequences)]
+def exclusive_pair_sequences(rng):
+    """The same for ldxp / stxp, of two W registers (one 8-byte location) and two X registers
+    (16 bytes): alone, a load and a store, a store to another address, either half changed in
+    between (by a str), a clrex in between, a second store after one that succeeded and wrote
+    back what was read, a store alone. With and without acquire / release, and with sp as the
+    base."""
+    ldxp = lambda sz, o0, rt, rt2, rn: 1 << 31 | sz << 30 | 0x08600000 | 31 << 16 | o0 << 15 | rt2 << 10 | rn << 5 | rt
+    stxp = lambda sz, o0, rs, rt, rt2, rn: 1 << 31 | sz << 30 | 0x08200000 | rs << 16 | o0 << 15 | rt2 << 10 | rn << 5 | rt
+    out = []
+    for sz in (0, 1):
+        for o0l, o0s in ((0, 0), (1, 1), (0, 1), (1, 0)):
+            rn, rt, rt2, rs, rs2, a, b = regs(rng, 7)
+            if o0l == 1 and o0s == 0:
+                rn = 31                                                       # sp
+            ld, st = ldxp(sz, o0l, rt, rt2, rn), stxp(sz, o0s, rs, a, b, rn)
+            low = 0xF9000000 | rn << 5 | a                                    # str xa, [base]
+            high = (0xF9000400 if sz else 0xB9000400) | rn << 5 | a           # str xa, [base, #8] / str wa, [base, #4]
+            again = stxp(sz, o0s, rs2, rt, rt2, rn)                           # (stores what was loaded)
+            out.append(("ldxp", (ld,)))
+            out.append(("ldxp; stxp", (ld, st)))                              # succeeds
+            out.append(("ldxp; add; stxp", (ld, 0x91004000 | rn << 5 | rn, st)))   # add base, base, #16: fails
+            out.append(("ldxp; str; stxp", (ld, low, again)))                 # the first doubleword changed: fails
+            out.append(("ldxp; str; stxp (high)", (ld, high, again)))         # the high half changed: fails
+            out.append(("ldxp; clrex; stxp", (ld, 0xD503305F, st)))          # clrex: fails
+            out.append(("ldxp; stxp; stxp", (ld, again, st)))                 # succeeds, memory as it was; then fails: the monitor went
+            out.append(("stxp", (st,)))                                       # no reservation: fails
+    return out
+
+
+SEQUENCES = [("exclusive monitor", exclusive_sequences), ("exclusive pairs", exclusive_pair_sequences)]

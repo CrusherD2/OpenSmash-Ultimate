@@ -521,7 +521,7 @@ def write_sources(tests, lifter, work):
             for i in range(f0, min(f0 + per_file, len(tests))):
                 addr, n = tests[i]
                 f.write(f"void t_{i}(Cpu *c, TestIO *t) {{\n"
-                        f"    u32 nf = t->n, zf = t->z, cf = t->c, vf = t->v; u64 ex_a = 0, ex_v = 0;"
+                        f"    u32 nf = t->n, zf = t->z, cf = t->c, vf = t->v; u64 ex_a = 0, ex_v = 0, ex_w = 0;"
                         f" u64 t_pc = {const(BASE + addr + 4 * n)};\n")
                 for stmt in lifter.snippet(addr, n):
                     f.write(f"    {stmt}\n")
