@@ -42,7 +42,9 @@ As on Windows, the game must be version 13.0.5, its last update
 `install-windowsmash.sh` does everything in one go: it gets the newest WindowSmash, installs what
 the build needs, finds your game files, and builds the game. It needs:
 
-- **An x86-64 PC with AVX2**, a Vulkan driver, and 8 GB of RAM or more (16 GB builds faster).
+- **An x86-64 PC with AVX2** (recommended) **or at the least SSE4.2** (x86-64-v2: the game is built for it, and is
+  expected to run slower; [the instruction set](BUILDING.md#the-instruction-set)), a Vulkan driver, and 8 GB of RAM or
+  more (16 GB builds faster).
 - **About 30 GB of free space**, and an internet connection.
 - **Your password for `sudo`**, to install packages. It knows the package managers of Ubuntu,
   Debian, Linux Mint, Fedora, Arch, Manjaro and openSUSE, and the families built on them. On an
@@ -171,7 +173,7 @@ These are for the package from Windows.
 | | Requirement |
 | :--- | :--- |
 | **Linux** | 64-bit, with glibc 2.35 or newer: Ubuntu 22.04 or later, Debian 12 or later, Fedora 36 or later. |
-| **Processor** | One with AVX2 (Intel Haswell / AMD Excavator or newer). Virtual machines normally pass it through. |
+| **Processor** | One with what the package was built for, which the program checks as it starts: AVX2 (Intel Haswell / AMD Excavator or newer), or SSE4.2 for a package built for older processors (x86-64-v2: Intel Nehalem / AMD Bulldozer or newer; [the instruction set](BUILDING.md#the-instruction-set)). Virtual machines normally pass AVX2 through. |
 | **Graphics** | A Vulkan driver. Mesa's (`mesa-vulkan-drivers`) covers AMD, Intel and, without a GPU, the software renderer *lavapipe*. NVIDIA needs its proprietary driver. |
 | **Memory** | About 6 GB for the game on top of the desktop, so 12 GB or more for the whole machine is comfortable. |
 | **Game data** | The files the Windows build reads its RomFS from (its `romfs.cfg`): one NCA or RomFS image with 13.0.5 in it, or, when the Windows installer applied the 13.0.5 update itself, the game's own file and the update's `romfs_patch.bin`. |
@@ -368,6 +370,14 @@ On Linux, `install-windowsmash.sh` builds it ([Installing on Linux](#installing-
 the system's clang and lld. The third-party parts then live in `deps/linux-toolchain`, where the
 installer puts them, and the overlay's font is drawn from the system's monospace font
 (`tools/linux/make_overlay_font.py`, with Pillow).
+
+Both compile for the instruction set [`tools/isa.py`](../tools/isa.py) chooses: `avx2`, or `x86-64-v2` on a processor
+without AVX2 ([the instruction set](BUILDING.md#the-instruction-set)). Set `SSBU_ISA` to choose, for example for a
+package for other PCs: by default it is this machine's processor. `build-linux/isa.txt` says what the game was
+built for and `build-vkd3d/linux/isa.txt` what vkd3d-shader was; `build_linux.py` stops when they differ, or
+when vkd3d-shader has none (an older version built it, with other flags), and `build_game.py` builds it again.
+`build_linux.py --link-only` links only when nothing is left to compile, so that `build-linux/isa.txt` says
+what all of it is compiled for.
 
 On Windows, the Linux program is cross-compiled next to the Windows build. It compiles the same
 generated C again, so build the game for Windows first (`tools/build_game.py`, or

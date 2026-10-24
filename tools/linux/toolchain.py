@@ -23,6 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(REPO, "tools"))   # (isa.py)
+import isa  # noqa: E402
+
 RUNTIME = os.path.join(REPO, "runtime")
 HOST_LINUX = sys.platform.startswith("linux")   # building on Linux itself, not cross-compiling on Windows
 EXE = "" if HOST_LINUX else ".exe"
@@ -130,12 +133,23 @@ LLVM_AR = os.path.join(LLVM, "llvm-ar" + EXE)
 LLVM_NM = os.path.join(LLVM, "llvm-nm" + EXE)
 # (on Linux, the system's own target and headers)
 TARGET = [] if HOST_LINUX else ["--target=x86_64-linux-gnu", "--sysroot=" + SYSROOT]
+# The instruction set (tools/isa.py): avx2, or x86-64-v2 for older processors; whether SSBU_ISA chose
+# it (build-linux/isa.txt keeps that for the next build); why, in words.
+ISA, ISA_TOLD, ISA_WHY = isa.target(os.path.join(REPO, "build-linux"))
 # Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math (as on Windows).
 # -fno-pic: the program is linked at a fixed address (non-PIE); its code is far over the size
 # where PIC's extra indirections are free.
-ARCH = ["-mavx2", "-mfma", "-mf16c", "-mbmi", "-mbmi2", "-mlzcnt", "-mpopcnt"]
-CFLAGS = TARGET + ARCH + ["-fno-strict-aliasing", "-ffp-contract=off", "-fno-pic", "-fno-plt", "-w",
-                          "-fasynchronous-unwind-tables", "-I", RUNTIME]
+def cflags(target):
+    """CFLAGS for an instruction set (tools/isa.py)."""
+    return TARGET + list(isa.CLANG[target]) + ["-fno-strict-aliasing", "-ffp-contract=off", "-fno-pic", "-fno-plt", "-w",
+                                               "-fasynchronous-unwind-tables", "-I", RUNTIME]
+
+
+ARCH = list(isa.CLANG[ISA])
+CFLAGS = cflags(ISA)
+# runtime/cpu_check.c's (a job's "baseline"): for any x86-64 processor, as it checks the processor
+# before anything else runs
+CHECK_CFLAGS = cflags(isa.ANY)
 
 
 # (below normal priority: a build here should not get in the way of anything else on the machine)
@@ -151,9 +165,11 @@ def run(cmd):
 
 
 def compile_command(src, obj, opt, flags=(), extra=()):
-    """The command compile_each compiles src into obj with (and what objcache.py keys the object on)."""
+    """The command compile_each compiles src into obj with (and what objcache.py keys the object on).
+    flags: the job's own, where "c++" compiles it as C++ and "baseline" with CHECK_CFLAGS for CFLAGS."""
     lang = ["-x", "c++", "-std=gnu++20", "-fexceptions"] if src.endswith((".cpp", ".cc")) or "c++" in flags else []
-    return [CLANG, "-c", opt, *CFLAGS, *lang, *extra, *[f for f in flags if f != "c++"], src, "-o", obj]
+    base = CHECK_CFLAGS if "baseline" in flags else CFLAGS
+    return [CLANG, "-c", opt, *base, *lang, *extra, *[f for f in flags if f not in ("c++", "baseline")], src, "-o", obj]
 
 
 def compile_each(jobs_list, jobs=16, extra=()):

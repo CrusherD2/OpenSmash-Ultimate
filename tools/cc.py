@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import codec_libs   # (this folder, which every importer of cc puts on sys.path)
+import isa
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNTIME = os.path.join(ROOT, "runtime")
@@ -52,12 +53,22 @@ def _find_toolchain():
 
 
 CLANG, WINSYSROOT, TOOLCHAIN = _find_toolchain()
+# The instruction set (tools/isa.py): avx2, or x86-64-v2 for older processors; why, in words; and
+# whether SSBU_ISA chose it (build/isa.txt keeps that for the next build).
+ISA, ISA_TOLD, ISA_WHY = isa.target(os.path.join(ROOT, "build"))
 # Guest FP semantics need IEEE-exact arithmetic: no contraction, no fast-math. (BASE_CFLAGS is
 # also what the codec libraries are compiled with: same instruction set, same C runtime.) With
 # deps\msvc, /winsysroot is where the C runtime's and the Windows SDK's headers and libraries are.
-BASE_CFLAGS = ["/nologo", "/arch:AVX2", "-mfma", "-mf16c", "-fno-strict-aliasing", "/clang:-ffp-contract=off", "-w",
-               *(["/winsysroot", WINSYSROOT] if WINSYSROOT else [])]
+def base_cflags(target):
+    """BASE_CFLAGS for an instruction set (tools/isa.py)."""
+    return ["/nologo", *isa.CLANG_CL[target], "-fno-strict-aliasing", "/clang:-ffp-contract=off", "-w",
+            *(["/winsysroot", WINSYSROOT] if WINSYSROOT else [])]
+
+
+BASE_CFLAGS = base_cflags(ISA)
 CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
+# runtime/cpu_check.c's: for any x64 processor, as it checks the processor before anything else runs
+CHECK_CFLAGS = [*base_cflags(isa.ANY), "/I", RUNTIME]
 # The generated C's flags: it includes recomp.h or module.h, which read none of the runtime's defines and
 # include folders added to CFLAGS below (SDL3, libopus, libvpx). So their coming and going compiles the
 # runtime again (minutes), not the game (hours: tools/objcache.py keys each object on its command).
@@ -229,7 +240,7 @@ def link(objs, exe, options=()):
     """Link objects into an executable; `options` go to the linker. The codec libraries built
     from third_party/ are made first if they are missing or stale (a few seconds)."""
     if BUILT_CODECS:
-        codec_libs.build(BUILT_CODECS, log=lambda m: print(m, flush=True))
+        codec_libs.build(BUILT_CODECS, log=lambda m: print(m, flush=True), target=ISA)
     rsp = exe + ".rsp"
     with open(rsp, "w") as f:
         f.write("\n".join(f'"{o}"' for o in objs))

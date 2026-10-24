@@ -21,7 +21,8 @@ emit      write C for the given functions and everything they call directly
 image     write the module image with base relocations applied for its load address
 build     write C for a whole module, split across many files, plus its loader tables
 compile   compile a build directory to objects (incremental: objcache.py; reports per-file failures)
-link      compile the host runtime and link module build directories into an executable
+link      compile the host runtime and link module build directories into an executable; each
+          directory's objects compiled already, for this build (compile): else it stops
 all       image + build + compile every module of an ExeFS, then link; a module whose C is
           current (same build id, address and tools: modcache.py) is not generated again;
           --generate-only stops before compiling (the Linux build compiles the C itself:
@@ -55,6 +56,7 @@ from multiprocessing import Pool
 # this folder, for the modules below: a Python with a ._pth file (the embeddable one the installer
 # sets up when the PC has none) does not put a script's own folder on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import isa  # noqa: E402
 import modcache  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
@@ -879,6 +881,13 @@ def build(path, outdir, jobs, per_file, imports=None):
           f"{imports:,} symbols referenced by {relocs:,} relocations" + (f"; {len(hookable)} hookable" if hookable else ""))
 
 
+def build_folder(outdir):
+    """The build folder a module folder is in (build_all's <out>/<module> or <out>/nro/<module>), whose
+    record (tools/isa.py: isa.txt, which link writes) says what its objects are compiled for."""
+    out = os.path.dirname(os.path.abspath(outdir))
+    return os.path.dirname(out) if os.path.basename(out) == "nro" else out
+
+
 def plan(outdir):
     """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
     one is). A generated file includes recomp.h, one with hook slots hookable.h too, g_module.c
@@ -888,9 +897,11 @@ def plan(outdir):
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
-    # (a folder an older version built, without a record: its objects that the date said were current are kept)
-    record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,),
-                             adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"),
+    # (a folder an older version built, without a record: its objects that the date said were current are kept -
+    # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
+    adopt = (objcache.header_files(cc.RUNTIME, "recomp.h", "module.h")
+             if isa.adopts(build_folder(outdir), cc.ISA, isa.CLANG_CL[cc.ISA], isa.LEGACY_CLANG_CL) else None)
+    record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,), adopt_by_date=adopt,
                              adopt_found={objcache.HOOK_SLOTS: objcache.header_files(cc.RUNTIME, "hookable.h")})
     compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, *h)) for h in objcache.GAME_HEADERS}
@@ -959,17 +970,21 @@ def link(dirs, exe, rt_dir=None):
     # changes (objcache.py): cc.CFLAGS change as SDL3, libopus or libvpx come and go.
     record, compiler = objcache.Record(rt_dir), objcache.compiler_id(cc.CLANG)
     headers = objcache.digest_files([os.path.join(cc.RUNTIME, n) for n in os.listdir(cc.RUNTIME) if n.endswith(".h")])
-    jobs, keys, why = [], {}, Counter()
+    jobs, keys, why = {}, {}, Counter()   # (jobs: by their flags, None for cc.CFLAGS)
+    print(f"instruction set: {cc.ISA} ({cc.ISA_WHY})")
 
-    def want(src, obj, opt):
-        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt), compiler, headers)
+    def want(src, obj, opt, flags=None):
+        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt, flags), compiler, headers)
         reason = record.check(obj, keys[obj])
         if reason:
             why[reason] += 1
-            jobs.append((src, obj, opt))
+            jobs.setdefault(None if flags is None else tuple(flags), []).append((src, obj, opt))
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
     for n in sources:
         want(os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj"), "/O2")
+    # the processor check, for any x64 processor (it runs before the rest: runtime/cpu_check.c)
+    check = os.path.join(rt_dir, "cpu_check.obj")
+    want(os.path.join(cc.RUNTIME, "cpu_check.c"), check, "/O2", cc.CHECK_CFLAGS)
     # Native implementations by name, for symbols no module defines.
     names = sorted(hle_names())
     table = os.path.join(rt_dir, "hle_table.c")
@@ -989,20 +1004,25 @@ def link(dirs, exe, rt_dir=None):
     want(nro_table, nro_table[:-2] + ".obj", "/O1")
     if objcache.summary(why):
         print(f"runtime: {objcache.summary(why)}")
-    record.forget([obj for _src, obj, _opt in jobs])
-    for _src, obj, _opt in jobs:   # (as compile_dir: a file that fails to compile leaves no old object)
+    every = [job for group in jobs.values() for job in group]
+    record.forget([obj for _src, obj, _opt in every])
+    for _src, obj, _opt in every:   # (as compile_dir: a file that fails to compile leaves no old object)
         if os.path.exists(obj):
             os.remove(obj)
-    failures = cc.compile_each(jobs, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]))
+    failures = []
+    for flags, group in jobs.items():
+        failures += cc.compile_each(group, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]),
+                                    flags=None if flags is None else list(flags))
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
-    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
+    objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [check, table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
     # a wrap no module has (a made-up game's modules, tools/mac/boottest): its original is a stub nothing calls
     cc.link(objs, exe, [f"/alternatename:f_{a:x}_orig=rt_wrap_missing" for a in sorted(hle_wraps())])
+    isa.record(os.path.dirname(os.path.abspath(exe)), cc.ISA, cc.ISA_TOLD)   # (what build_game.py's build_is_current compares)
     # the controllers' SDL3.dll, which the runtime loads from the exe's own folder
     if cc.SDL3_DLL:
         import shutil
@@ -1012,6 +1032,30 @@ def link(dirs, exe, rt_dir=None):
             shutil.copy2(cc.SDL3_DLL, dll)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
+
+
+def link_compiled(dirs, exe, rt_dir=None):
+    """recomp.py link: link(), when every module folder's objects are current (plan: compiled with this
+    build's command, so for its instruction set, cc.ISA). link compiles the runtime for it and writes
+    it into isa.txt beside the exe (tools/isa.py), which must name what every object it links is
+    compiled for: avx2 objects linked as x86-64-v2 would pass the processor check on a processor
+    without AVX2 (it checks for what the runtime is compiled for), and build_game.py would take the
+    program as current. (build_all links the folders it has just compiled.)"""
+    import cc
+    for d in dirs:
+        if not os.path.isfile(os.path.join(d, "manifest.tsv")):
+            print(f"{d}: not a folder recomp.py generated (no manifest.tsv): recomp.py link links only those")
+            return False
+        todo, _record, _keys, why = plan(d)
+        if todo:
+            built = isa.built_for(build_folder(d))
+            print(f"{os.path.basename(d)}: {len(todo)} object{'s' if len(todo) != 1 else ''} not compiled for this build"
+                  + (f" (the folder is built for {built}, this build is for {cc.ISA})" if built != cc.ISA else "")
+                  + f": compile them first (recomp.py compile {d}, or recomp.py all)")
+            if objcache.summary(why):
+                print(f"{os.path.basename(d)}: {objcache.summary(why)}")
+            return False
+    return link(dirs, exe, rt_dir)
 
 
 def module_paths(exefs):
@@ -1114,7 +1158,7 @@ if __name__ == "__main__":
     elif cmd == "compile":
         sys.exit(0 if compile_dir(nso, int(arg("--jobs", "16"))) else 1)
     elif cmd == "link":
-        sys.exit(0 if link(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
+        sys.exit(0 if link_compiled(arg("--dirs").split(","), arg("--out"), arg("--rt", None)) else 1)
     elif cmd == "all":
         # (on macOS the C is compiled by tools/mac/build_mac.py, the compiling and linking here being clang-cl's)
         compile_c = "--generate-only" not in sys.argv and sys.platform != "darwin"

@@ -22,6 +22,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import cc  # noqa: E402
+import isa  # noqa: E402
 import objcache  # noqa: E402
 import recomp  # noqa: E402
 
@@ -336,6 +337,7 @@ class WindowsBuildTests(Folder):
         self.flags = ['/nologo', '/arch:AVX2', '-mfma', '/I', str(self.runtime)]   # cc.GAME_CFLAGS
         self.rt_flags = list(self.flags)   # cc.CFLAGS: the runtime's, with its libraries' defines and folders
         for patch in (mock.patch.object(cc, 'CLANG', self.cc.name), mock.patch.object(cc, 'GAME_CFLAGS', self.flags),
+                      mock.patch.object(cc, 'ISA', 'avx2'),   # (what an older version's folder, without build/isa.txt, is for)
                       mock.patch.object(cc, 'CFLAGS', self.rt_flags), mock.patch.object(cc, 'RUNTIME', str(self.runtime)),
                       self.cc.patch()):
             patch.start()
@@ -379,11 +381,41 @@ class WindowsBuildTests(Folder):
         self.assertEqual(self.compile(), (True, ['g0000.c /O1']))
         self.assertNotIn('to compile again', self.said)
 
+    def test_an_older_version_s_objects_are_compiled_again(self):
+        """Every older version compiled the game with /arch:AVX2 -mfma -mf16c (isa.LEGACY_CLANG_CL, its cc.py's), which
+        allows MOVBE and F16C: today's avx2 (-mno-movbe -mno-f16c) neither needs them nor has the program check for
+        them. So a folder an older version built (no objcache.json, no build/isa.txt) is compiled again whole for
+        avx2, its objects not taken as current by date, nor for x86-64-v2 (a fighter module's folder alike)."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        nro = self.module.parent / 'nro' / 'fighter'
+        write(nro / 'manifest.tsv', 'g0000.c\t40000\t5000\n')
+        write(nro / 'g0000.c', '#include "recomp.h"\nvoid f_7100002000(void) {}\n')
+        write(nro / 'g_module.c', '#include "module.h"\n')
+        for target in isa.TARGETS:
+            with self.subTest(target=target), mock.patch.object(cc, 'ISA', target):
+                self.flags[:] = ['/nologo', *isa.LEGACY_CLANG_CL, '/I', str(self.runtime)]   # (the older version's build)
+                self.compile()
+                self.compile(nro)
+                for folder in (self.module, nro):
+                    (folder / objcache.RECORD).unlink()
+                self.assertIsNone(isa.recorded(str(self.module.parent)))
+                self.flags[:] = ['/nologo', *isa.CLANG_CL[target], '/I', str(self.runtime)]   # (today's)
+                self.assertEqual(self.compile(), (True, every))
+                self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+                self.assertNotIn('taken as current', self.said)
+                self.assertNotIn('-mf16c', (self.module / 'g0000.obj').read_text())
+                self.assertIn(isa.CLANG_CL[target][-1], (self.module / 'g0000.obj').read_text())
+                self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
+
     def test_a_folder_an_older_version_built_is_not_compiled_again(self):
         """No record at all (built before objcache.py): an object newer than its C and the runtime headers is taken
         as current, as the old rule (by date) took it, and recorded; an older one, or any after a header changed
-        since, is compiled. A record that is there is never second-guessed by date."""
+        since, is compiled. A record that is there is never second-guessed by date. (Only for a build whose flags
+        are the ones the older version compiled with, which no target's are today: made up here.)"""
         every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        patch = mock.patch.object(isa, 'LEGACY_CLANG_CL', isa.CLANG_CL['avx2'])
+        patch.start()
+        self.addCleanup(patch.stop)
         self.compile()
         record = self.module / objcache.RECORD
         record.unlink()
@@ -404,6 +436,39 @@ class WindowsBuildTests(Folder):
         self.flags[1] = '/arch:SSE4.2'   # (with a record: by key alone)
         self.assertEqual(self.compile(), (True, every))
 
+    def test_a_folder_an_older_version_built_for_another_instruction_set(self):
+        """Taken as current by date takes both: the folder built for today's instruction set (build/isa.txt, else
+        avx2: every older version's) and today's flags for it the older version's (here made up to be x86-64-v2's).
+        Built today for x86-64-v2, an avx2 folder's objects are all compiled again; one build/isa.txt says is
+        x86-64-v2's is adopted, and is not when the flags differ (a fighter module's folder, build/nro/<name>,
+        goes by build/isa.txt too)."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.flags[1:3] = ['/clang:-march=x86-64-v2']
+        with mock.patch.object(cc, 'ISA', 'x86-64-v2'), mock.patch.object(isa, 'LEGACY_CLANG_CL', isa.CLANG_CL['x86-64-v2']):
+            self.assertEqual(self.compile(), (True, every))
+            self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+            self.assertIn('-march=x86-64-v2', (self.module / 'g0000.obj').read_text())
+            record.unlink()
+            isa.record(str(self.module.parent), 'x86-64-v2', True)   # (what link writes)
+            with mock.patch.object(isa, 'LEGACY_CLANG_CL', ('/arch:SSE4.2',)):   # (not the flags they were compiled with)
+                self.assertEqual(self.compile(), (True, every))
+            record.unlink()
+            self.assertEqual(self.compile(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
+            nro = self.module.parent / 'nro' / 'fighter'
+            write(nro / 'manifest.tsv', 'g0000.c\t40000\t5000\n')
+            write(nro / 'g0000.c', '#include "recomp.h"\nvoid f_7100002000(void) {}\n')
+            write(nro / 'g_module.c', '#include "module.h"\n')
+            self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
+            (nro / objcache.RECORD).unlink()
+            self.assertEqual(self.compile(nro), (True, []))
+            isa.record(str(self.module.parent), 'avx2', False)
+            (nro / objcache.RECORD).unlink()
+            self.assertEqual(self.compile(nro), (True, ['g0000.c /O2', 'g_module.c /O1']))
+
     def test_hook_slots_are_keyed_on_hookable_h(self):
         """A file with hook slots includes hookable.h (tools/recomp.py): a change to it compiles that file
         again, and only that one; the files without slots keep their keys."""
@@ -418,7 +483,12 @@ class WindowsBuildTests(Folder):
     def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
         """A folder with no record: the object of a file with hook slots is taken as current by date only when it
         is newer than hookable.h too. Such a file is keyed on it, so the key recorded for an object compiled before
-        it changed would say it was compiled with the new one. The others go by their own headers alone."""
+        it changed would say it was compiled with the new one. The others go by their own headers alone. (Only for
+        a build whose flags are the ones the older version compiled with, which no target's are today: made up
+        here.)"""
+        patch = mock.patch.object(isa, 'LEGACY_CLANG_CL', isa.CLANG_CL['avx2'])
+        patch.start()
+        self.addCleanup(patch.stop)
         write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
         write(self.module / 'g0001.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100001000(void) {}\n')
         self.compile()
@@ -498,17 +568,25 @@ class WindowsBuildTests(Folder):
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
         write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
         write(self.runtime / 'kernel.c', '#include "host.h"\nint kernel;\n')
+        write(self.runtime / 'cpu_check.c', '#include "cpu_check.h"\n')
         rt, exe = self.dir / 'build' / 'rt', self.dir / 'build' / 'ssbu.exe'
+        check_flags = ['/nologo', '/I', str(self.runtime)]   # cc.CHECK_CFLAGS: for any x64 processor
+        linked = []
 
         def link():
             out = io.StringIO()
-            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): Path(exe).write_bytes(b'MZ')), \
-                    mock.patch.object(cc, 'SDL3_DLL', None), contextlib.redirect_stdout(out):
+            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): linked.append(objs) or Path(exe).write_bytes(b'MZ')), \
+                    mock.patch.object(cc, 'SDL3_DLL', None), mock.patch.object(cc, 'CHECK_CFLAGS', check_flags), \
+                    contextlib.redirect_stdout(out):
                 ok = recomp.link([], str(exe), str(rt))
             self.said = out.getvalue()
             return ok, self.cc.runs()
-        every = ['hle_table.c /O1', 'host.c /O2', 'kernel.c /O2', 'nro_table.c /O1']
+        every = ['cpu_check.c /O2', 'hle_table.c /O1', 'host.c /O2', 'kernel.c /O2', 'nro_table.c /O1']
         self.assertEqual(link(), (True, every))
+        self.assertIn(str(rt / 'cpu_check.obj'), linked[-1])
+        self.assertNotIn('/arch:AVX2', (rt / 'cpu_check.obj').read_text())   # (its own flags, not the runtime's)
+        self.assertIn('/arch:AVX2', (rt / 'host.obj').read_text())
+        self.assertEqual(isa.recorded(str(exe.parent)), (cc.ISA, cc.ISA_TOLD))   # (build_game.py's build_is_current reads it)
         self.assertEqual(link(), (True, []))
         touch(self.runtime / 'host.h')
         self.assertEqual(link(), (True, []))
@@ -516,10 +594,12 @@ class WindowsBuildTests(Folder):
         self.assertEqual(link(), (True, ['host.c /O2']))
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\nint more;\n')
         self.assertEqual(link(), (True, every))
-        self.assertIn('runtime: 4 objects to compile again: the runtime headers changed', self.said)
+        self.assertIn('runtime: 5 objects to compile again: the runtime headers changed', self.said)
         self.rt_flags.append('/DSSBU_HAVE_OPUS')
-        self.assertEqual(link(), (True, every))
+        self.assertEqual(link(), (True, [j for j in every if not j.startswith('cpu_check')]))
         self.assertIn('runtime: 4 objects to compile again: the compile command changed', self.said)
+        check_flags.append('/DMORE')
+        self.assertEqual(link(), (True, ['cpu_check.c /O2']))
         self.cc.version('fake clang version 20.1.8')
         self.assertEqual(link(), (True, every))
         write(self.runtime / 'kernel.c', '#error made up\n')
@@ -527,6 +607,48 @@ class WindowsBuildTests(Folder):
         self.assertFalse((rt / 'kernel.obj').exists())   # (not the old one either)
         self.assertEqual(link(), (False, ['kernel.c /O2']))   # (still not compiled: tried again)
         self.assertNotIn('to compile again', self.said)
+
+    def test_link_by_hand_links_only_what_is_compiled_for_this_build(self):
+        """recomp.py link (link_compiled) links a module folder only when its objects are all compiled for this build,
+        so that build/isa.txt, which the link writes, never names today's instruction set over objects compiled for
+        another (avx2 objects labelled x86-64-v2 would pass the processor check on a processor without AVX2)."""
+        exe, linked = self.dir / 'build' / 'ssbu.exe', []
+
+        def link():
+            out = io.StringIO()
+            def link(dirs, exe, rt_dir=None):   # (link's record, as test_runtime has it write)
+                linked.append(dirs)
+                isa.record(str(Path(exe).parent), cc.ISA, False)
+                return True
+            with mock.patch.object(recomp, 'link', link), contextlib.redirect_stdout(out):
+                ok = recomp.link_compiled([str(self.module)], str(exe))
+            self.said = out.getvalue()
+            return ok
+        self.compile()
+        isa.record(str(self.module.parent), 'avx2', False)
+        self.assertTrue(link())
+        self.assertEqual(linked, [[str(self.module)]])
+        with mock.patch.object(cc, 'ISA', 'x86-64-v2'):   # (SSBU_ISA=x86-64-v2 set, say)
+            self.flags[1:3] = ['/clang:-march=x86-64-v2']
+            self.assertFalse(link())
+            self.assertIn('main: 3 objects not compiled for this build (the folder is built for avx2, this build is for '
+                          'x86-64-v2): compile them first', self.said)
+            self.assertIn('main: 3 objects to compile again: the compile command changed', self.said)
+            self.assertEqual(len(linked), 1)
+            self.compile()
+            self.assertTrue(link())
+            self.assertEqual(len(linked), 2)
+            write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')   # (and not with a file's C changed since)
+            self.assertFalse(link())
+            self.assertIn('main: 1 object not compiled for this build: compile them first', self.said)
+        hand = self.dir / 'build' / 'hand'   # (objects compiled by hand: no manifest.tsv, so no plan to check them by)
+        hand.mkdir()
+        out = io.StringIO()
+        with mock.patch.object(recomp, 'link', lambda *a: linked.append(a) or True), contextlib.redirect_stdout(out):
+            self.assertFalse(recomp.link_compiled([str(hand)], str(exe)))
+        self.assertIn('not a folder recomp.py generated (no manifest.tsv)', out.getvalue())
+        self.assertEqual(len(linked), 2)
+        self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
 
 
 # ---- the Linux build -------------------------------------------------------------------------
@@ -544,6 +666,7 @@ class LinuxBuildTests(Folder):
         self.tc.RUNTIME = str(self.runtime)
         write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
         write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
+        write(self.runtime / 'cpu_check.c', '#include "cpu_check.h"\n')
         write(self.runtime / 'linux' / 'win32.c', '#include "host.h"\nint win32;\n')
         write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\n')
         self.tree, self.out = self.dir / 'tree', self.dir / 'build-linux'
@@ -566,6 +689,7 @@ class LinuxBuildTests(Folder):
             else:
                 sys.modules['toolchain'] = saved[0]
             sys.argv, sys.path[:] = saved[1], saved[2]
+        self.ns['ISA'] = 'avx2'   # (what an older version's folder, without build-linux/isa.txt, is for)
 
     def build(self, what='game'):
         out = io.StringIO()
@@ -600,13 +724,86 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (True, ['g0000_cxx.cpp -O2']))   # (now C++: said as a change to its C)
         self.assertNotIn('to compile again', self.said)
 
+    def test_an_older_version_s_objects_are_compiled_again(self):
+        """As on Windows: every older version compiled with -mf16c (isa.LEGACY_CLANG, its toolchain.py's ARCH), which
+        today's avx2 does not, so a folder it built is compiled again whole for avx2 (and for x86-64-v2)."""
+        every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
+        for target in isa.TARGETS:
+            with self.subTest(target=target):
+                with mock.patch.dict(isa.CLANG, {'avx2': isa.LEGACY_CLANG}):
+                    self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')   # (the older version's build)
+                self.build()
+                (self.out / 'main' / objcache.RECORD).unlink()
+                self.assertIsNone(isa.recorded(str(self.out)))
+                self.ns['ISA'], self.tc.CFLAGS = target, self.tc.cflags(target)
+                self.assertEqual(self.build(), (True, every))
+                self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+                self.assertNotIn('taken as current', self.said)
+                self.assertNotIn('-mf16c', (self.out / 'main' / 'g0000.o').read_text())
+
     def test_a_folder_an_older_version_built_is_not_compiled_again(self):
-        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept."""
+        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept (for a build
+        whose flags are the ones the older version compiled with, which no target's are today: made up here)."""
+        with mock.patch.object(isa, 'LEGACY_CLANG', isa.CLANG['avx2']):
+            self.build()
+            (self.out / 'main' / objcache.RECORD).unlink()
+            self.assertEqual(self.build(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
+            self.assertEqual(self.build(), (True, []))
+
+    def test_a_folder_an_older_version_built_for_another_instruction_set(self):
+        """As on Windows: built today for x86-64-v2, an older version's folder (avx2, no build-linux/isa.txt) is
+        compiled again whole; built for what build-linux/isa.txt names, with its flags the older version's (made up),
+        its objects are taken as current."""
+        every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
         self.build()
-        (self.out / 'main' / objcache.RECORD).unlink()
-        self.assertEqual(self.build(), (True, []))
-        self.assertIn('3 objects an older version compiled taken as current', self.said)
-        self.assertEqual(self.build(), (True, []))
+        record = self.out / 'main' / objcache.RECORD
+        record.unlink()
+        self.ns['ISA'], self.tc.CFLAGS = 'x86-64-v2', self.tc.cflags('x86-64-v2')
+        with mock.patch.object(isa, 'LEGACY_CLANG', isa.CLANG['x86-64-v2']):
+            self.assertEqual(self.build(), (True, every))
+            self.assertIn('game: 3 objects to compile again: no record of what they were built from', self.said)
+            record.unlink()
+            isa.record(str(self.out), 'x86-64-v2', True)   # (what link writes)
+            self.assertEqual(self.build(), (True, []))
+            self.assertIn('3 objects an older version compiled taken as current', self.said)
+        record.unlink()
+        self.assertEqual(self.build(), (True, every))   # (with today's own: not the flags they were compiled with)
+
+    def test_link_only_links_only_what_is_compiled_for_this_build(self):
+        """--link-only (link_only) links only when nothing is to be compiled, so that build-linux/isa.txt, which the link
+        writes, never names today's instruction set over objects compiled for another: not after the instruction set
+        changed, nor with the runtime compiled for another (--runtime-only) in a folder whose record names today's."""
+        linked = []
+        self.ns['link'] = lambda: linked.append(self.ns['ISA']) or True
+
+        def link_only():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), warnings.catch_warnings():
+                warnings.simplefilter('ignore', ResourceWarning)
+                ok = self.ns['link_only']()
+            self.said = out.getvalue()
+            return ok
+        self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')
+        self.build()
+        self.build('runtime')
+        isa.record(str(self.out), 'avx2', False)
+        self.assertTrue(link_only())
+        self.assertEqual(linked, ['avx2'])
+        self.ns['ISA'], self.tc.CFLAGS = 'x86-64-v2', self.tc.cflags('x86-64-v2')   # (SSBU_ISA=x86-64-v2 set, say)
+        self.assertFalse(link_only())
+        self.assertIn('--link-only: 8 objects not compiled for this build (the folder is built for avx2, this build is for '
+                      'x86-64-v2): build without --link-only', self.said)
+        self.build('runtime')   # (--runtime-only: the runtime for x86-64-v2, the game still avx2's)
+        self.assertFalse(link_only())
+        self.ns['ISA'], self.tc.CFLAGS = 'avx2', self.tc.cflags('avx2')
+        self.assertFalse(link_only())   # (the record names avx2, the runtime is x86-64-v2's)
+        self.assertIn('--link-only: 5 objects not compiled for this build: build without --link-only', self.said)
+        self.assertEqual(linked, ['avx2'])
+        self.build('runtime')
+        self.assertTrue(link_only())
+        self.assertEqual(linked, ['avx2', 'avx2'])
+        self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
 
     def test_hook_slots_are_keyed_on_hookable_h(self):
         """As on Windows: a change to hookable.h compiles again only the files that include it."""
@@ -620,7 +817,11 @@ class LinuxBuildTests(Folder):
 
     def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
         """As on Windows: with no record, the object of a file with hook slots older than hookable.h is not taken
-        as current; the others are."""
+        as current; the others are (for a build whose flags are the ones the older version compiled with, which no
+        target's are today: made up here)."""
+        patch = mock.patch.object(isa, 'LEGACY_CLANG', isa.CLANG['avx2'])
+        patch.start()
+        self.addCleanup(patch.stop)
         main = self.tree / 'build' / 'main'
         write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
         write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100000000(void) {}\n')
@@ -652,14 +853,20 @@ class LinuxBuildTests(Folder):
         self.assertEqual(self.build(), (False, ['g0000.c -O2']))
 
     def test_runtime(self):
-        every = ['hle_table.c -O1', 'host.c -O2', 'nro_table.c -O1', 'win32.c -O2', 'wrap_missing.c -O1']
+        every = ['cpu_check.c -O2', 'hle_table.c -O1', 'host.c -O2', 'nro_table.c -O1', 'win32.c -O2', 'wrap_missing.c -O1']
         self.assertEqual(self.build('runtime'), (True, every))
+        check = (self.out / 'rt' / 'cpu_check.o').read_text().split()   # (for any x86-64 processor: not the game's flags)
+        self.assertIn('-march=x86-64', check)
+        self.assertNotIn('baseline', check)
+        self.assertEqual([f for f in self.tc.ARCH if f in check], [])
         self.assertEqual(self.build('runtime'), (True, []))
         write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\ntypedef int BOOL;\n')
         self.assertEqual(self.build('runtime'), (True, every))
-        self.assertIn('runtime: 5 objects to compile again: the runtime headers changed', self.said)
+        self.assertIn('runtime: 6 objects to compile again: the runtime headers changed', self.said)
         self.tc.CFLAGS = self.tc.CFLAGS + ['-DMORE']
-        self.assertEqual(self.build('runtime'), (True, every))
+        self.assertEqual(self.build('runtime'), (True, [j for j in every if not j.startswith('cpu_check')]))
+        self.tc.CHECK_CFLAGS = self.tc.CHECK_CFLAGS + ['-DMORE']
+        self.assertEqual(self.build('runtime'), (True, ['cpu_check.c -O2']))
 
 
 if __name__ == '__main__':

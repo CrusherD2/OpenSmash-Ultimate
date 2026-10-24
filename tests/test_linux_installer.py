@@ -180,10 +180,39 @@ class SystemTests(unittest.TestCase):
         self.assertIsNone(il.libstdcxx_package([], lambda v: False))
 
     def test_cpu_and_memory(self):
-        cpu = 'processor\t: 0\nmodel name\t: AMD Ryzen 9  7950X 16-Core Processor\nflags\t\t: fpu sse2 avx avx2 bmi2\n'
-        self.assertEqual(il.cpu_info(cpu), ('AMD Ryzen 9 7950X 16-Core Processor', True))
-        self.assertEqual(il.cpu_info(cpu.replace(' avx2', '')), ('AMD Ryzen 9 7950X 16-Core Processor', False))
-        self.assertEqual(il.cpu_info(''), ('unknown processor', None))
+        # (made-up flags lines: what the build for each needs, tools/isa.py)
+        v2 = 'fpu sse2 pni ssse3 cx16 sse4_1 sse4_2 popcnt'
+        cpu = f'processor\t: 0\nmodel name\t: AMD Ryzen 9  7950X 16-Core Processor\nflags\t\t: {v2} avx avx2 fma bmi1 bmi2 abm\n'
+        name = 'AMD Ryzen 9 7950X 16-Core Processor'
+        self.assertEqual(il.cpu_info(cpu), (name, 'avx2', []))
+        self.assertEqual(il.cpu_info(cpu.replace(' avx2', '')), (name, 'x86-64-v2', ['avx2']))   # built for older processors
+        self.assertEqual(il.cpu_info(cpu.replace(' avx ', ' ')), (name, 'x86-64-v2', ['avx']))   # (no YMM state: Linux leaves avx out)
+        self.assertEqual(il.cpu_info(cpu.replace(' sse4_2', '')), (name, None, ['sse4.2']))   # below x86-64-v2: stopped
+        self.assertEqual(il.cpu_info(''), ('unknown processor', '', []))
+
+    def test_pc_check_by_the_processor(self):
+        # step 2: AVX2 recommended, x86-64-v2 the least; stopped only below it
+        v2 = 'fpu sse2 pni ssse3 cx16 sse4_1 sse4_2 popcnt'
+        files = {'/etc/os-release': 'PRETTY_NAME="Made-up Linux 1"\n', '/proc/meminfo': 'MemTotal:       33554432 kB\n'}
+        m = unittest.mock
+
+        def check(flags):
+            files['/proc/cpuinfo'] = f'model name\t: Made-up CPU\nflags\t\t: {flags}\n' if flags is not None else ''
+            out = io.StringIO()
+            with m.patch.object(il, 'read_text', lambda p: files.get(p, '')), m.patch.object(il.os, 'geteuid', lambda: 1000, create=True), \
+                    m.patch.object(il.platform, 'machine', lambda: 'x86_64'), m.patch.object(il, 'folder_gb', lambda p: 0), \
+                    m.patch.object(il.shutil, 'disk_usage', lambda p: types.SimpleNamespace(free=500 * 2**30)), \
+                    contextlib.redirect_stdout(out):
+                try:
+                    il.step_check_pc()
+                except il.Stop as e:
+                    return 'STOPPED: ' + str(e)
+            return out.getvalue()
+        self.assertIn('Made-up CPU - has AVX2', check(v2 + ' avx avx2 fma bmi1 bmi2 abm'))
+        self.assertIn('Made-up CPU - lacks avx, avx2, fma, bmi1, bmi2, lzcnt: the game is built for older processors (x86-64-v2)', check(v2))
+        self.assertIn('its extensions are unknown: the game is built for older processors', check(None))
+        self.assertIn('STOPPED: The processor (Made-up CPU) lacks sse4.2, popcnt, which the game needs at the least',
+                      check(v2.replace(' sse4_2 popcnt', '')))
         self.assertAlmostEqual(il.mem_total_gb('MemTotal:       16303232 kB\nMemFree: 1 kB\n'), 15.55, places=2)
         self.assertIsNone(il.mem_total_gb(''))
         self.assertEqual(il.disk_need_gb(40, 12.5), 27.5)
@@ -307,7 +336,7 @@ class BuildOnLinuxTests(unittest.TestCase):
         self.vkd3d = top / 'build-vkd3d'
         self.calls = []
         self.ns = runpy.run_path(str(ROOT / 'tools/build_game.py'), run_name='build_game_linux')['build'].__globals__
-        fake_tc = types.SimpleNamespace(VKD3D_BUILD=str(self.vkd3d))
+        fake_tc = types.SimpleNamespace(VKD3D_BUILD=str(self.vkd3d), ISA='avx2')
         self.ns.update(
             LINUX=True, ROOT=str(top / 'port'), DUMP=str(dump), EXEFS=str(dump / 'exefs'), FONTS=str(dump / 'fonts'),
             MODULES=str(dump / 'modules'), SAVED=str(dump / 'build_folders.txt'), SOURCE=str(dump / 'game_source.txt'),
@@ -337,9 +366,18 @@ class BuildOnLinuxTests(unittest.TestCase):
     def test_vkd3d_once(self):
         (self.vkd3d / 'linux').mkdir(parents=True)
         (self.vkd3d / 'linux' / 'libvkd3d-shader.a').write_bytes(b'')
+        # no record: an older version built it, with flags no instruction set has today (tools/isa.py): built again
+        self.ns['build'](self.args)
+        self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_vkd3d.py', 'build_linux.py'])
+        il.isa.record(str(self.vkd3d / 'linux'), 'avx2', False)   # (what build_vkd3d.py writes)
+        self.calls.clear()
         self.ns['build'](self.args)
         self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_linux.py'])
-
+        # built for another instruction set: built again
+        il.isa.record(str(self.vkd3d / 'linux'), 'x86-64-v2', False)
+        self.calls.clear()
+        self.ns['build'](self.args)
+        self.assertEqual(self.tools_run(), ['arc.py', 'recomp.py', 'build_vkd3d.py', 'build_linux.py'])
 
     def test_game_files_not_asked_for_when_read(self):
         # an update's build: dump/ has everything from the game files, so no folder is asked for

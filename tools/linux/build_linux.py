@@ -15,9 +15,10 @@ libvpx as the system has them). Built on Linux, the DXVK libraries go into <out>
 program runs from its own folder.
 Incremental: a file is compiled again when its source, the runtime headers it is built with, its
 compile command or the compiler changed (tools/objcache.py: <out>/rt/ and each module's folder keep
-an objcache.json). <out> holds one tree's game (port.txt): build another tree's into another <out>,
-or give --replace to start this one over. A progress bar shows how far it has got and the time left
-(tools/progress.py)."""
+an objcache.json); --link-only links only when nothing is to be compiled, so that <out>/isa.txt, which
+the link writes (tools/isa.py), says what all of it is compiled for. <out> holds one tree's game
+(port.txt): build another tree's into another <out>, or give --replace to start this one over. A
+progress bar shows how far it has got and the time left (tools/progress.py)."""
 import os
 import re
 import shutil
@@ -27,11 +28,12 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
-from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, LLVM, LLVM_NM, REPO, RUNTIME, SYSROOT, TARGET,
-                       TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each, default_port, read_port_stamp,
-                       run, same_path, write_port_stamp)
+from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, ISA, ISA_TOLD, ISA_WHY, LLVM, LLVM_NM, REPO,
+                       RUNTIME, SYSROOT, TARGET, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each,
+                       default_port, read_port_stamp, run, same_path, write_port_stamp)
 
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import isa  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
 
@@ -123,10 +125,12 @@ def game_jobs():
     # module.h (tools/recomp.py; objcache.game_headers)
     headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, *h)) for h in objcache.GAME_HEADERS}
     jobs, why = [], Counter()
+    # (a folder an older version built, without a record: its objects that the date said were current are kept -
+    # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
+    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
+             if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     for name, src_dir, out_dir in modules():
-        # (a folder an older version built, without a record: its objects that the date said were current are kept)
-        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS),
-                                 adopt_by_date=objcache.header_files(RUNTIME, "recomp.h", "module.h"),
+        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt,
                                  adopt_found={objcache.HOOK_SLOTS: objcache.header_files(RUNTIME, "hookable.h")})
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
@@ -231,6 +235,8 @@ def runtime_jobs():
             jobs.append(job)
     for src in sources:
         want((src, os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o"), "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+    # the processor check, for any x86-64 processor (it runs before the rest: runtime/cpu_check.c)
+    want((os.path.join(RUNTIME, "cpu_check.c"), os.path.join(rt_out, "cpu_check.o"), "-O2", ["baseline"]))
     names = hle_names()
     table = os.path.join(GEN, "hle_table.c")
     write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
@@ -347,6 +353,7 @@ def link():
         errors = [l for l in out.splitlines() if "error" in l.lower()] or out.splitlines()
         print("link failed\n" + "\n".join(errors)[:6000])
         return False
+    isa.record(OUT, ISA, ISA_TOLD)   # (what build_game.py's build_is_current compares)
     syms = subprocess.run([LLVM_NM, "-n", "--defined-only", exe], capture_output=True, text=True)
     with open(os.path.join(OUT, "ssbu.syms"), "w", newline="\n") as f:
         f.write(syms.stdout)
@@ -358,6 +365,22 @@ def link():
                 shutil.copy2(src, dst)
     print(f"linked {len(objs)} objects into {exe} ({os.path.getsize(exe) / 1048576:,.0f} MB) in {time.time() - t0:,.0f}s")
     return True
+
+
+def link_only():
+    """--link-only: link(), when no object is to be compiled (runtime_jobs, game_jobs: each one compiled
+    with this build's command, so for its instruction set). link writes <out>/isa.txt, which must name
+    what every object it links is compiled for: avx2 objects linked as x86-64-v2 would pass the
+    processor check on a processor without AVX2 (it checks for what the runtime is compiled for), and
+    build_game.py would take the program as current."""
+    stale = runtime_jobs() + game_jobs()
+    if stale:
+        built = isa.built_for(OUT)
+        print(f"--link-only: {len(stale)} object{'s' if len(stale) != 1 else ''} not compiled for this build"
+              + (f" (the folder is built for {built}, this build is for {ISA})" if built != ISA else "")
+              + ": build without --link-only")
+        return False
+    return link()
 
 
 def codec_lib(name):
@@ -387,6 +410,11 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")
+    vkd3d = isa.recorded(os.path.join(VKD3D_BUILD, "linux"))   # (none: an older version built it, with its own flags)
+    if not vkd3d or vkd3d[0] != ISA:
+        raise SystemExit(f"vkd3d-shader is built for {vkd3d[0] if vkd3d else 'an older version'}, the game for {ISA}: "
+                         "run tools/linux/build_vkd3d.py linux")
+    print(f"instruction set: {ISA} ({ISA_WHY})")
     dxvk_libs()
     if not modules():
         raise SystemExit(f"no recompiled game in {os.path.join(PORT, 'build')} (tools/recomp.py all)")
@@ -394,7 +422,7 @@ def main():
     if "--runtime-only" not in sys.argv:
         use_tree()
     if "--link-only" in sys.argv:
-        return link()
+        return link_only()
     if not overlay_font():
         return False
     runtime_only = "--runtime-only" in sys.argv
