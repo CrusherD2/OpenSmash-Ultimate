@@ -654,6 +654,9 @@ def link_compiled(dirs, exe, rt_dir=None):
     program as current. (build_all links the folders it has just compiled.)"""
     import cc
     for d in dirs:
+        if not os.path.isfile(os.path.join(d, "manifest.tsv")):
+            print(f"{d}: not a folder recomp.py generated (no manifest.tsv): recomp.py link links only those")
+            return False
         todo, _record, _keys, why = plan(d)
         if todo:
             built = isa.built_for(build_folder(d))

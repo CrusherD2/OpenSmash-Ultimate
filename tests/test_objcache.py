@@ -608,6 +608,13 @@ class WindowsBuildTests(Folder):
             write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')   # (and not with a file's C changed since)
             self.assertFalse(link())
             self.assertIn('main: 1 object not compiled for this build: compile them first', self.said)
+        hand = self.dir / 'build' / 'hand'   # (objects compiled by hand: no manifest.tsv, so no plan to check them by)
+        hand.mkdir()
+        out = io.StringIO()
+        with mock.patch.object(recomp, 'link', lambda *a: linked.append(a) or True), contextlib.redirect_stdout(out):
+            self.assertFalse(recomp.link_compiled([str(hand)], str(exe)))
+        self.assertIn('not a folder recomp.py generated (no manifest.tsv)', out.getvalue())
+        self.assertEqual(len(linked), 2)
         self.assertEqual(self.cc.runs(), [])   # (it compiles nothing itself)
 
 

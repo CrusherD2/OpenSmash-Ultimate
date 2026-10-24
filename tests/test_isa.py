@@ -120,6 +120,8 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(isa.recorded(str(self.dir)), ('avx2', False))
         (self.dir / isa.RECORD).write_text('sse9\ntold\n')
         self.assertIsNone(isa.recorded(str(self.dir)))
+        (self.dir / isa.RECORD).write_bytes(b'\xef\xbb\xbfx86-64-v2\r\ntold\r\n')   # saved again by an editor: BOM, CRLF
+        self.assertEqual(isa.recorded(str(self.dir)), ('x86-64-v2', True))
 
     def test_target_reads_the_record(self):
         isa.record(str(self.dir), 'x86-64-v2', True)

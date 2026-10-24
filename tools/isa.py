@@ -145,9 +145,10 @@ def choose(env, features, record):
 
 
 def recorded(folder):
-    """(target, told) from a build folder's record, or None."""
+    """(target, told) from a build folder's record, or None. (utf-8-sig: a record saved again with a BOM reads
+    as the installer's Get-Content reads it.)"""
     try:
-        with open(os.path.join(folder, RECORD), encoding="utf-8") as f:
+        with open(os.path.join(folder, RECORD), encoding="utf-8-sig") as f:
             lines = f.read().splitlines()
     except OSError:
         return None
