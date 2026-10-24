@@ -141,8 +141,9 @@ what changed and builds only that: your game files aren't asked for again (they 
 into `dump/`), and the game's code is compiled again only when the update changes it. An update
 of the program's own parts (the graphics, the audio, the kernel: the files in `runtime/`) compiles
 those files and links the program again, which takes minutes. An update that changes how the
-game's code is translated (a performance change to the translator, say) compiles the game's code
-again, once: about as long as the first build. To build from other
+game's code is translated (a performance change to the translator, say), the header the game's
+code includes (`runtime/recomp.h`) or the compile flags, or a new compiler, compiles the game's
+code again, once: about as long as the first build. To build from other
 game files, name them: `bash install-windowsmash.sh --game <folder>`.
 
 A folder an older WindowSmash built from another game version, such as 11.0.0, is set up again

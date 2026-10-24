@@ -20,7 +20,7 @@ coverage  lift every function and report what the lifter cannot translate yet
 emit      write C for the given functions and everything they call directly
 image     write the module image with base relocations applied for its load address
 build     write C for a whole module, split across many files, plus its loader tables
-compile   compile a build directory to objects (incremental; reports per-file failures)
+compile   compile a build directory to objects (incremental: objcache.py; reports per-file failures)
 link      compile the host runtime and link module build directories into an executable
 all       image + build + compile every module of an ExeFS, then link; a module whose C is
           current (same build id, address and tools: modcache.py) is not generated again;
@@ -56,6 +56,7 @@ from multiprocessing import Pool
 # sets up when the PC has none) does not put a script's own folder on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import modcache  # noqa: E402
+import objcache  # noqa: E402
 import progress  # noqa: E402
 from funcs import discover  # noqa: E402
 from lift import Lifter  # noqa: E402
@@ -878,33 +879,64 @@ def build(path, outdir, jobs, per_file, imports=None):
           f"{imports:,} symbols referenced by {relocs:,} relocations" + (f"; {len(hookable)} hookable" if hookable else ""))
 
 
-def stale_files(outdir):
-    """What compile_dir compiles, in order: (source, object, optimisation level, estimated
-    seconds: progress.file_cost) of each file whose object is missing or older than it."""
+def plan(outdir):
+    """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
+    one is). A generated file includes recomp.h, one with hook slots hookable.h too, g_module.c
+    module.h (_emit, module_table; objcache.game_headers). The key's
+    command names the file and its object by their names in the folder: the folder spelled another
+    way (build/main, .\\build\\main, a full path), or moved, compiles nothing again."""
+    import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
-    todo = []
+    # (a folder an older version built, without a record: its objects that the date said were current are kept)
+    record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,),
+                             adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"),
+                             adopt_found={objcache.HOOK_SLOTS: objcache.header_files(cc.RUNTIME, "hookable.h")})
+    compiler = objcache.compiler_id(cc.CLANG)
+    headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, *h)) for h in objcache.GAME_HEADERS}
+    todo, keys, why = [], {}, Counter()
     for name, insns, biggest in rows + [["g_module.c", "0", "0"]]:
         src = os.path.join(outdir, name)
         obj = src[:-2] + ".obj"
-        if not os.path.exists(obj) or os.path.getmtime(obj) < os.path.getmtime(src):
-            # very large functions make the optimiser superlinear; build those at a lower level
-            todo.append((src, obj, "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2",
-                         progress.TABLE if name == "g_module.c" else progress.file_cost(int(insns), int(biggest))))
-    return todo
+        # very large functions make the optimiser superlinear; build those at a lower level
+        opt = "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"
+        keys[obj] = record.entry([src], cc.compile_command(name, name[:-2] + ".obj", opt, cc.GAME_CFLAGS), compiler,
+                                 headers[objcache.game_headers(name, record.source(src)[1])])
+        reason = record.check(obj, keys[obj])
+        if reason:
+            why[reason] += 1
+            todo.append((src, obj, opt, progress.TABLE if name == "g_module.c" else progress.file_cost(int(insns), int(biggest))))
+    record.save()   # (the sources' digests: the next look reads only the files that changed)
+    return todo, record, keys, why
+
+
+def stale_files(outdir):
+    """What compile_dir compiles, in order: (source, object, optimisation level, estimated
+    seconds: progress.file_cost) of each file whose object is missing or not current: compiled
+    from other C, headers or flags, or by another compiler (objcache.py)."""
+    return plan(outdir)[0]
 
 
 def compile_dir(outdir, jobs, shown=None):
     """Compile a module's stale files; `shown`, a progress.Build, follows them."""
     import cc
-    todo = stale_files(outdir)
+    todo, record, keys, why = plan(outdir)
+    if objcache.summary(why):
+        print(f"{os.path.basename(outdir)}: {objcache.summary(why)}")
+    record.forget([obj for _src, obj, _opt, _cost in todo])
     for _src, obj, _opt, _cost in todo:   # a new file, not one written through (it may be a hard link: modcache.replace_file)
         if os.path.exists(obj):
             os.remove(obj)
     t0 = time.time()
     if shown:
         shown.begin("compile", os.path.basename(outdir), [(src, cost) for src, _obj, _opt, cost in todo])
-    failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()))
+
+    def compiled(job, _level):
+        # under the key of its own level even when a crash had it compiled at /O1 instead (cc.RETRY): kept until what
+        # it is built from changes, rather than compiled again at every build in case the compiler no longer crashes
+        record.compiled(job[1], keys[job[1]])
+    failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()),
+                               compiled=compiled, flags=cc.GAME_CFLAGS)
     if shown:
         shown.end("compile", os.path.basename(outdir))
     objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
@@ -921,47 +953,51 @@ def link(dirs, exe, rt_dir=None):
     runtime's objects go to rt_dir (default: rt beside the exe)."""
     import cc
     t0 = time.time()
-    rt_dir = rt_dir or os.path.join(os.path.dirname(exe), "rt")
+    rt_dir = os.path.abspath(rt_dir or os.path.join(os.path.dirname(exe), "rt"))   # (one spelling: its objects' keys name it)
     os.makedirs(rt_dir, exist_ok=True)
-    headers = max(os.path.getmtime(os.path.join(cc.RUNTIME, n)) for n in os.listdir(cc.RUNTIME) if n.endswith(".h"))
-    # the compile command the objects were built with: cc.CFLAGS change as SDL3, libopus or libvpx come and go
-    stamp, flags = os.path.join(rt_dir, "cflags.txt"), " ".join([cc.CLANG, *cc.CFLAGS]) + "\n"
-    old = ""
-    if os.path.exists(stamp):
-        with open(stamp, encoding="utf-8") as f:
-            old = f.read()
-    every = old != flags
+    # An object is compiled again when its source, a runtime header, the compiler or its compile command
+    # changes (objcache.py): cc.CFLAGS change as SDL3, libopus or libvpx come and go.
+    record, compiler = objcache.Record(rt_dir), objcache.compiler_id(cc.CLANG)
+    headers = objcache.digest_files([os.path.join(cc.RUNTIME, n) for n in os.listdir(cc.RUNTIME) if n.endswith(".h")])
+    jobs, keys, why = [], {}, Counter()
+
+    def want(src, obj, opt):
+        keys[obj] = record.entry([src], cc.compile_command(src, obj, opt), compiler, headers)
+        reason = record.check(obj, keys[obj])
+        if reason:
+            why[reason] += 1
+            jobs.append((src, obj, opt))
     sources = [n for n in os.listdir(cc.RUNTIME) if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|debug\w*|net\w*)\.c", n)]
-    jobs = []
     for n in sources:
-        src, obj = os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj")
-        if every or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), headers):
-            jobs.append((src, obj, "/O2"))
+        want(os.path.join(cc.RUNTIME, n), os.path.join(rt_dir, n[:-2] + ".obj"), "/O2")
     # Native implementations by name, for symbols no module defines.
     names = sorted(hle_names())
     table = os.path.join(rt_dir, "hle_table.c")
-    changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
-                               + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
-                               + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
-    if changed or every or not os.path.exists(table[:-2] + ".obj"):
-        jobs.append((table, table[:-2] + ".obj", "/O1"))
+    write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
+                     + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
+                     + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
+    want(table, table[:-2] + ".obj", "/O1")
     # The run-time loadable modules (NROs) linked in, for nn::ro to find by build id.
     nros = [os.path.basename(os.path.normpath(d)) for d in dirs
             if os.path.basename(os.path.dirname(os.path.normpath(d))) == "nro"]
     nro_table = os.path.join(rt_dir, "nro_table.c")
-    changed = write_if_changed(nro_table, '#include "module.h"\n\n'
-                               + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
-                               + "const RtModule *const rt_nro_modules[] = {"
-                               + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
-                               + f"const u32 rt_nro_count = {len(nros)};\n")
-    if changed or every or not os.path.exists(nro_table[:-2] + ".obj"):
-        jobs.append((nro_table, nro_table[:-2] + ".obj", "/O1"))
-    failures = cc.compile_each(jobs, 4)
+    write_if_changed(nro_table, '#include "module.h"\n\n'
+                     + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
+                     + "const RtModule *const rt_nro_modules[] = {"
+                     + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
+                     + f"const u32 rt_nro_count = {len(nros)};\n")
+    want(nro_table, nro_table[:-2] + ".obj", "/O1")
+    if objcache.summary(why):
+        print(f"runtime: {objcache.summary(why)}")
+    record.forget([obj for _src, obj, _opt in jobs])
+    for _src, obj, _opt in jobs:   # (as compile_dir: a file that fails to compile leaves no old object)
+        if os.path.exists(obj):
+            os.remove(obj)
+    failures = cc.compile_each(jobs, 4, compiled=lambda job, _level: record.compiled(job[1], keys[job[1]]))
     for src, err in failures:
         print(f"FAILED {os.path.basename(src)}:\n{err[:4000]}")
     if failures:
         return False
-    write_if_changed(stamp, flags)   # (only now: a failed compile is tried again)
     objs = [os.path.join(rt_dir, n[:-2] + ".obj") for n in sources] + [table[:-2] + ".obj", nro_table[:-2] + ".obj"]
     for d in dirs:
         objs += sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".obj"))
@@ -1003,12 +1039,14 @@ def build_all(exefs, out, jobs, compile_c=True):
     targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
                for name, nso in paths.items()}
     shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
+
+    def stale(target):   # (for the bar; none when the C is compiled elsewhere: --generate-only)
+        return [(t[0], t[3]) for t in stale_files(target)] if compile_c else []
     generate = False
     for name, mod in mods.items():
         current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
         generate |= not current
-        shown.module(name, (mod.text.end - mod.text.mem) // 4,
-                     [(t[0], t[3]) for t in stale_files(targets[name])] if current else None)
+        shown.module(name, (mod.text.end - mod.text.mem) // 4, stale(targets[name]) if current else None)
     build_ids = {name: mod.build_id for name, mod in mods.items()}
     # (for the modules whose C is generated again; the names come from the boot modules, 13.0.5's,
     # so a module whose C is current has them already)
@@ -1030,7 +1068,7 @@ def build_all(exefs, out, jobs, compile_c=True):
                 build(nso, target, jobs, 40000, imports)
             if not compile_c:
                 modcache.write_stamp(target, build_id, base, name, fp)
-            shown.written(name, [(t[0], t[3]) for t in stale_files(target)])
+            shown.written(name, stale(target))
             shown.end("gen", name)
         print(f"{reused} of {len(paths)} modules reused without generating their C again")
         if not compile_c:

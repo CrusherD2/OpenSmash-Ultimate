@@ -1,0 +1,666 @@
+"""Objects compiled again when what they are built from changes (tools/objcache.py): the C, the
+runtime headers it includes, the compile command, the compiler; not when a file is only saved again.
+Then the Windows build (tools/recomp.py with tools/cc.py: a module's objects, the runtime's, a crash
+compiled again at /O1) and the Linux one (tools/linux/build_linux.py) with it. Made-up sources, and
+a made-up compiler: a Python script that writes an object of a line for each file."""
+from collections import Counter
+from pathlib import Path
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import runpy
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import warnings
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'tools'))
+import cc  # noqa: E402
+import objcache  # noqa: E402
+import recomp  # noqa: E402
+
+REAL_RUN = subprocess.run
+# The made-up compiler. --version prints version.txt beside it. Otherwise it compiles the one source
+# it is given (.c or .cpp) into the object named by -o or /Fo, as a line naming the source and the
+# rest of the command; a source with "#error" is an error in the code, one with "crash at /O2" makes
+# it crash at /O2 (as cc.py tells a crash), one with "half-written" leaves half an object and fails.
+# Each run leaves a file of its own in runs/ beside it: "<source> <level>". (One shared file would
+# lose lines when two compiles of a parallel build append at once: on Windows, appends aren't atomic.)
+FAKE_CC = r'''
+import os, sys, tempfile
+here = os.path.dirname(os.path.abspath(__file__))
+args = sys.argv[1:]
+if args == ["--version"]:
+    with open(os.path.join(here, "version.txt")) as f:
+        print(f.read().strip())
+    sys.exit(0)
+src = next(a for a in args if a.endswith((".c", ".cpp")))
+obj = args[args.index("-o") + 1] if "-o" in args else next(a[3:] for a in args if a.startswith("/Fo"))
+level = next(a for a in args if a in ("/O1", "/O2", "-O0", "-O1", "-O2"))
+os.makedirs(os.path.join(here, "runs"), exist_ok=True)
+fd, _ = tempfile.mkstemp(dir=os.path.join(here, "runs"), suffix=".txt")
+with os.fdopen(fd, "w") as f:
+    f.write(os.path.basename(src) + " " + level + "\n")
+with open(src) as f:
+    text = f.read()
+if "#error" in text:
+    sys.stderr.write(src + "(1,2): error: a made-up error\n1 error generated.\n")
+    sys.exit(1)
+if "crash at /O2" in text and level == "/O2":
+    sys.stderr.write("PLEASE submit a bug report\nStack dump:\nException Code: 0xC0000005\n")
+    sys.exit(1)
+with open(obj, "w") as f:
+    f.write("half" if "half-written" in text else "object of " + os.path.basename(src) + ": "
+            + " ".join(a for a in args if a not in (src, obj, "/Fo" + obj)) + "\n")
+sys.exit(1 if "half-written" in text else 0)
+'''
+
+
+def write(path, text, age=3600):
+    """A file with this text, dated `age` seconds ago (older than objcache.RECENT_NS: its digest is kept)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, newline='\n')
+    t = time.time() - age
+    os.utime(path, (t, t))
+    return path
+
+
+def touch(path):
+    """Saved again unchanged: the same content with a time of now."""
+    os.utime(path, None)
+
+
+class FakeCompiler:
+    """The made-up compiler in a folder of its own. subprocess.run runs it for a command that names
+    `name` as its program (patch()): cc.py's, objcache.compiler_id's and the Linux toolchain's."""
+    def __init__(self, folder, name='fakeclang'):
+        self.folder, self.name = Path(folder), name
+        self.script = write(self.folder / 'fakecc.py', FAKE_CC)
+        self.version('fake clang version 19.1.0')
+
+    def version(self, text):
+        write(self.folder / 'version.txt', text + '\n')
+        objcache.compiler_id.cache_clear()   # (a new build: the compiler is asked again)
+
+    def runs(self):
+        """The compiles since the last call, sorted: ["<source> <level>", ...]."""
+        lines = []
+        for path in sorted((self.folder / 'runs').glob('*.txt')):
+            lines += path.read_text().splitlines()
+            path.unlink()
+        return sorted(lines)
+
+    def patch(self):
+        def run(args, **kw):
+            args = list(args)
+            if self.name in args:   # (on Linux, toolchain.run puts "nice -n 10" before it)
+                args = [sys.executable, str(self.script), *args[args.index(self.name) + 1:]]
+            return REAL_RUN(args, **kw)
+        return mock.patch.object(subprocess, 'run', run)
+
+
+class Folder(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='objcache-test-')
+        self.dir = Path(self.tmp.name)
+        self.cc = FakeCompiler(self.dir / 'cc')
+        self.runtime = self.dir / 'runtime'
+        write(self.runtime / 'recomp.h', '#pragma once\n#include <stdint.h>\n#include "lanes.h"\ntypedef int u32;\n')
+        write(self.runtime / 'lanes.h', '#pragma once\ntypedef struct { u32 s[4]; } V128;\n')
+        write(self.runtime / 'module.h', '#pragma once\n#include "recomp.h"\ntypedef struct RtModule RtModule;\n')
+
+    def tearDown(self):
+        objcache.compiler_id.cache_clear()
+        self.tmp.cleanup()
+
+
+# ---- the record ------------------------------------------------------------------------------
+class RecordTests(Folder):
+    """One object, a.o from a.c, by objcache alone: the build's look at it, and its compile when stale."""
+    def setUp(self):
+        super().setUp()
+        self.src = write(self.dir / 'src' / 'a.c', '#include "recomp.h"\nvoid f_7100000000(void) {}\n')
+        self.out = self.dir / 'out'
+        self.obj = self.out / 'a.o'
+        self.log = []
+
+    def build(self, flags=('-mavx2', '-mfma'), level='-O2'):
+        """Why a.o was compiled (None: it was current)."""
+        self.out.mkdir(exist_ok=True)
+        record = objcache.Record(str(self.out), log=self.log.append)
+        command = [sys.executable, str(self.cc.script), '-c', level, *flags, str(self.src), '-o', str(self.obj)]
+        headers = objcache.digest_files(objcache.header_files(str(self.runtime), 'recomp.h'))
+        key = record.entry([str(self.src)], command, objcache.compiler_id((sys.executable, str(self.cc.script))), headers)
+        why = record.check(str(self.obj), key)
+        record.save()
+        if why:   # (as the builds do: the old object and its key gone first)
+            record.forget([str(self.obj)])
+            if self.obj.exists():
+                self.obj.unlink()
+            if REAL_RUN(command, capture_output=True).returncode == 0:
+                record.compiled(str(self.obj), key)
+        return why
+
+    def recorded(self):
+        return json.loads((self.out / objcache.RECORD).read_text())
+
+    def test_first_build_then_current(self):
+        self.assertEqual(self.build(), objcache.NEW)
+        self.assertIsNone(self.build())
+        self.assertIn('a.o', self.recorded()['objects'])
+
+    def test_source_change(self):
+        self.build()
+        write(self.src, '#include "recomp.h"\nvoid f_7100000000(void) { return; }\n')
+        self.assertEqual(self.build(), objcache.CHANGED)
+        self.assertIsNone(self.build())
+        write(self.src, '#include "recomp.h"\nvoid f_7100000004(void) { return; }\n', age=1800)   # (the same size)
+        self.assertEqual(self.build(), objcache.CHANGED)
+        self.assertIsNone(self.build())
+        write(self.src, '#include "recomp.h"\nvoid f_7100000008(void) { return; }\n')
+        self.assertEqual(self.build(level='-O1'), objcache.CHANGED)   # (a level that comes with the change: not the command)
+
+    def test_object_gone(self):
+        self.build()
+        self.obj.unlink()
+        self.assertEqual(self.build(), objcache.NEW)
+        record = objcache.Record(str(self.out))
+        record.compiled(str(self.out / 'b.o'), {'key': '0' * 64})   # (no such object: not recorded)
+        self.assertNotIn('b.o', self.recorded()['objects'])
+
+    def test_saved_again_unchanged_is_kept(self):
+        self.build()
+        touch(self.src)
+        self.assertIsNone(self.build())
+        touch(self.runtime / 'lanes.h')
+        self.assertIsNone(self.build())
+
+    def test_same_size_and_time_not_read_again(self):
+        self.build()
+        read = []
+        real = objcache.file_sha
+        with mock.patch.object(objcache, 'file_sha', side_effect=lambda p, scan=(): read.append(p) or real(p, scan)):
+            self.assertIsNone(self.build())
+        self.assertNotIn(os.path.abspath(self.src), read)   # (the headers are read each time: a few small files)
+
+    def test_a_file_written_just_now_is_read_again(self):
+        """A disk that keeps times to the second would give a file changed again in the same second the
+        same time: the digest of a file written in the last few seconds is not kept."""
+        self.build()
+        write(self.src, '#include "recomp.h"\nint x;\n', age=0)
+        self.assertEqual(self.build(), objcache.CHANGED)
+        self.assertNotIn(os.path.abspath(self.src), self.recorded()['sources'])
+        read = []
+        real = objcache.file_sha
+        with mock.patch.object(objcache, 'file_sha', side_effect=lambda p, scan=(): read.append(p) or real(p, scan)):
+            self.assertIsNone(self.build())
+        self.assertIn(os.path.abspath(self.src), read)
+
+    def test_instruction_set_or_level_change(self):
+        self.build(flags=('-mavx2', '-mfma'))
+        self.assertEqual(self.build(flags=('-march=x86-64-v2',)), objcache.COMMAND)
+        self.assertIsNone(self.build(flags=('-march=x86-64-v2',)))
+        self.assertEqual(self.build(flags=('-march=x86-64-v2',), level='-O1'), objcache.COMMAND)
+
+    def test_header_change(self):
+        self.build()
+        write(self.runtime / 'lanes.h', '#pragma once\ntypedef struct { u32 s[4]; } __attribute__((aligned(16))) V128;\n')
+        self.assertEqual(self.build(), objcache.HEADERS)   # (lanes.h is included by recomp.h)
+        self.assertIsNone(self.build())
+        write(self.runtime / 'module.h', '#pragma once\n#include "recomp.h"\n')
+        self.assertIsNone(self.build())   # (not included by a.c)
+
+    def test_compiler_change(self):
+        self.build()
+        self.cc.version('fake clang version 19.1.0')   # (asked again, the same answer)
+        self.assertIsNone(self.build())
+        self.cc.version('fake clang version 20.1.8')
+        self.assertEqual(self.build(), objcache.COMPILER)
+        self.assertIsNone(self.build())
+
+    def test_missing_record(self):
+        self.build()
+        (self.out / objcache.RECORD).unlink()
+        self.assertEqual(self.build(), objcache.UNRECORDED)
+        self.assertEqual(self.log, [])   # (said in the build's line: summary)
+        self.assertIsNone(self.build())
+
+    def test_unreadable_record_said_once(self):
+        self.build()
+        for garbage in ('{"version": 1, "objects": {"a.o": ', '[1, 2]', '{"version": 0, "objects": {}, "sources": {}}'):
+            with self.subTest(garbage):
+                self.log.clear()
+                (self.out / objcache.RECORD).write_text(garbage)
+                self.assertEqual(self.build(), 'objcache.json could not be read')
+                self.assertEqual(len(self.log), 1)
+                self.assertIn('could not be read', self.log[0])
+                self.assertIsNone(self.build())
+                self.assertEqual(len(self.log), 1)
+
+    def test_a_record_held_a_moment_is_read(self):
+        """On Windows another program (an antivirus) can hold the record a moment after it was written."""
+        self.build()
+        held, real = [], open
+
+        def opened(path, *args, **kw):
+            if path == str(self.out / objcache.RECORD) and len(held) < 2:
+                held.append(path)
+                raise PermissionError(13, 'held by another program', path)
+            return real(path, *args, **kw)
+        with mock.patch.object(objcache, 'open', opened, create=True), mock.patch.object(objcache.time, 'sleep'):
+            self.assertIsNone(self.build())
+        self.assertEqual(len(held), 2)
+        self.assertEqual(self.log, [])
+
+    def test_a_record_that_cannot_be_opened_stops_the_build(self):
+        """Not taken for no record (every object compiled again, the record replaced): nothing is compiled or
+        removed, and the record is left as it was."""
+        self.build()
+        before = (self.out / objcache.RECORD).read_text()
+
+        def opened(path, *args, **kw):
+            raise PermissionError(13, 'held by another program', path)
+        with mock.patch.object(objcache, 'open', opened, create=True), mock.patch.object(objcache.time, 'sleep'), \
+                self.assertRaises(SystemExit) as stop:
+            self.build()
+        self.assertIn('could not be opened', str(stop.exception))
+        self.assertEqual((self.out / objcache.RECORD).read_text(), before)
+        self.assertTrue(self.obj.exists())
+        self.assertIsNone(self.build())
+
+    def test_a_record_that_cannot_be_written(self):
+        """After a build's look (save) or a compile (compiled): logged, and the build goes on (its sources are
+        read and the object compiled again next time). Before a compile (forget): the build stops there, before
+        an old object is removed, as its key could not be dropped."""
+        self.build()
+        before = (self.out / objcache.RECORD).read_text()
+        record = objcache.Record(str(self.out), log=self.log.append)
+        key = {'key': '1' * 64}
+        with mock.patch.object(objcache.os, 'replace', side_effect=PermissionError(13, 'held')), \
+                mock.patch.object(objcache.time, 'sleep'):
+            record.save()
+            record.compiled(str(self.obj), key)
+            with self.assertRaises(PermissionError):
+                record.forget([str(self.obj)])
+        self.assertEqual(len(self.log), 2)
+        self.assertTrue(all('could not write' in line for line in self.log), self.log)
+        self.assertEqual((self.out / objcache.RECORD).read_text(), before)
+
+    def test_a_failed_compile_records_nothing(self):
+        self.build()
+        write(self.src, '#error not this one\n')
+        self.assertEqual(self.build(), objcache.CHANGED)
+        self.assertFalse(self.obj.exists())
+        self.assertNotIn('a.o', self.recorded()['objects'])
+        self.assertEqual(self.build(), objcache.NEW)   # (tried again)
+        write(self.src, 'half-written\n')              # a compile that fails leaving half an object
+        self.assertEqual(self.build(), objcache.NEW)
+        self.assertTrue(self.obj.exists())
+        self.assertNotIn('a.o', self.recorded()['objects'])
+        self.assertEqual(self.build(), objcache.UNRECORDED)   # (compiled again, not taken as current)
+
+    def test_header_files(self):
+        write(self.runtime / 'sub' / 'inner.h', '#pragma once\n')
+        write(self.runtime / 'sub' / 'outer.h', '#include "inner.h"\n#include "missing.h"\n')
+        write(self.runtime / 'lanes.h', '#include "sub/outer.h"\n  #  include "recomp.h"\n')
+        names = lambda *h: sorted(os.path.relpath(p, self.runtime) for p in objcache.header_files(str(self.runtime), *h))
+        self.assertEqual(names('recomp.h'), ['lanes.h', 'recomp.h', os.path.join('sub', 'inner.h'), os.path.join('sub', 'outer.h')])
+        self.assertEqual(names('module.h'), sorted(names('recomp.h') + ['module.h']))
+
+    def test_summary(self):
+        self.assertIsNone(objcache.summary(Counter({objcache.NEW: 3, objcache.CHANGED: 2})))
+        self.assertEqual(objcache.summary(Counter({objcache.COMMAND: 431, objcache.NEW: 2})),
+                         '431 objects to compile again: the compile command changed')
+        self.assertEqual(objcache.summary(Counter({objcache.HEADERS: 1})), '1 object to compile again: the runtime headers changed')
+        self.assertEqual(objcache.summary(Counter({objcache.COMPILER: 3, objcache.UNRECORDED: 2, objcache.CHANGED: 9})),
+                         '5 objects to compile again: no record of what they were built from (2), the compiler changed (3)')
+
+
+# ---- the Windows build -----------------------------------------------------------------------
+class WindowsBuildTests(Folder):
+    """recomp.py compile_dir and link's runtime, with the made-up compiler as clang-cl."""
+    def setUp(self):
+        super().setUp()
+        self.module = self.dir / 'build' / 'main'
+        write(self.module / 'manifest.tsv', 'g0000.c\t40000\t5000\ng0001.c\t30000\t25000\n')
+        write(self.module / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) {}\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\nvoid f_7100001000(void) {}\n')
+        write(self.module / 'g_module.c', '#include "module.h"\n')
+        self.flags = ['/nologo', '/arch:AVX2', '-mfma', '/I', str(self.runtime)]   # cc.GAME_CFLAGS
+        self.rt_flags = list(self.flags)   # cc.CFLAGS: the runtime's, with its libraries' defines and folders
+        for patch in (mock.patch.object(cc, 'CLANG', self.cc.name), mock.patch.object(cc, 'GAME_CFLAGS', self.flags),
+                      mock.patch.object(cc, 'CFLAGS', self.rt_flags), mock.patch.object(cc, 'RUNTIME', str(self.runtime)),
+                      self.cc.patch()):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def compile(self, folder=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = recomp.compile_dir(str(folder or self.module), 1)
+        self.said = out.getvalue()
+        return ok, self.cc.runs()
+
+    def test_module(self):
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        self.assertEqual(self.compile(), (True, every))
+        self.assertNotIn('to compile again', self.said)   # (a first build: nothing to explain)
+        self.assertEqual(self.compile(), (True, []))
+        touch(self.module / 'g0000.c')
+        self.assertEqual(self.compile(), (True, []))
+        write(self.module / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { return; }\n')
+        self.assertEqual(self.compile(), (True, ['g0000.c /O2']))
+        self.assertNotIn('to compile again', self.said)
+        write(self.runtime / 'lanes.h', '#pragma once\ntypedef struct { u32 s[4]; } V128; /* two */\n')
+        self.assertEqual(self.compile(), (True, every))
+        self.assertIn('main: 3 objects to compile again: the runtime headers changed', self.said)
+        write(self.runtime / 'module.h', '#pragma once\n#include "recomp.h"\n')
+        self.assertEqual(self.compile(), (True, ['g_module.c /O1']))
+        self.flags[1] = '/arch:SSE4.2'   # (another instruction set: every object, never a mix of the two)
+        self.assertEqual(self.compile(), (True, every))
+        self.assertIn('main: 3 objects to compile again: the compile command changed', self.said)
+        self.assertIn('/arch:SSE4.2', (self.module / 'g0000.obj').read_text())   # (compiled with the flags it is keyed on)
+        self.rt_flags += ['/DSSBU_HAVE_SDL3', '/I', str(self.dir / 'SDL3' / 'include')]   # (the runtime's alone)
+        self.assertEqual(self.compile(), (True, []))
+        self.cc.version('fake clang version 20.1.8')
+        self.assertEqual(self.compile(), (True, every))
+        self.assertIn('main: 3 objects to compile again: the compiler changed', self.said)
+        self.assertEqual(recomp.stale_files(str(self.module)), [])
+        # a change to the C that puts the file at another level: said as a change to its C, not to the command
+        write(self.module / 'manifest.tsv', 'g0000.c\t40000\t25000\ng0001.c\t30000\t25000\n')
+        write(self.module / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { /* bigger */ }\n')
+        self.assertEqual(self.compile(), (True, ['g0000.c /O1']))
+        self.assertNotIn('to compile again', self.said)
+
+    def test_a_folder_an_older_version_built_is_not_compiled_again(self):
+        """No record at all (built before objcache.py): an object newer than its C and the runtime headers is taken
+        as current, as the old rule (by date) took it, and recorded; an older one, or any after a header changed
+        since, is compiled. A record that is there is never second-guessed by date."""
+        every = ['g0000.c /O2', 'g0001.c /O1', 'g_module.c /O1']
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.compile(), (True, []))
+        self.assertIn('3 objects an older version compiled taken as current', self.said)
+        self.assertEqual(sorted(json.loads(record.read_text())['objects']), ['g0000.obj', 'g0001.obj', 'g_module.obj'])
+        self.assertEqual(self.compile(), (True, []))
+        self.assertNotIn('taken as current', self.said)
+        record.unlink()
+        old = time.time() - 7200   # (older than its C, written an hour ago)
+        os.utime(self.module / 'g0000.obj', (old, old))
+        self.assertEqual(self.compile(), (True, ['g0000.c /O2']))
+        self.assertIn('2 objects an older version compiled taken as current', self.said)
+        record.unlink()
+        touch(self.runtime / 'lanes.h')   # (a header newer than the objects: the old rule can't vouch for them)
+        self.assertEqual(self.compile(), (True, every))
+        self.assertIn('main: 3 objects to compile again: no record of what they were built from', self.said)
+        self.flags[1] = '/arch:SSE4.2'   # (with a record: by key alone)
+        self.assertEqual(self.compile(), (True, every))
+
+    def test_hook_slots_are_keyed_on_hookable_h(self):
+        """A file with hook slots includes hookable.h (tools/recomp.py): a change to it compiles that file
+        again, and only that one; the files without slots keep their keys."""
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100001000(void) {}\n')
+        self.compile()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n')
+        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
+        self.assertIn('main: 1 object to compile again: the runtime headers changed', self.said)
+        self.assertEqual(self.compile(), (True, []))
+
+    def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
+        """A folder with no record: the object of a file with hook slots is taken as current by date only when it
+        is newer than hookable.h too. Such a file is keyed on it, so the key recorded for an object compiled before
+        it changed would say it was compiled with the new one. The others go by their own headers alone."""
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100001000(void) {}\n')
+        self.compile()
+        record = self.module / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.compile(), (True, []))   # (newer than hookable.h: taken as current)
+        record.unlink()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n', age=-7200)
+        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
+        self.assertIn('main: 1 object to compile again: no record of what they were built from', self.said)
+        self.assertIn('2 objects an older version compiled taken as current', self.said)
+        self.assertEqual(self.compile(), (True, []))
+
+    def test_the_folder_spelled_another_way_or_moved(self):
+        """The key names a file and its object by their names in the folder: build/main, ./build/main, the
+        full path (build\\main on Windows), or the build folder moved, compile nothing again."""
+        with contextlib.chdir(self.dir):
+            self.assertTrue(self.compile('build/main')[0])
+            for spelling in ('./build/main', os.path.join('build', 'main'), str(self.module)):
+                with self.subTest(spelling):
+                    self.assertEqual(self.compile(spelling), (True, []))
+        os.rename(self.dir / 'build', self.dir / 'moved')
+        self.assertEqual(self.compile(self.dir / 'moved' / 'main'), (True, []))
+
+    def test_the_game_is_compiled_without_the_runtime_s_libraries(self):
+        """SDL3, libopus and libvpx are the runtime's. Their defines and include folders come and go with the
+        libraries; they are not in the generated C's command (cc.GAME_CFLAGS), so they compile only the runtime again."""
+        lib = write(self.dir / 'opus.lib', '')
+        with mock.patch.dict(os.environ, {'SSBU_OPUS_LIBS': str(lib)}):
+            spec = importlib.util.spec_from_file_location('cc_under_test', ROOT / 'tools' / 'cc.py')
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+        self.assertIn('/DSSBU_HAVE_OPUS', fresh.CFLAGS)
+        self.assertEqual(fresh.GAME_CFLAGS, [*fresh.BASE_CFLAGS, '/I', fresh.RUNTIME])
+        self.assertNotIn('/DSSBU_HAVE_OPUS', fresh.compile_command('g0000.c', 'g0000.obj', '/O2', fresh.GAME_CFLAGS))
+
+    def test_a_crash_compiled_at_O1_is_kept(self):
+        """A file the compiler crashed on at /O2 and compiled at /O1 (cc.RETRY) is recorded under its own
+        level's key: not compiled again at every build, but compiled again when its flags change."""
+        write(self.module / 'g0000.c', '/* crash at /O2 */\n#include "recomp.h"\n')
+        crashed = ['g0000.c /O1', 'g0000.c /O2', 'g0000.c /O2']
+        self.assertEqual(self.compile(), (True, sorted(crashed + ['g0001.c /O1', 'g_module.c /O1'])))
+        self.assertIn('g0000.c compiled (at /O1', self.said)
+        self.assertEqual(self.compile(), (True, []))
+        self.flags[1] = '/arch:SSE4.2'
+        self.assertEqual(self.compile(), (True, sorted(crashed + ['g0001.c /O1', 'g_module.c /O1'])))
+        self.assertEqual(self.compile(), (True, []))
+
+    def test_a_failed_or_interrupted_compile_records_nothing(self):
+        self.compile()
+        write(self.module / 'g0001.c', '#error made up\n')
+        ok, runs = self.compile()
+        self.assertFalse(ok)
+        self.assertIn('FAILED g0001.c', self.said)
+        self.assertFalse((self.module / 'g0001.obj').exists())
+        self.assertEqual(self.compile()[1], ['g0001.c /O1'])   # (tried again)
+        # stopped during g0001.c's compile (Ctrl+C): the objects compiled are kept, g0001's is not
+        write(self.module / 'g0000.c', '#include "recomp.h"\nint changed;\n')
+        write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')
+        run = subprocess.run
+
+        def interrupted(args, **kw):
+            if any(str(a).endswith('g0001.c') for a in args):
+                raise KeyboardInterrupt
+            return run(args, **kw)
+        with mock.patch.object(subprocess, 'run', interrupted), self.assertRaises(KeyboardInterrupt), \
+                contextlib.redirect_stdout(io.StringIO()):
+            recomp.compile_dir(str(self.module), 1)
+        self.cc.runs()
+        recorded = json.loads((self.module / objcache.RECORD).read_text())['objects']
+        self.assertIn('g0000.obj', recorded)
+        self.assertNotIn('g0001.obj', recorded)
+        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
+
+    def test_runtime(self):
+        """link's runtime objects: compiled again for a header, the flags (the stamp cflags.txt was) or the compiler."""
+        write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
+        write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
+        write(self.runtime / 'kernel.c', '#include "host.h"\nint kernel;\n')
+        rt, exe = self.dir / 'build' / 'rt', self.dir / 'build' / 'ssbu.exe'
+
+        def link():
+            out = io.StringIO()
+            with mock.patch.object(cc, 'link', lambda objs, exe, options=(): Path(exe).write_bytes(b'MZ')), \
+                    mock.patch.object(cc, 'SDL3_DLL', None), contextlib.redirect_stdout(out):
+                ok = recomp.link([], str(exe), str(rt))
+            self.said = out.getvalue()
+            return ok, self.cc.runs()
+        every = ['hle_table.c /O1', 'host.c /O2', 'kernel.c /O2', 'nro_table.c /O1']
+        self.assertEqual(link(), (True, every))
+        self.assertEqual(link(), (True, []))
+        touch(self.runtime / 'host.h')
+        self.assertEqual(link(), (True, []))
+        write(self.runtime / 'host.c', '#include "host.h"\nint host = 1;\n')
+        self.assertEqual(link(), (True, ['host.c /O2']))
+        write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\nint more;\n')
+        self.assertEqual(link(), (True, every))
+        self.assertIn('runtime: 4 objects to compile again: the runtime headers changed', self.said)
+        self.rt_flags.append('/DSSBU_HAVE_OPUS')
+        self.assertEqual(link(), (True, every))
+        self.assertIn('runtime: 4 objects to compile again: the compile command changed', self.said)
+        self.cc.version('fake clang version 20.1.8')
+        self.assertEqual(link(), (True, every))
+        write(self.runtime / 'kernel.c', '#error made up\n')
+        self.assertEqual(link(), (False, ['kernel.c /O2']))
+        self.assertFalse((rt / 'kernel.obj').exists())   # (not the old one either)
+        self.assertEqual(link(), (False, ['kernel.c /O2']))   # (still not compiled: tried again)
+        self.assertNotIn('to compile again', self.said)
+
+
+# ---- the Linux build -------------------------------------------------------------------------
+class LinuxBuildTests(Folder):
+    """build_linux.py's game and runtime jobs, with tools/linux/toolchain.py (its clang the made-up compiler)."""
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.dir / 'llvm' / 'bin'
+        bin_dir.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'SSBU_LLVM_BIN': str(bin_dir)}):
+            spec = importlib.util.spec_from_file_location('linux_toolchain_under_test', ROOT / 'tools' / 'linux' / 'toolchain.py')
+            self.tc = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.tc)
+        self.cc.name = self.tc.CLANG
+        self.tc.RUNTIME = str(self.runtime)
+        write(self.runtime / 'host.h', '#pragma once\n#include "module.h"\n')
+        write(self.runtime / 'host.c', '#include "host.h"\nint host;\n')
+        write(self.runtime / 'linux' / 'win32.c', '#include "host.h"\nint win32;\n')
+        write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\n')
+        self.tree, self.out = self.dir / 'tree', self.dir / 'build-linux'
+        main = self.tree / 'build' / 'main'
+        write(main / 'manifest.tsv', 'g0000.c\t40000\t5000\ng0001.c\t40000\t60000\n')
+        write(main / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) {}\n')
+        write(main / 'g0001.c', '#include "recomp.h"\nvoid f_7100001000(void) { __try { } }\n')   # (landing sites: C++)
+        write(main / 'g_module.c', '#include "module.h"\n')
+        patch = self.cc.patch()
+        patch.start()
+        self.addCleanup(patch.stop)
+        saved = sys.modules.get('toolchain'), sys.argv, list(sys.path)
+        sys.modules['toolchain'] = self.tc
+        sys.argv = ['build_linux.py', '--port', str(self.tree), '--out', str(self.out), '--jobs', '2']
+        try:
+            self.ns = runpy.run_path(str(ROOT / 'tools' / 'linux' / 'build_linux.py'), run_name='build_linux_under_test')['main'].__globals__
+        finally:
+            if saved[0] is None:
+                sys.modules.pop('toolchain', None)
+            else:
+                sys.modules['toolchain'] = saved[0]
+            sys.argv, sys.path[:] = saved[1], saved[2]
+
+    def build(self, what='game'):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), warnings.catch_warnings():
+            warnings.simplefilter('ignore', ResourceWarning)   # (build_linux.py reads its small files with open().read())
+            jobs = self.ns['game_jobs' if what == 'game' else 'runtime_jobs']()
+            ok = self.ns['compile_all'](jobs, what)
+        self.said = out.getvalue()
+        return ok, self.cc.runs()
+
+    def test_game(self):
+        every = ['g0000.c -O2', 'g0001_cxx.cpp -O0', 'g_module.c -O1']
+        self.assertEqual(self.build(), (True, every))
+        self.assertTrue((self.out / 'main' / 'g0001.o').read_text().startswith('object of g0001_cxx.cpp: -c -O0'))
+        self.assertIn('-x c++', (self.out / 'main' / 'g0001.o').read_text())
+        self.assertEqual(self.build(), (True, []))
+        self.assertIn('game: up to date', self.said)
+        touch(self.tree / 'build' / 'main' / 'g0001.c')
+        self.assertEqual(self.build(), (True, []))
+        write(self.tree / 'build' / 'main' / 'g0001.c', '#include "recomp.h"\nvoid f_7100001000(void) { __try { } } \n')
+        self.assertEqual(self.build(), (True, ['g0001_cxx.cpp -O0']))
+        write(self.runtime / 'lanes.h', '#pragma once\ntypedef struct { u32 s[4]; } V128; /* two */\n')
+        self.assertEqual(self.build(), (True, every))
+        self.assertIn('game: 3 objects to compile again: the runtime headers changed', self.said)
+        self.tc.CFLAGS = [f for f in self.tc.CFLAGS if f != '-mavx2'] + ['-march=x86-64-v2']
+        self.assertEqual(self.build(), (True, every))
+        self.assertIn('game: 3 objects to compile again: the compile command changed', self.said)
+        self.cc.version('fake clang version 20.1.8')
+        self.assertEqual(self.build(), (True, every))
+        self.assertIn('game: 3 objects to compile again: the compiler changed', self.said)
+        write(self.tree / 'build' / 'main' / 'g0000.c', '#include "recomp.h"\nvoid f_7100000000(void) { __try { } }\n')
+        self.assertEqual(self.build(), (True, ['g0000_cxx.cpp -O2']))   # (now C++: said as a change to its C)
+        self.assertNotIn('to compile again', self.said)
+
+    def test_a_folder_an_older_version_built_is_not_compiled_again(self):
+        """As on Windows: no record at all, objects newer than their sources and the runtime headers kept."""
+        self.build()
+        (self.out / 'main' / objcache.RECORD).unlink()
+        self.assertEqual(self.build(), (True, []))
+        self.assertIn('3 objects an older version compiled taken as current', self.said)
+        self.assertEqual(self.build(), (True, []))
+
+    def test_hook_slots_are_keyed_on_hookable_h(self):
+        """As on Windows: a change to hookable.h compiles again only the files that include it."""
+        main = self.tree / 'build' / 'main'
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100000000(void) {}\n')
+        self.build()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n')
+        self.assertEqual(self.build(), (True, ['g0000.c -O2']))
+        self.assertEqual(self.build(), (True, []))
+
+    def test_no_object_with_hook_slots_older_than_hookable_h_taken_as_current(self):
+        """As on Windows: with no record, the object of a file with hook slots older than hookable.h is not taken
+        as current; the others are."""
+        main = self.tree / 'build' / 'main'
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n')
+        write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f_7100000000(void) {}\n')
+        self.build()
+        record = self.out / 'main' / objcache.RECORD
+        record.unlink()
+        self.assertEqual(self.build(), (True, []))   # (newer than hookable.h: taken as current)
+        record.unlink()
+        write(self.runtime / 'hookable.h', '#pragma once\n#include "recomp.h"\n/* a slot more */\n', age=-7200)
+        self.assertEqual(self.build(), (True, ['g0000.c -O2']))
+        self.assertIn('game: 1 object to compile again: no record of what they were built from', self.said)
+        self.assertIn('2 objects an older version compiled taken as current', self.said)
+        self.assertEqual(self.build(), (True, []))
+
+    def test_landing_sites_found_once(self):
+        """Whether a file has landing sites (C++) is kept with its digest: an unchanged file is not read again."""
+        self.build()
+        read = []
+        real = objcache.file_sha
+        with mock.patch.object(objcache, 'file_sha', side_effect=lambda p, scan=(): read.append(p) or real(p, scan)):
+            self.assertEqual(self.build(), (True, []))
+        self.assertFalse([p for p in read if p.endswith('.c')], read)
+
+    def test_a_failed_compile_leaves_no_object(self):
+        self.build()
+        write(self.tree / 'build' / 'main' / 'g0000.c', '#error made up\n')
+        self.assertEqual(self.build(), (False, ['g0000.c -O2']))
+        self.assertFalse((self.out / 'main' / 'g0000.o').exists())   # (not the old one either: no link takes it)
+        self.assertEqual(self.build(), (False, ['g0000.c -O2']))
+
+    def test_runtime(self):
+        every = ['hle_table.c -O1', 'host.c -O2', 'nro_table.c -O1', 'win32.c -O2', 'wrap_missing.c -O1']
+        self.assertEqual(self.build('runtime'), (True, every))
+        self.assertEqual(self.build('runtime'), (True, []))
+        write(self.runtime / 'linux' / 'include' / 'windows.h', '#pragma once\ntypedef int BOOL;\n')
+        self.assertEqual(self.build('runtime'), (True, every))
+        self.assertIn('runtime: 5 objects to compile again: the runtime headers changed', self.said)
+        self.tc.CFLAGS = self.tc.CFLAGS + ['-DMORE']
+        self.assertEqual(self.build('runtime'), (True, every))
+
+
+if __name__ == '__main__':
+    unittest.main()

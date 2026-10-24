@@ -13,9 +13,10 @@ compiled as C++ (see recomp.h). The runtime is runtime/*.c with the Linux platfo
 (built by build_vkd3d.py), libopus and libvpx, the last three statically (on Linux, libopus and
 libvpx as the system has them). Built on Linux, the DXVK libraries go into <out>/lib, so the
 program runs from its own folder.
-Incremental: a file is compiled again when its source is newer than its object. <out> holds one
-tree's game (port.txt): build another tree's into another <out>, or
-give --replace to start this one over. A progress bar shows how far it has got and the time left
+Incremental: a file is compiled again when its source, the runtime headers it is built with, its
+compile command or the compiler changed (tools/objcache.py: <out>/rt/ and each module's folder keep
+an objcache.json). <out> holds one tree's game (port.txt): build another tree's into another <out>,
+or give --replace to start this one over. A progress bar shows how far it has got and the time left
 (tools/progress.py)."""
 import os
 import re
@@ -23,13 +24,15 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, LLVM, LLVM_NM, REPO, RUNTIME, SYSROOT, TARGET,
-                       TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_each, default_port, read_port_stamp, run, same_path,
-                       write_port_stamp)
+                       TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each, default_port, read_port_stamp,
+                       run, same_path, write_port_stamp)
 
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import objcache  # noqa: E402
 import progress  # noqa: E402
 
 
@@ -98,15 +101,33 @@ def needs(obj, *srcs):
     return not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(s) for s in srcs)
 
 
-def has_landing_sites(path):
-    with open(path, "rb") as f:
-        return b"__try" in f.read()
+KEYS = {}   # object -> (its folder's objcache.Record, the key it is compiled with), for each job to compile
+LANDING_SITES = b"__try"   # (what a generated file with exception landing sites has)
+
+
+def stale(record, job, inputs, headers, why):
+    """Whether a job's object is to be compiled (objcache.py): built from other `inputs` (files),
+    headers (objcache.digest_files), command or compiler; why[reason] counts it."""
+    src, obj, opt = job[:3]
+    key = record.entry(inputs, compile_command(src, obj, opt, job[3] if len(job) > 3 else []),
+                       objcache.compiler_id(CLANG), headers)
+    reason = record.check(obj, key)
+    if reason:
+        KEYS[obj] = (record, key)
+        why[reason] += 1
+    return reason is not None
 
 
 def game_jobs():
-    recomp_h = os.path.join(RUNTIME, "recomp.h")
-    jobs = []
+    # what the generated files include: recomp.h, one with hook slots hookable.h too, g_module.c
+    # module.h (tools/recomp.py; objcache.game_headers)
+    headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, *h)) for h in objcache.GAME_HEADERS}
+    jobs, why = [], Counter()
     for name, src_dir, out_dir in modules():
+        # (a folder an older version built, without a record: its objects that the date said were current are kept)
+        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS),
+                                 adopt_by_date=objcache.header_files(RUNTIME, "recomp.h", "module.h"),
+                                 adopt_found={objcache.HOOK_SLOTS: objcache.header_files(RUNTIME, "hookable.h")})
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
@@ -114,10 +135,9 @@ def game_jobs():
             obj = os.path.join(out_dir, fname[:-2] + ".o")
             # very large functions make the optimiser superlinear; build those at a lower level (as on Windows)
             opt = "-O1" if int(biggest) > 20000 or fname == "g_module.c" else "-O2"
-            if not needs(obj, src, recomp_h):
-                continue
             insns, biggest = int(insns), int(biggest)
-            if fname != "g_module.c" and has_landing_sites(src):
+            job, inputs = (src, obj, opt), [src]
+            if fname != "g_module.c" and LANDING_SITES in record.source(src)[1]:
                 # As C++, a huge function full of landing sites (lua2cpp item/fighter tables: up to
                 # 210k instructions, 41k sites) takes the optimiser hours even at -O1 - and seconds
                 # at -O0. Those are one-off set-up code; 38k-instruction ones still take 20 s at -O1.
@@ -129,11 +149,15 @@ def game_jobs():
                 if not os.path.exists(wrapper) or open(wrapper).read() != text:
                     with open(wrapper, "w") as f:
                         f.write(text)
-                jobs.append((wrapper, obj, opt))
-            else:
-                jobs.append((src, obj, opt))
+                job, inputs = (wrapper, obj, opt), [wrapper, src]
+            if not stale(record, job, inputs, headers[objcache.game_headers(fname, record.source(src)[1])], why):
+                continue
+            jobs.append(job)
             ESTIMATES[jobs[-1][0]] = (progress.TABLE if fname == "g_module.c" else
                                       game_estimate(insns, biggest, opt, jobs[-1][0].endswith("_cxx.cpp")))
+        record.save()   # (the sources' digests: the next build reads only the files that changed)
+    if objcache.summary(why):
+        print(f"game: {objcache.summary(why)}")
     return jobs
 
 
@@ -191,40 +215,45 @@ def overlay_font():
 def runtime_jobs():
     os.makedirs(GEN, exist_ok=True)
     rt_out = os.path.join(OUT, "rt")
-    headers = [os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")] + \
-              [os.path.join(RUNTIME, "linux", "include", "windows.h")]
+    font = os.path.join(GEN, "overlay_font.h")
+    headers = objcache.digest_files([os.path.join(RUNTIME, n) for n in os.listdir(RUNTIME) if n.endswith(".h")]
+                                    + [os.path.join(RUNTIME, "linux", "include", "windows.h")]
+                                    + ([font] if os.path.exists(font) else []))
+    record, why = objcache.Record(rt_out), Counter()
     sources = [os.path.join(RUNTIME, n) for n in sorted(os.listdir(RUNTIME))
                if re.fullmatch(r"(host|kernel|gpu\w*|hle\w*|ipc\w*|net\w*|debug_watchdog)\.c", n)]
     sources += [os.path.join(RUNTIME, "linux", n) for n in sorted(os.listdir(os.path.join(RUNTIME, "linux")))
                 if n.endswith((".c", ".cpp"))]
     jobs = []
+
+    def want(job):
+        if stale(record, job, [job[0]], headers, why):
+            jobs.append(job)
     for src in sources:
-        obj = os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o")
-        if needs(obj, src, *headers):
-            jobs.append((src, obj, "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+        want((src, os.path.join(rt_out, os.path.basename(src).rsplit(".", 1)[0] + ".o"), "-O2", RUNTIME_INCLUDES + RUNTIME_DEFINES))
     names = hle_names()
     table = os.path.join(GEN, "hle_table.c")
-    changed = write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
-                               + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
-                               + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
-    if changed or needs(os.path.join(rt_out, "hle_table.o"), table, *headers):
-        jobs.append((table, os.path.join(rt_out, "hle_table.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+    write_if_changed(table, '#include "host.h"\n\n' + "".join(f"GuestFn hle_{n};\n" for n in names)
+                     + "const HleEntry hle_table[] = {\n" + "".join(f'    {{"{n}", hle_{n}}},\n' for n in names)
+                     + f"    {{0, 0}}\n}};\nconst u32 hle_count = {len(names)};\n")
+    want((table, os.path.join(rt_out, "hle_table.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
     # A wrapped function no module of this build has (a made-up game's): the original its wrapper names
     # (f_<address>_orig, which nothing reaches) is rt_wrap_missing. The Windows link says so
     # with /alternatename (tools/recomp.py); here it is a weak stub a module's own replaces.
     missing = os.path.join(GEN, "wrap_missing.c")
-    changed = write_if_changed(missing, '#include "host.h"\n\nvoid rt_wrap_missing(Cpu *c);\n'
-                               + "".join(f"__attribute__((weak)) void f_{a:x}_orig(Cpu *c) {{ rt_wrap_missing(c); }}\n"
-                                         for a in hle_wraps()))
-    if changed or needs(os.path.join(rt_out, "wrap_missing.o"), missing, *headers):
-        jobs.append((missing, os.path.join(rt_out, "wrap_missing.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
+    write_if_changed(missing, '#include "host.h"\n\nvoid rt_wrap_missing(Cpu *c);\n'
+                     + "".join(f"__attribute__((weak)) void f_{a:x}_orig(Cpu *c) {{ rt_wrap_missing(c); }}\n"
+                               for a in hle_wraps()))
+    want((missing, os.path.join(rt_out, "wrap_missing.o"), "-O1", RUNTIME_INCLUDES + RUNTIME_DEFINES))
     nros =[n for n, src, _o in modules() if os.path.basename(os.path.dirname(src)) == "nro"]
     nro_table = os.path.join(GEN, "nro_table.c")
-    changed = write_if_changed(nro_table, '#include "module.h"\n\n' + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
-                               + "const RtModule *const rt_nro_modules[] = {" + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
-                               + f"const u32 rt_nro_count = {len(nros)};\n")
-    if changed or needs(os.path.join(rt_out, "nro_table.o"), nro_table):
-        jobs.append((nro_table, os.path.join(rt_out, "nro_table.o"), "-O1", ["-I", RUNTIME]))
+    write_if_changed(nro_table, '#include "module.h"\n\n' + "".join(f"extern const RtModule rt_module_{n};\n" for n in nros)
+                     + "const RtModule *const rt_nro_modules[] = {" + "".join(f"&rt_module_{n}, " for n in nros) + "0};\n"
+                     + f"const u32 rt_nro_count = {len(nros)};\n")
+    want((nro_table, os.path.join(rt_out, "nro_table.o"), "-O1", ["-I", RUNTIME]))
+    record.save()
+    if objcache.summary(why):
+        print(f"runtime: {objcache.summary(why)}")
     return jobs
 
 
@@ -238,14 +267,30 @@ def in_order(jobs):
     return sorted(jobs, key=source_size, reverse=True)
 
 
+def forget(jobs):
+    """Before the jobs compile: their objects and recorded keys gone (objcache.py), so that neither a
+    build stopped half-way nor a file that fails to compile leaves an old object to be taken as
+    current, by the next build or by a link (--link-only)."""
+    records = {}
+    for job in jobs:
+        records.setdefault(KEYS[job[1]][0], []).append(job[1])
+    for record, objs in records.items():
+        record.forget(objs)
+    for job in jobs:
+        if os.path.exists(job[1]):
+            os.remove(job[1])
+
+
 def compile_all(jobs, what, shown=None):
-    """Compile the jobs; `shown`, a progress.Build with a module named `what`, follows them."""
+    """Compile the jobs (from stale: each one's key is recorded once it compiles); `shown`, a
+    progress.Build with a module named `what`, follows them."""
     if not jobs:
         print(f"{what}: up to date")
         return True
     t0 = time.time()
     failures = []
     jobs = in_order(jobs)
+    forget(jobs)
     if shown:
         shown.begin("compile", what, [(job[0], estimate(job)) for job in jobs])
 
@@ -256,6 +301,9 @@ def compile_all(jobs, what, shown=None):
         failed = compile_each([job], 1)
         if shown:
             shown.finished(job, time.time() - t)
+        if not failed:
+            record, key = KEYS[job[1]]
+            record.compiled(job[1], key)
         return failed
     from concurrent.futures import as_completed
     with ThreadPoolExecutor(JOBS) as pool:

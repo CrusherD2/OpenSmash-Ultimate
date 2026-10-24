@@ -58,6 +58,10 @@ CLANG, WINSYSROOT, TOOLCHAIN = _find_toolchain()
 BASE_CFLAGS = ["/nologo", "/arch:AVX2", "-mfma", "-mf16c", "-fno-strict-aliasing", "/clang:-ffp-contract=off", "-w",
                *(["/winsysroot", WINSYSROOT] if WINSYSROOT else [])]
 CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
+# The generated C's flags: it includes recomp.h or module.h, which read none of the runtime's defines and
+# include folders added to CFLAGS below (SDL3, libopus, libvpx). So their coming and going compiles the
+# runtime again (minutes), not the game (hours: tools/objcache.py keys each object on its command).
+GAME_CFLAGS = [*BASE_CFLAGS, "/I", RUNTIME]
 # Linking through clang-cl: with lld-link when it is next to clang-cl (else Visual Studio's link.exe),
 # and LINK_OPTIONS after /link. With deps\msvc both are given the system root. clang-cl, given
 # /winsysroot, hands lld-link the root's library folders (-libpath:). lld-link, given /winsysroot:,
@@ -158,31 +162,40 @@ def compile_many(sources, jobs=16, opt="/O2"):
         return list(pool.map(lambda s: compile_one(s, os.path.splitext(s)[0] + ".obj", opt), sources))
 
 
-def _compile(src, obj, opt):
-    r = subprocess.run([CLANG, "/c", opt, *CFLAGS, NO_CRASH_FILES, src, "/Fo" + obj], capture_output=True, text=True)
+def compile_command(src, obj, opt, flags=None):
+    """The command compile_each compiles a file with (and what objcache.py keys its object on);
+    flags: CFLAGS unless given (GAME_CFLAGS for the generated C)."""
+    return [CLANG, "/c", opt, *(CFLAGS if flags is None else flags), NO_CRASH_FILES, src, "/Fo" + obj]
+
+
+def _compile(src, obj, opt, flags=None):
+    r = subprocess.run(compile_command(src, obj, opt, flags), capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
-def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print):
-    """Compile (src, obj, opt) triples in parallel, in order; returns [(src, error text)] for
-    failures. started(job) and finished(job, seconds), if given, are called (from the worker
-    threads) as each one starts and ends. A file the compiler crashed on is compiled again once
-    the others are done, on its own (RETRY); log() says so."""
+def compile_each(jobs_list, jobs=16, started=None, finished=None, log=print, compiled=None, flags=None):
+    """Compile (src, obj, opt) triples in parallel, in order, with flags (CFLAGS unless given); returns
+    [(src, error text)] for failures. started(job) and finished(job, seconds), if given, are called
+    (from the worker threads) as each one starts and ends, and compiled(job, level) as each one
+    compiles, with the level it compiled at. A file the compiler crashed on is compiled again once the
+    others are done, on its own (RETRY); log() says so."""
     def one(job):
         src, obj, opt = job
         if started:
             started(job)
         t0 = time.time()
-        code, out = _compile(src, obj, opt)
+        code, out = _compile(src, obj, opt, flags)
         if finished:
             finished(job, time.time() - t0)
+        if not code and compiled:
+            compiled(job, opt)
         return (job, code, out) if code else None
     with ThreadPoolExecutor(jobs) as pool:
         failed = [f for f in pool.map(one, jobs_list) if f]
-    return [f for f in (_compile_again(*f, log) for f in failed) if f]
+    return [f for f in (_compile_again(*f, log, compiled, flags) for f in failed) if f]
 
 
-def _compile_again(job, code, out, log):
+def _compile_again(job, code, out, log, compiled=None, flags=None):
     """A failed compile's (src, error text), or None if it was a crash and the file compiles now."""
     src, obj, opt = job
     name = os.path.basename(src)
@@ -191,9 +204,11 @@ def _compile_again(job, code, out, log):
     for again in RETRY.get(opt, (opt, opt)):
         log(f"the compiler crashed on {name} ({crash_cause(code, out)}): compiling it again on its own"
             + (f", at {again}" if again != opt else ""))
-        code, out = _compile(src, obj, again)
+        code, out = _compile(src, obj, again, flags)
         if not code:
             log(f"{name} compiled" + (f" (at {again}: a little less optimised, works the same)" if again != opt else ""))
+            if compiled:
+                compiled(job, again)
             return None
         if not crashed(code, out):
             return src, out

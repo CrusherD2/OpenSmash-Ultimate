@@ -1102,7 +1102,8 @@ def build(a):
             import cc
             if not cc.SDL3_DLL:
                 log("  (no SDL3 in deps\\SDL3: Xbox controllers and the keyboard only - setup guide's SDL3 step)")
-            log("  the first build takes from 30 minutes to a few hours, later ones minutes; if it stops, run this again to carry on")
+            log("  the first build takes from 30 minutes to a few hours, later ones minutes unless the compiler, its flags or "
+                "runtime/recomp.h changed; if it stops, run this again to carry on")
             run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"),
                  "--out", "build", "--jobs", str(jobs)],
                 "The build failed (see above). If the PC ran out of memory, build with fewer jobs at a time: open "
@@ -1119,7 +1120,8 @@ def build_linux_program(jobs):
     """build-linux/ssbu: the game's C generated into build/, then compiled and linked for Linux."""
     retry = (f"If the PC ran out of memory, build with fewer jobs at a time: bash install-windowsmash.sh --jobs "
              f"{max(1, jobs // 2)}")
-    log("  the first build takes one to a few hours, later ones minutes; if it stops, run this again to carry on")
+    log("  the first build takes one to a few hours, later ones minutes unless the compiler, its flags or "
+        "runtime/recomp.h changed; if it stops, run this again to carry on")
     log("  the game's code, as C:")
     run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"), "--out", "build",
          "--jobs", str(jobs), "--generate-only"],
@@ -1148,7 +1150,8 @@ def build_mac_program(jobs):
         subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
-    log("  the first build takes one to a few hours, later ones minutes; if it stops, run this again to carry on")
+    log("  the first build takes one to a few hours, later ones minutes unless the compiler, its flags or "
+        "runtime/recomp.h changed; if it stops, run this again to carry on")
     log("  the game's code, as C:")
     run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"), "--out", "build",
          "--jobs", str(jobs), "--generate-only"],

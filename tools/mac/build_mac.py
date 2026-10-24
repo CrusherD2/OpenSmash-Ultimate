@@ -138,6 +138,17 @@ def needs(obj, *srcs):
     return not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(s) for s in srcs)
 
 
+def hook_slots_stale(obj, src, hookable_time):
+    """Whether obj, of a generated file with hook slots (#include "hookable.h"), is older than
+    hookable.h (hookable_time: its time, None without one). Asked only of an object older than
+    hookable.h, but then at every build: the objects of files without slots stay older than it once
+    it has changed. So only the head of the C is read, where tools/recomp.py puts its includes."""
+    if hookable_time is None or os.path.getmtime(obj) >= hookable_time:
+        return False
+    with open(src, "rb") as f:
+        return b'#include "hookable.h"' in f.read(256)
+
+
 def has_landing_sites(path):
     with open(path, "rb") as f:
         return b"__try" in f.read()
@@ -221,6 +232,8 @@ def record_compiled(job):
 
 def game_jobs():
     recomp_h, module_h = os.path.join(RUNTIME, "recomp.h"), os.path.join(RUNTIME, "module.h")
+    hookable_h = os.path.join(RUNTIME, "hookable.h")   # (what a file with hook slots includes too)
+    hookable_time = os.path.getmtime(hookable_h) if os.path.exists(hookable_h) else None
     record, why = read_game_sources()
     kept = []
     jobs = []
@@ -238,7 +251,8 @@ def game_jobs():
             ident = source_id(src)
             was = record.get(key)
             if was and was[2] == ident and was[0] == game_opt(fname, biggest, was[1] == "c++") and \
-                    not needs(obj, src, recomp_h, *([module_h] if fname == "g_module.c" else [])):
+                    not needs(obj, src, recomp_h, *([module_h] if fname == "g_module.c" else [])) and \
+                    not hook_slots_stale(obj, src, hookable_time):
                 kept.append(record_line(key, *was))
                 continue
             cxx = fname != "g_module.c" and has_landing_sites(src)
