@@ -156,6 +156,8 @@ for _sf, _r in ((1, 'x'), (0, 'w')):
         f'other_{_r}': [ldxp(_sf, 0, 2, 3, 1), stxp(_sf, 0, 4, 5, 6, 7)],       # ...; stxp w4, x5, x6, [x7]: fails
         f'changed_{_r}': [ldxp(_sf, 1, 2, 3, 1), STR_X8_HIGH[_sf], stxp(_sf, 1, 4, 2, 3, 1)],   # ...; str; stlxp w4, x2, x3: fails
         f'clrex_{_r}': [ldxp(_sf, 0, 2, 3, 1), CLREX, stxp(_sf, 0, 4, 5, 6, 1)],   # fails
+        # ...; stxp w8, x2, x3 (what was read): succeeds, memory as it was; stxp w4, x5, x6: fails, the first ended the reservation
+        f'twice_{_r}': [ldxp(_sf, 0, 2, 3, 1), stxp(_sf, 0, 8, 2, 3, 1), stxp(_sf, 0, 4, 5, 6, 1)],
         f'alone_{_r}': [stxp(_sf, 1, 4, 5, 6, 1)],                              # stlxp alone: fails
         f'sp_{_r}': [ldxp(_sf, 1, 2, 3, 31), stxp(_sf, 0, 4, 5, 6, 31)],        # ldaxp x2, x3, [sp]; stxp w4, x5, x6, [sp]
     })
@@ -166,7 +168,7 @@ SEQUENCES['count_w'] = [ldxp(0, 0, 2, 3, 1), 0x31000442, 0x1A1F0063, stxp(0, 0, 
 SEQUENCES['flip_x'] = [ldxp(1, 0, 2, 3, 1), 0x91000442, 0xAA2203E3, stxp(1, 1, 4, 2, 3, 1)] + LOOP_END    # add x2, x2, #1; mvn x3, x2
 # run on the CPU as well: not changed_* (whether a CPU's own store clears its monitor is IMPLEMENTATION DEFINED) nor
 # sp_* (native code keeps its own stack)
-HARDWARE = [n for n in SEQUENCES if n.split('_')[0] in ('ld', 'lda', 'ldst', 'ldast', 'other', 'clrex', 'alone')]
+HARDWARE = [n for n in SEQUENCES if n.split('_')[0] in ('ld', 'lda', 'ldst', 'ldast', 'other', 'clrex', 'twice', 'alone')]
 
 
 def module_c():
@@ -235,6 +237,7 @@ static void each_sequence(void) {
     RESET(A0); FN_other_x(&c);   CHECK(c.x[4] == 1 && MEM(A0, A1));    /* (o: as it was) */
     RESET(A0); FN_changed_x(&c); CHECK(c.x[4] == 1 && MEM(A0, V8));
     RESET(A0); FN_clrex_x(&c);   CHECK(c.x[4] == 1 && MEM(A0, A1));
+    RESET(A0); FN_twice_x(&c);   CHECK(c.x[2] == A0 && c.x[3] == A1 && c.x[8] == 0 && c.x[4] == 1 && MEM(A0, A1));
     RESET(A0); FN_alone_x(&c);   CHECK(c.x[4] == 1 && MEM(A0, A1));
     RESET(A0); FN_sp_x(&c);      CHECK(c.x[2] == A0 && c.x[3] == A1 && c.x[4] == 0 && MEM(V5, V6) && c.sp == GUEST(b));
     /* two W registers: one doubleword, Wt its low half; the registers' upper halves cleared */
@@ -245,6 +248,7 @@ static void each_sequence(void) {
     RESET(B); FN_other_w(&c);    CHECK(c.x[4] == 1 && MEM(B, A1));
     RESET(B); FN_changed_w(&c);  CHECK(c.x[4] == 1 && MEM((V8 << 32) | (u32)B, A1));
     RESET(B); FN_clrex_w(&c);    CHECK(c.x[4] == 1 && MEM(B, A1));
+    RESET(B); FN_twice_w(&c);    CHECK(c.x[8] == 0 && c.x[4] == 1 && MEM(B, A1));
     RESET(B); FN_alone_w(&c);    CHECK(c.x[4] == 1 && MEM(B, A1));
     RESET(B); FN_sp_w(&c);       CHECK(c.x[2] == 0xFEDCBA98u && c.x[3] == 0x76543210u && c.x[4] == 0 && MEM((V6 << 32) | (u32)V5, A1));
 }
@@ -267,7 +271,11 @@ static void work(Job *j) {
 #ifdef _WIN32
 typedef HANDLE Thread;
 static DWORD WINAPI thread_main(LPVOID j) { work((Job *)j); return 0; }
-static Thread start(Job *j) { return CreateThread(NULL, 0, thread_main, j, 0, NULL); }
+static Thread start(Job *j) {
+    HANDLE t = CreateThread(NULL, 0, thread_main, j, 0, NULL);
+    if (!t) { fprintf(stderr, "CreateThread: error %lu\n", (unsigned long)GetLastError()); exit(2); }
+    return t;
+}
 static void join(Thread t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
 #else
 typedef pthread_t Thread;

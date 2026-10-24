@@ -514,8 +514,9 @@ def exclusive_sequences(rng):
 def exclusive_pair_sequences(rng):
     """The same for ldxp / stxp, of two W registers (one 8-byte location) and two X registers
     (16 bytes): alone, a load and a store, a store to another address, either half changed in
-    between (by a str), a clrex in between, a second store after a successful one, a store
-    alone. With and without acquire / release, and with sp as the base."""
+    between (by a str), a clrex in between, a second store after one that succeeded and wrote
+    back what was read, a store alone. With and without acquire / release, and with sp as the
+    base."""
     ldxp = lambda sz, o0, rt, rt2, rn: 1 << 31 | sz << 30 | 0x08600000 | 31 << 16 | o0 << 15 | rt2 << 10 | rn << 5 | rt
     stxp = lambda sz, o0, rs, rt, rt2, rn: 1 << 31 | sz << 30 | 0x08200000 | rs << 16 | o0 << 15 | rt2 << 10 | rn << 5 | rt
     out = []
@@ -534,7 +535,7 @@ def exclusive_pair_sequences(rng):
             out.append(("ldxp; str; stxp", (ld, low, again)))                 # the first doubleword changed: fails
             out.append(("ldxp; str; stxp (high)", (ld, high, again)))         # the high half changed: fails
             out.append(("ldxp; clrex; stxp", (ld, 0xD503305F, st)))          # clrex: fails
-            out.append(("ldxp; stxp; stxp", (ld, st, again)))                 # succeeds, then fails: the monitor went
+            out.append(("ldxp; stxp; stxp", (ld, again, st)))                 # succeeds, memory as it was; then fails: the monitor went
             out.append(("stxp", (st,)))                                       # no reservation: fails
     return out
 
