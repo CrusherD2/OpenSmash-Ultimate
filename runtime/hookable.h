@@ -12,7 +12,10 @@
  * release, so a hook may go in while other threads call through the slot.
  *
  * A hookable function is also an exact-callee: its callers hand it every register they have
- * changed and read back every one they use, so a hook sees and can change all of them. */
+ * changed and read back every one they use, so a hook sees and can change all of them. A caller
+ * through a pointer does so only if tools/hooks.txt lists it as an exact-caller; otherwise a
+ * hook sees its x0-x18, x29, x30 and SP but stale x19-x28, and what it writes to x19-x28, x29 or
+ * SP is lost. */
 #pragma once
 #include "recomp.h"
 

@@ -17,8 +17,10 @@
 #       the function gets a hook slot (runtime/hookable.h): every direct call, tail call,
 #       indirect call and import stub reaches it through a pointer a hook can swap at run time,
 #       and its own code is never inlined or folded into another function. It is an
-#       exact-callee too (list it once, as hookable). A function whose calls become the host's
-#       setjmp cannot be hookable.
+#       exact-callee too (list it once, as hookable), with the same limit: a hook sees and
+#       changes x19-x28 of a caller through a pointer (blr) only if that caller is listed as
+#       an exact-caller; x0-x18 always. A function whose calls become the host's setjmp cannot
+#       be hookable.
 #
 # A hook's caller is the code it returns to (where its LR points), so an exact-callee also
 # makes exact, in every module:

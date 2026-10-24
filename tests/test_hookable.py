@@ -3,13 +3,16 @@ the guest reaches only through a slot a hook can take over (runtime/hookable.h, 
 The lifter calls through the slot at every direct call and tail call, f_<address> (which the
 module's table holds for rt_lookup, and so for indirect calls and other modules' import stubs)
 calls through it too, and the function is an exact-callee, so a hook sees and changes its
-callers' registers. tools/hook_inline_check.py checks that in the generated C and in objects.
-The functions here are made of hand-assembled words, the lists of made-up addresses."""
+callers' registers (as for any exact-callee, a caller through a pointer's only if that caller is
+listed as an exact-caller). tools/hook_inline_check.py checks that in the generated C and in
+objects. The functions here are made of hand-assembled words, the lists of made-up addresses."""
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import os
 import platform
-import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -45,7 +48,7 @@ def caller(at, to):
 FUNCS = {0x00: caller(0x00, 0x40),                                     # A
          0x38: [ADD_X0_100, ADD_X0_100],                               # N: runs on into B
          0x40: [ADD_X0_1, RET],                                        # B
-         0x80: [MOV_X19_5, MOV_X20_6, BLR_X8, MOV_X1_X19, MOV_X2_X20, RET],   # C
+         0x80: [MOV_X19_5, MOV_X20_6, SUB_SP, ADD_X29, BLR_X8, MOV_X1_X19, MOV_X2_X20, ADD_SP, RET],   # C
          0xC0: caller(0xC0, 0x100),                                    # G
          0x100: [ADD_X0_100, hl.b(0x104, 0x40)]}                       # T
 SIZES = {off: 4 * len(words) for off, words in FUNCS.items()}
@@ -68,14 +71,17 @@ class SdkModule(hl.FakeModule):
         self.symbols = [('', 0, 0, 0, 0), ('nn_hooked', 0, 0, 0x12, 0)]
 
 
-LIST = f'hookable {HOOKED} nn_hooked\nexact-caller {MAIN + 0x80:x} indirect_caller\n'
+# (C calls B through a pointer, which cannot be known to reach it: as for any exact-callee, a hook
+# sees C's x19-x28 only with C listed as an exact-caller. MacRunTests runs it without, too.)
+ONLY_HOOKABLE = f'hookable {HOOKED} nn_hooked\n'
+LIST = ONLY_HOOKABLE + f'exact-caller {MAIN + 0x80:x} indirect_caller\n'
 
 
-def resolved():
-    """What recomp.build hands the Lifter for main and for sdk with LIST: ({...}, {...})."""
+def resolved(listing=LIST):
+    """What recomp.build hands the Lifter for main and for sdk with this list: ({...}, {...})."""
     main_mod = hl.FakeModule(hl.assemble(FUNCS))
     tails = recomp.tail_graph(main_mod, SIZES)
-    with hl.hooks_file(LIST):
+    with hl.hooks_file(listing):
         imports = recomp.hook_imports({'main': types.SimpleNamespace(exports=[('nn_hooked', B, 8, 0x12, 1)])},
                                       {'main': ({}, tails)})
         callees, callers = recomp.resolve_hooks(main_mod, MAIN, SIZES, 'main', set(FUNCS))
@@ -121,6 +127,16 @@ def emit(outdir, funcs=FUNCS, base=MAIN, **lists):
 
 
 TABLE = f'    {{0x{MAIN + 0x40:X}ull, f_{HOOKED}}},\n'   # B's row of g_module.c's table (recomp.module_table)
+# what the checks read of main's g_module.c: B's row of the table, and the module's base
+G_MODULE = (f'GuestFn f_{HOOKED};\nstatic const RtFunc funcs[] = {{\n{TABLE}}};\n'
+            f'const RtModule rt_module_main = {{\n    "main", 0x{MAIN:X}ull, 0x1000ull,\n}};\n')
+
+
+def command(folder, *args):
+    """(hook_inline_check.py's exit status on a module's folder, what it printed), with LIST."""
+    out = io.StringIO()
+    with hl.hooks_file(LIST), redirect_stdout(out):
+        return hook_inline_check.main([str(folder), *args]), out.getvalue()
 
 
 class HookList(unittest.TestCase):
@@ -259,7 +275,7 @@ class InlineCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             text, problems = emit(tmp, **(lists or resolved()[0]))
         self.assertEqual(problems, [])
-        return {'g0000.c': text, 'g_module.c': f'GuestFn f_{HOOKED};\nstatic const RtFunc funcs[] = {{\n{TABLE}}};\n'}
+        return {'g0000.c': text, 'g_module.c': G_MODULE}
 
     def problems(self, files):
         return hook_inline_check.check_c(files, {MAIN + B})
@@ -312,6 +328,33 @@ class InlineCheck(unittest.TestCase):
             with self.subTest(what), patch, tempfile.TemporaryDirectory() as tmp:
                 _text, problems = emit(tmp, **main)
                 self.assertTrue(problems)
+
+    def test_a_lifter_not_given_the_list_stops_the_build(self):
+        """recomp._emit reads tools/hooks.txt itself for the check, so a build whose Pool hands the
+        Lifter no hookable set (its arguments out of step with _init's) stops, not generates
+        plain calls."""
+        with hl.hooks_file(LIST), tempfile.TemporaryDirectory() as tmp:
+            text, problems = emit(tmp, **dict(resolved()[0], hookable=None))
+        self.assertNotIn('rt_hook_', text)
+        self.assertTrue(any(f'calls f_{HOOKED} directly' in p for p in problems), problems)
+        self.assertTrue(any(f'f_{HOOKED} does not call through its slot' in p for p in problems), problems)
+
+    def test_the_command(self):
+        """On a module's folder: 1 for a problem in the C; 2, not 0, when a file that defines or
+        calls a hookable function has no object to read. (Compiled: 0 with its object.)"""
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            for name, text in self.files().items():
+                (folder / name).write_text(text, encoding='utf-8')
+            status, out = command(folder)
+            self.assertEqual(status, 2, out)
+            self.assertIn('g0000.c: no object, or no objdump to read it with: not checked', out)
+            self.assertIn('1 files that define or call a hookable function have no object checked', out)
+            g = (folder / 'g0000.c').read_text(encoding='utf-8')
+            (folder / 'g0000.c').write_text(g.replace(CALL_B, f'f_{HOOKED}(c);', 1), encoding='utf-8')
+            status, out = command(folder)
+            self.assertEqual(status, 1, out)
+            self.assertIn(f'calls f_{HOOKED} directly', out)
 
     def test_the_header(self):
         text = (ROOT / 'runtime' / 'hookable.h').read_text(encoding='utf-8')
@@ -370,6 +413,23 @@ def windows_compile(src, obj, stubs):
                            '/I', str(ROOT / 'runtime'), str(src), '/Fo' + str(obj)], capture_output=True, text=True, timeout=300)
 
 
+def relocations_overflowed(data):
+    """A COFF object with each section's relocations written as a section with more than 65,535
+    has them: moved to the end, after a first record holding their count (which counts it too),
+    with the section's count 0xFFFF and IMAGE_SCN_LNK_NRELOC_OVFL set."""
+    out = bytearray(data)
+    (nsec,), (opt,) = struct.unpack_from('<H', data, 2), struct.unpack_from('<H', data, 16)
+    for i in range(nsec):
+        at = 20 + opt + 40 * i
+        (relocs,), (nrel,), (flags,) = (struct.unpack_from(f, data, at + o) for f, o in (('<I', 24), ('<H', 32), ('<I', 36)))
+        if nrel:
+            struct.pack_into('<I', out, at + 24, len(out))
+            out += struct.pack('<IIH', nrel + 1, 0, 0) + data[relocs:relocs + 10 * nrel]
+            struct.pack_into('<H', out, at + 32, 0xFFFF)
+            struct.pack_into('<I', out, at + 36, flags | hook_inline_check.IMAGE_SCN_LNK_NRELOC_OVFL)
+    return bytes(out)
+
+
 class Compiled(unittest.TestCase):
     """hook_inline_check.check_object on the made-up module compiled at -O2: the function's own
     code is there, its forwarder and every caller load the slot, nothing else names it, and on
@@ -425,6 +485,12 @@ class Compiled(unittest.TestCase):
         self.assertIn(body, refs['probe_direct'])                          # called, not inlined, where called directly
         self.assertEqual(hook_inline_check.check_object(obj, {MAIN + B}),
                          [f'{os.path.basename(obj)}: probe_direct names {body}: a call that bypasses the slot'])
+        as_is = obj
+        # the command, on the module's folder with the object beside its C: 0
+        self.assertTrue(self.text.endswith(PROBE))
+        folder = Path(self.build('command', self.text[:-len(PROBE)], compile_)[0]).parent
+        (folder / 'g_module.c').write_text(G_MODULE, encoding='utf-8')
+        self.assertEqual(command(folder), (0, f'{folder}: 1 hookable functions\n'))
 
         # noinline taken out: the direct call takes the function's code in
         _obj, (funcs, refs, _comdat) = self.build('inline', self.text, compile_, header.replace('noinline, ', '').replace(
@@ -436,7 +502,7 @@ class Compiled(unittest.TestCase):
         self.assertNotEqual(direct, self.text)
         obj, _code = self.build('direct', direct, compile_)
         self.assertIn(f'f_{MAIN:x} names {body}', '\n'.join(hook_inline_check.check_object(obj, {MAIN + B})))
-        return header
+        return header, as_is
 
     def test_the_platforms_compiler(self):
         self.check(native_compile)
@@ -444,13 +510,35 @@ class Compiled(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt' or CLANG is None, 'Windows compiles it with clang-cl itself (the test above)')
     def test_for_windows(self):
         """/O2 puts every function in a COMDAT of its own, which /OPT:ICF may fold with an
-        identical one; the function's section is not one."""
-        header = self.check(windows_compile)
+        identical one; the function's section is not one. And a section with more than 65,535
+        relocations, whose count is in its first record, reads the same."""
+        header, as_is = self.check(windows_compile)
         obj, (_funcs, _refs, comdat) = self.build('comdat', self.text, windows_compile,
                                                   header.replace(', section(".text$rt_hook")', ''))
         self.assertIn(f'f_{HOOKED}_body', comdat)
         self.assertIn(f'f_{HOOKED}', comdat)   # (as every other function there)
         self.assertIn('in a COMDAT section', '\n'.join(hook_inline_check.check_object(obj, {MAIN + B})))
+        data = Path(as_is).read_bytes()
+        self.assertEqual(data[:2], b'\x64\x86')   # (AMD64, not the big-object form)
+        self.assertEqual(hook_inline_check.coff_code(relocations_overflowed(data)), hook_inline_check.coff_code(data))
+
+
+class Coff(unittest.TestCase):
+    def test_relocations_past_65535(self):
+        """A section with more than 65,535 relocations keeps their count in its first record (a
+        COFF object made here: one code section, f calling g three times)."""
+        sym = struct.Struct('<8sIhHBB')
+        syms = [sym.pack(b'f', 0, 1, 0x20, 2, 0), sym.pack(b'g', 0, 0, 0x20, 2, 0)]   # f in section 1; g undefined
+        relocs = b''.join(struct.pack('<IIH', 4 * i, 1, 4) for i in range(3))         # three calls of g
+        code = b'\xc3' * 16
+        at_code = 20 + 40
+        at_relocs, at_syms = at_code + len(code), at_code + len(code) + len(relocs)
+        head = struct.pack('<HHIIIHH', 0x8664, 1, 0, at_syms, len(syms), 0, 0)
+        section = struct.pack('<8sIIIIIIHHI', b'.text', 0, 0, len(code), at_code, at_relocs, 0, len(relocs) // 10, 0,
+                              0x60000020)
+        data = head + section + code + relocs + b''.join(syms) + struct.pack('<I', 4)
+        self.assertEqual(hook_inline_check.coff_code(data), ({'f'}, {'f': {'g'}}, set()))
+        self.assertEqual(hook_inline_check.coff_code(relocations_overflowed(data)), ({'f'}, {'f': {'g'}}, set()))
 
 
 # ---- run on an arm64 Mac ------------------------------------------------------------------
@@ -458,8 +546,10 @@ HARNESS = r'''
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include "hookable.h"
 
 GuestFn f_7100000000, f_7100000038, f_7100000040, f_7100000040_body, f_7100000080, f_71000000c0, f_7109000000;
@@ -476,12 +566,12 @@ _Noreturn void rt_trap(Cpu *c, u64 pc, const char *why) { (void)c; fprintf(stder
 void rt_svc(Cpu *c, u32 n) { (void)c; fprintf(stderr, "svc %u\n", n); exit(5); }
 u64 rt_ticks(void) { return 0; }
 
-/* the hook: sees the caller's x19 and x20, runs the original, then changes them */
+/* the hook: sees the caller's x19, x20, x29 and SP, runs the original, then changes x19 and x20 */
 static GuestFn *next;
 static int hooked;
-static u64 seen[2];
+static u64 seen[4];
 static void hook(Cpu *c) {
-    hooked++; seen[0] = c->x[19]; seen[1] = c->x[20];
+    hooked++; seen[0] = c->x[19]; seen[1] = c->x[20]; seen[2] = c->x[29]; seen[3] = c->sp;
     next(c);
     c->x[19] = 77; c->x[20] = 88;
 }
@@ -494,17 +584,19 @@ static void run_all(const char *phase) {
         Cpu c;
         memset(&c, 0, sizeof c);
         c.x[0] = 10; c.x[8] = 0x7100000040ull; c.x[19] = 1; c.x[20] = 2; c.x[29] = 3; c.sp = 0x10000;
-        hooked = 0; seen[0] = seen[1] = 0;
+        hooked = 0; memset(seen, 0, sizeof seen);
         entries[i].fn(&c);
-        printf("%s %s %d %llu %llu %llu %llu %llu\n", phase, entries[i].name, hooked, (unsigned long long)seen[0],
-               (unsigned long long)seen[1], (unsigned long long)c.x[0], (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
+        printf("%s %s %d %llu %llu %llx %llx %llu %llu %llu\n", phase, entries[i].name, hooked, (unsigned long long)seen[0],
+               (unsigned long long)seen[1], (unsigned long long)seen[2], (unsigned long long)seen[3], (unsigned long long)c.x[0],
+               (unsigned long long)c.x[1], (unsigned long long)c.x[2]);
     }
 }
 
-/* one thread calls A over and over while another puts a hook in and takes it out */
+/* One thread calls A over and over while another puts a hook in and takes it out, 200000 times.
+ * Every 8th time it leaves the hook in until a call has gone through it (5 s at most). */
 static GuestFn *stress_next;
 static u64 stress_hooked;
-static int stop, bad_remove;
+static int stop, bad_remove, missed;
 static void stress_hook(Cpu *c) {
     __atomic_fetch_add(&stress_hooked, 1, __ATOMIC_RELAXED);
     __atomic_load_n(&stress_next, __ATOMIC_RELAXED)(c);
@@ -512,7 +604,11 @@ static void stress_hook(Cpu *c) {
 }
 static void *swapper(void *slot) {
     for (int i = 0; i < 200000; i++) {
+        u64 before = __atomic_load_n(&stress_hooked, __ATOMIC_RELAXED);
         rt_hook_install((GuestFn **)slot, stress_hook, &stress_next);
+        if (i % 8 == 0 && !missed)
+            for (time_t end = time(NULL) + 5; __atomic_load_n(&stress_hooked, __ATOMIC_RELAXED) == before; sched_yield())
+                if (time(NULL) > end) { missed = 1; break; }
         if (!rt_hook_remove((GuestFn **)slot, stress_hook, stress_next)) bad_remove++;
     }
     __atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
@@ -538,10 +634,12 @@ int main(void) {
     CHECK(rt_hook_remove(slot, hook, next) && *slot == f_7100000040_body);
     run_all("after");
 
+    /* each call's x0 is the function's and its x19/x20 A's or the hook's; every call that went
+     * through the hook came back with the hook's */
     pthread_t t;
     pthread_create(&t, NULL, swapper, slot);
     u64 calls = 0, wrong = 0, hooked_seen = 0;
-    while (!__atomic_load_n(&stop, __ATOMIC_ACQUIRE)) {
+    do {
         Cpu c;
         memset(&c, 0, sizeof c);
         c.x[0] = 10; c.sp = 0x10000;
@@ -549,11 +647,12 @@ int main(void) {
         calls++;
         if (c.x[0] != 11 || !((c.x[1] == 5 && c.x[2] == 6) || (c.x[1] == 77 && c.x[2] == 88))) wrong++;
         hooked_seen += c.x[1] == 77;
-    }
+    } while (!__atomic_load_n(&stop, __ATOMIC_ACQUIRE));
     pthread_join(t, NULL);
-    printf("stress %llu %d %d\n", (unsigned long long)wrong, bad_remove, calls > 0);
-    fprintf(stderr, "(%llu calls while the hook went in and out 200000 times; %llu hooked)\n", (unsigned long long)calls,
-            (unsigned long long)hooked_seen);
+    u64 through = __atomic_load_n(&stress_hooked, __ATOMIC_RELAXED);
+    printf("stress %llu %d %d\n", (unsigned long long)wrong, bad_remove, !missed && hooked_seen > 0 && hooked_seen == through);
+    fprintf(stderr, "(%llu calls while the hook went in and out 200000 times; %llu went through it, %llu came back changed)\n",
+            (unsigned long long)calls, (unsigned long long)through, (unsigned long long)hooked_seen);
     CHECK(*slot == f_7100000040_body);
     return 0;
 }
@@ -562,16 +661,11 @@ int main(void) {
 
 @unittest.skipUnless(ON_ARM64_MAC, 'needs an arm64 Mac with clang (the Command Line Tools)')
 class MacRunTests(unittest.TestCase):
-    def test_a_hook_in_the_slot_takes_every_call(self):
-        """Put in at run time, the hook takes the direct call, the tail call, the indirect call, the
-        call from sdk through its import stub, and the function running on into it; it sees and
-        changes the caller's x19 and x20 and runs the original (x0 + 1). Taken out, the calls reach
-        the function again. And it goes in and out while another thread calls through the slot."""
-        main, sdk = resolved()
+    def run_harness(self, main, sdk):
+        """(the harness's lines, main's C, sdk's C), with main and sdk lifted with these lists."""
         with tempfile.TemporaryDirectory() as tmp:
             gen_main = emit(Path(tmp) / 'main', **main)[0]
             gen_sdk = emit(Path(tmp) / 'sdk', SDK_FUNCS, SDK, **sdk)[0]
-            self.assertIn(f'f_{SDK + 0x100:x}(c);', gen_sdk)   # (sdk calls its stub; the stub, rt_lookup)
             harness = Path(tmp) / 'harness.c'
             harness.write_text(HARNESS, encoding='utf-8')
             exe = Path(tmp) / 'run'
@@ -579,32 +673,44 @@ class MacRunTests(unittest.TestCase):
                                 str(Path(tmp) / 'sdk' / 'g0000.c'), str(ROOT / 'runtime' / 'hle_hooks.c'), str(harness),
                                 '-o', str(exe)], capture_output=True, text=True, timeout=300)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn(f'RT_HOOK(rt_hook_{HOOKED})', gen_main)
             r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        lines = r.stdout.splitlines()
-        plain = {'direct': '0 0 0 11 5 6', 'tail': '0 0 0 111 5 6', 'indirect': '0 0 0 11 5 6', 'stub': '0 0 0 11 5 6',
-                 'runs-on': '0 0 0 211 0 0'}
-        hooked = {'direct': '1 5 6 11 77 88', 'tail': '1 5 6 111 77 88', 'indirect': '1 5 6 11 77 88', 'stub': '1 5 6 11 77 88',
-                  'runs-on': '1 1 2 211 0 0'}   # (N's own caller is the harness: x19 and x20 as it set them)
+        return r.stdout.splitlines(), gen_main, gen_sdk
+
+    def test_a_hook_in_the_slot_takes_every_call(self):
+        """Put in at run time, the hook takes the direct call, the tail call, the indirect call, the
+        call from sdk through its import stub, and the function running on into it; it sees the
+        caller's x19, x20, x29 and SP, changes x19 and x20, and runs the original (x0 + 1). Taken
+        out, the calls reach the function again. And it goes in and out while another thread
+        calls through the slot, taking calls as it does. (C, the indirect caller, is listed as an
+        exact-caller.)"""
+        lines, gen_main, gen_sdk = self.run_harness(*resolved())
+        self.assertIn(f'RT_HOOK(rt_hook_{HOOKED})', gen_main)
+        self.assertIn(f'f_{SDK + 0x100:x}(c);', gen_sdk)   # (sdk calls its stub; the stub, rt_lookup)
+        plain = {'direct': '0 0 0 0 0 11 5 6', 'tail': '0 0 0 0 0 111 5 6', 'indirect': '0 0 0 0 0 11 5 6',
+                 'stub': '0 0 0 0 0 11 5 6', 'runs-on': '0 0 0 0 0 211 0 0'}
+        # (each caller's frame: SP 0x10000 - 0x20, x29 SP + 0x10)
+        hooked = {'direct': '1 5 6 fff0 ffe0 11 77 88', 'tail': '1 5 6 fff0 ffe0 111 77 88',
+                  'indirect': '1 5 6 fff0 ffe0 11 77 88', 'stub': '1 5 6 fff0 ffe0 11 77 88',
+                  'runs-on': '1 1 2 3 10000 211 0 0'}   # (N's own caller is the harness: its registers as it set them)
         self.assertEqual(lines, [f'{phase} {k} {v}' for phase, table in (('before', plain), ('hooked', hooked), ('after', plain))
                                  for k, v in table.items()] + ['stress 0 0 1'])
+
+    def test_a_caller_through_a_pointer_needs_listing_as_an_exact_caller(self):
+        """With only the hookable entry, the slot still takes C's call through x8, and the hook
+        sees C's x29 and SP and its result comes back in x0, but it finds the context's x19 and
+        x20, not C's, and what it writes there is lost. The other calls are exact as before."""
+        lines, _main, _sdk = self.run_harness(*resolved(ONLY_HOOKABLE))
+        self.assertIn('hooked indirect 1 1 2 fff0 ffe0 11 5 6', lines)
+        for k, v in (('direct', '1 5 6 fff0 ffe0 11 77 88'), ('tail', '1 5 6 fff0 ffe0 111 77 88'),
+                     ('stub', '1 5 6 fff0 ffe0 11 77 88')):
+            self.assertIn(f'hooked {k} {v}', lines)
 
     def test_without_the_exact_callee_closure_a_hook_sees_stale_registers(self):
         """(What making a hookable function an exact-callee is for: the slot alone, as in #15's
         tests for a wrap.)"""
-        with tempfile.TemporaryDirectory() as tmp:
-            emit(Path(tmp) / 'main', hookable={B})
-            emit(Path(tmp) / 'sdk', SDK_FUNCS, SDK)
-            harness = Path(tmp) / 'harness.c'
-            harness.write_text(HARNESS, encoding='utf-8')
-            exe = Path(tmp) / 'run'
-            r = subprocess.run([CLANG, *MAC_CFLAGS, '-O2', '-I', str(ROOT / 'runtime'), str(Path(tmp) / 'main' / 'g0000.c'),
-                                str(Path(tmp) / 'sdk' / 'g0000.c'), str(ROOT / 'runtime' / 'hle_hooks.c'), str(harness),
-                                '-o', str(exe)], capture_output=True, text=True, timeout=300)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
-        self.assertIn('hooked direct 1 1 2 11 5 6', r.stdout.splitlines())   # the context's x19/x20; A keeps its own
+        lines, _main, _sdk = self.run_harness(dict(hookable={B}), {})
+        self.assertIn('hooked direct 1 1 2 fff0 ffe0 11 5 6', lines)   # the context's x19/x20; A keeps its own
 
 
 if __name__ == '__main__':
