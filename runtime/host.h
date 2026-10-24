@@ -67,6 +67,7 @@ Cpu *kernel_main_thread(u32 *handle);                  /* context + handle for t
 u32 kernel_new_session(void *session);                 /* a handle for a native IPC session */
 void *kernel_session_of(u32 handle);
 u32 kernel_create_event(void);                         /* a kernel event handle, for native code */
+void kernel_copy_handle(u32 handle);                   /* native code hands the guest that handle again */
 void fiber_counts(u32 *slots, u32 *finalized, u64 *made);   /* (hle_fiber.c) host fibers in use, spare; guest fibers started */
 
 /* ---- native system services (ipc.c) ----------------------------------------------- */
