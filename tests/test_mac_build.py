@@ -249,6 +249,22 @@ class BuildMacTests(unittest.TestCase):
         self.compile(self.ns['game_jobs']())
         self.assertEqual(self.ns['game_jobs'](), [])
 
+    def test_hook_slots_follow_hookable_h(self):
+        """A file with hook slots includes hookable.h (tools/recomp.py): an object of one older than
+        hookable.h is compiled again; the others, and objects newer than it, are kept."""
+        runtime = self.top / 'runtime'
+        for n in ('recomp.h', 'module.h', 'hookable.h'):
+            write(runtime / n, '#pragma once\n')
+        self.ns['RUNTIME'] = str(runtime)
+        main = self.tree / 'build' / 'main'
+        write(main / 'g0000.c', '#include "recomp.h"\n#include "hookable.h"\nvoid f(void) {}\n')
+        self.compile(self.ns['game_jobs']())   # (objects an hour from now)
+        self.assertEqual(self.ns['game_jobs'](), [])
+        later = time.time() + 7200
+        os.utime(runtime / 'hookable.h', (later, later))
+        again = [os.path.relpath(j[1], self.ns['OBJ']) for j in self.ns['game_jobs']()]
+        self.assertEqual(again, [os.path.join('main', 'g0000.o')])
+
     def test_stopped_half_way(self):
         """What a build stopped part of the way through compiled is kept: each object is recorded
         as it is compiled."""

@@ -881,16 +881,18 @@ def build(path, outdir, jobs, per_file, imports=None):
 
 def plan(outdir):
     """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
-    one is). A generated file includes recomp.h, g_module.c module.h (_emit, module_table). The key's
+    one is). A generated file includes recomp.h, one with hook slots hookable.h too, g_module.c
+    module.h (_emit, module_table; objcache.game_headers). The key's
     command names the file and its object by their names in the folder: the folder spelled another
     way (build/main, .\\build\\main, a full path), or moved, compiles nothing again."""
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
     # (a folder an older version built, without a record: its objects that the date said were current are kept)
-    record = objcache.Record(outdir, adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"))
+    record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,),
+                             adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"))
     compiler = objcache.compiler_id(cc.CLANG)
-    headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, h)) for h in ("recomp.h", "module.h")}
+    headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, *h)) for h in objcache.GAME_HEADERS}
     todo, keys, why = [], {}, Counter()
     for name, insns, biggest in rows + [["g_module.c", "0", "0"]]:
         src = os.path.join(outdir, name)
@@ -898,7 +900,7 @@ def plan(outdir):
         # very large functions make the optimiser superlinear; build those at a lower level
         opt = "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"
         keys[obj] = record.entry([src], cc.compile_command(name, name[:-2] + ".obj", opt, cc.GAME_CFLAGS), compiler,
-                                 headers["module.h" if name == "g_module.c" else "recomp.h"])
+                                 headers[objcache.game_headers(name, record.source(src)[1])])
         reason = record.check(obj, keys[obj])
         if reason:
             why[reason] += 1
