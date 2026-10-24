@@ -890,7 +890,8 @@ def plan(outdir):
         rows = [line.split("\t") for line in f.read().splitlines()]
     # (a folder an older version built, without a record: its objects that the date said were current are kept)
     record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,),
-                             adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h", "hookable.h"))
+                             adopt_by_date=objcache.header_files(cc.RUNTIME, "recomp.h", "module.h"),
+                             adopt_found={objcache.HOOK_SLOTS: objcache.header_files(cc.RUNTIME, "hookable.h")})
     compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, *h)) for h in objcache.GAME_HEADERS}
     todo, keys, why = [], {}, Counter()
