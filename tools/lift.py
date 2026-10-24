@@ -93,9 +93,10 @@ _RE_TAIL = re.compile(r"TAIL\((f_[0-9a-f]+)\)")
 _RE_TRAP = re.compile(r"(rt_trap\(c, [^;]*;)")
 
 
-def mark_syncs(s):
-    """The places regcache.apply brings the context up to date, marked in a statement."""
-    s = _RE_CALL.sub(r"\1@S@ \2 @R@", s)
+def mark_syncs(s, exact=False):
+    """The places regcache.apply brings the context up to date, marked in a statement. exact: the
+    statement's direct call is to an exact-callee (tools/hooks.txt)."""
+    s = _RE_CALL.sub(r"\1@E@@S@ \2 @R@" if exact else r"\1@S@ \2 @R@", s)
     s = s.replace("rt_lookup(t_)(c);", "@S@ rt_lookup(t_)(c); @R@")
     s = _RE_SVC.sub(r"@S@ \1 @R@", s)
     s = s.replace("if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;", "@F@ if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0; else { @A@ }")
@@ -108,6 +109,45 @@ def mark_syncs(s):
     return s
 
 
+def jump_target(w, pc):
+    """Where the b, b.cond, cbz/cbnz or tbz/tbnz at pc goes (the branches Lifter.goto lifts), or None."""
+    if w >> 26 == 5:
+        return pc + (sx(w & 0x3FFFFFF, 26) << 2)
+    if (w >> 25) & 0x3F == 0x1A or (w >> 24 == 0x54 and not (w >> 4) & 1):
+        return pc + (sx((w >> 5) & 0x7FFFF, 19) << 2)
+    if (w >> 25) & 0x3F == 0x1B:
+        return pc + (sx((w >> 5) & 0x3FFF, 14) << 2)
+    return None
+
+
+def tail_calls(image, funcs, entries):
+    """{function: the functions it jumps to without a call}, as the Lifter lifts them (TAIL): a
+    b, b.cond, cbz/cbnz or tbz/tbnz to another function's entry (goto), and a last instruction
+    that runs on into the next function (lift_function). funcs: [(offset, size)]; entries: the
+    Lifter's. Not a br through a register: where that goes is known only when it runs."""
+    out = {}
+    for a, size in funcs:
+        end = a + size
+        code = bytes(image[a:end])
+        for m in re.finditer(rb"[\x14-\x17\x34-\x37\x54\xb4-\xb7]", code[3::4]):   # those branches' top bytes
+            t = jump_target(struct.unpack_from("<I", code, m.start() * 4)[0], a + m.start() * 4)
+            if t is not None and not a <= t < end and t in entries:
+                out.setdefault(a, set()).add(t)
+        if size < 4 or end not in entries:
+            continue
+        last = (size & ~3) - 4
+        w = struct.unpack_from("<I", code, last)[0]
+        if w >> 26 == 5 or (w >> 24 == 0x54 and not (w >> 4) & 1 and w & 15 >= 14):   # b, b.al
+            t = jump_target(w, a + last)
+            ends = a <= t < end or t in entries   # (into another function's body: a trap, which runs on)
+        else:   # ret, br, an exception-generating instruction, udf
+            ends = (w & 0xFFFFFC1F in (0xD65F0000, 0xD61F0000) or (w >> 24 == 0xD4 and w & 0xFFE0001F != 0xD4000001)
+                    or w >> 16 == 0 or w == 0xE7FFDEFE)
+        if not ends:
+            out.setdefault(a, set()).add(end)
+    return out
+
+
 def fp_imm8(imm8):
     b6 = (imm8 >> 6) & 1
     exp = ((b6 ^ 1) << 10) | ((0xFF if b6 else 0) << 2) | ((imm8 >> 4) & 3)
@@ -116,12 +156,18 @@ def fp_imm8(imm8):
 
 
 class Lifter(SimdMixin):
-    def __init__(self, image, entries, base=BASE, forward=None, setjmp=None, pads=None):
+    def __init__(self, image, entries, base=BASE, forward=None, setjmp=None, pads=None, exact_callees=None,
+                 exact_callers=None):
         self.img = image
         self.base = base         # guest address the module is loaded at
         self.forward = forward or {}   # entry offset -> native function that replaces it
         self.setjmp = setjmp or set()  # offsets of setjmp (or its import stub): calls become host setjmp
         self.pads = pads or {}   # function offset -> [(call range start, end, landing pad)] (eh.py)
+        # tools/hooks.txt (recomp.resolve_hooks): offsets of functions whose direct callers bring
+        # every register to the context before the call and read every one back after it, and
+        # of functions that do so at each of their calls
+        self.exact_callees = exact_callees or set()
+        self.exact_callers = exact_callers or set()
         self.entries = entries   # set of known function entry offsets
         self.tables = 0          # jump tables resolved
         self.indirect_tail = 0   # br sites treated as indirect tail calls
@@ -133,7 +179,7 @@ class Lifter(SimdMixin):
     # ------------------------------------------------------------------ function
     def lift_function(self, start, size):
         self.fstart, self.fend = start, start + size
-        self.leaders, self.callees = set(), set()
+        self.leaders, self.callees, self.exact_sites = set(), set(), set()
         native = self.forward.get(start)
         if isinstance(native, str):   # replaced by a native implementation: every caller reaches it
             return (f"GuestFn {native};\nvoid f_{self.base + start:x}(Cpu *c) {{ {native}(c); }}",
@@ -164,8 +210,9 @@ class Lifter(SimdMixin):
             body.append((None, f'rt_trap(c, {const(self.base + self.fend)}, "fell off the end of a function");', False))
         decl = []
         if REGCACHE and len(self.words) <= REGCACHE_MAX:
-            decl, cached = regcache.apply([(pc, mark_syncs(s), f) for pc, s, f in body], self.leaders,
-                                          bool(self.sites) or any("rt_setjmp" in s for _pc, s, _f in body))
+            decl, cached = regcache.apply([(pc, mark_syncs(s, pc in self.exact_sites), f) for pc, s, f in body], self.leaders,
+                                          bool(self.sites) or any("rt_setjmp" in s for _pc, s, _f in body),
+                                          start in self.exact_callers)
             body = [(pc, s, f) for (pc, s), (_pc, _s, f) in zip(cached, body)]
         out = [f"void {name}(Cpu *c) {{",
                "    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0;"] + ["    " + d for d in decl]
@@ -193,6 +240,11 @@ class Lifter(SimdMixin):
             # (RT_SETJMP: the host's cheapest setjmp, recomp.h)
             return "if (!RT_SETJMP(*rt_setjmp(c))) X(0) = 0;"
         self.callees.add(target)
+        if target in self.exact_callees:
+            # (recomp.resolve_hooks adds the functions that reach one by a tail call and the
+            # import stubs other modules call it through. A call through rt_lookup cannot be
+            # known to reach one: its caller is listed as an exact-caller instead.)
+            self.exact_sites.add(ret - 4)
         return self.landing(ret, f"X(30) = {const(self.base +ret)}; f_{self.base + target:x}(c);")
 
     def call_indirect(self, rn, ret):

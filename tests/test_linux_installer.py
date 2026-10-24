@@ -453,7 +453,7 @@ class GenerateOnlyTests(unittest.TestCase):
                 check=lambda e, mods=None: 0, tools_fingerprint=lambda: 'fp', image=lambda nso, img: done.append(('image', nso)),
                 Module=lambda nso: types.SimpleNamespace(build_id='b' * 64, text=types.SimpleNamespace(mem=0, end=4000)),
                 MODULES={'main': 1, 'sdk': 2}, stale_files=lambda target: [],
-                build=lambda nso, target, jobs, per_file: done.append(('build', os.path.basename(target))),
+                build=lambda nso, target, jobs, per_file, imports=None: done.append(('build', os.path.basename(target))),
                 compile_dir=lambda target, jobs, shown=None: done.append(('compile', target)) or True,
                 link=lambda dirs, exe: done.append(('link', exe)) or True,
                 modcache=types.SimpleNamespace(build_info=lambda t: None, find_built=lambda *x: None,
