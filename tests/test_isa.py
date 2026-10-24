@@ -818,6 +818,10 @@ def make_cases(n=400):
         f_acc = [-to32(p * q) if (i + k) % 4 else single() for k, (p, q) in enumerate(zip(f_a, f_b))]
         d_a, d_b = [double() for _ in range(2)], [double() for _ in range(2)]
         d_acc = [-(p * q) for p, q in zip(d_a, d_b)]
+        if i == 4:   # (a product too small for the format, plus +0: -0, in each fused multiply-add)
+            s13, s14, s15 = 2.0 ** -80, -(2.0 ** -75), 0.0
+            f_a[0], f_b[0], f_acc[0] = 2.0 ** -80, -(2.0 ** -75), 0.0
+            d_a[0], d_b[0], d_acc[0] = 2.0 ** -600, -(2.0 ** -500), 0.0
         half = HALVES[i] if i < len(HALVES) else rng.getrandbits(16)
         x1 = rng.getrandbits(rng.randint(0, 64)) if i > 2 else (0, 1 << 63, 1 << 31)[i]
         junk = rng.getrandbits(64)   # (the upper halves of scalar inputs: never read)
@@ -955,7 +959,8 @@ class LiftedCodeTests(unittest.TestCase):
     def test_software_fma(self):
         """x86-64-v2's fma() where the C library does it without the processor's FMA instruction: Windows' with
         _set_FMA3_enable(0), glibc's told the processor has none (GLIBC_TUNABLES), a Mac's under Rosetta (which
-        says there is none)."""
+        says there is none). (Windows' gives +0 for a product too small for a double plus +0: recomp.h's
+        rt_fma_v2 takes a zero c itself.)"""
         if os.name == 'nt':
             lines = self.results('x86-64-v2', 'nofma3')
         else:
