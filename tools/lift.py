@@ -185,7 +185,11 @@ class Lifter(SimdMixin):
             return (f"GuestFn {native};\nvoid f_{self.base + start:x}(Cpu *c) {{ {native}(c); }}",
                     Counter(), set())
         name, wrapper = f"f_{self.base + start:x}", ""
-        if isinstance(native, tuple):   # wrapped natively: callers reach the wrapper, which may call this one
+        if isinstance(native, tuple) and native[2:] == ("export",):   # wrapped by name: handed this original
+            wrapper = (f"void {native[1]}(Cpu *c, GuestFn *orig);\nGuestFn {name}_orig;\n"
+                       f"void {name}(Cpu *c) {{ {native[1]}(c, {name}_orig); }}\n")
+            name += "_orig"
+        elif isinstance(native, tuple):   # wrapped natively: callers reach the wrapper, which may call this one
             wrapper = f"GuestFn {native[1]};\nvoid {name}(Cpu *c) {{ {native[1]}(c); }}\n"
             name += "_orig"
         self.words = struct.unpack_from(f"<{size // 4}I", self.img, start)
