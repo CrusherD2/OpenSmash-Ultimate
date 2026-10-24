@@ -10,9 +10,9 @@
  * It must not need more of the processor than any x86-64 one has, so this file alone is compiled
  * for plain x86-64 whatever the build's instruction set (tools/cc.py's CHECK_CFLAGS, tools/linux/
  * toolchain.py's), and it runs from the C runtime's start-up, before any of the program's own
- * code: on Windows among the C initialisers (.CRT$XIB: after the C runtime's own set-up, before
- * every C++ initialiser and main), on Linux from .preinit_array (before every constructor). The
- * macOS build (arm64) has none of this. */
+ * code: on Windows among the C initialisers (.CRT$XID: after the static C runtime's own, which are
+ * in .CRT$XIC and set up stdio among others, and before every C++ initialiser and main), on Linux
+ * from .preinit_array (before every constructor). The macOS build (arm64) has none of this. */
 #if defined(__x86_64__) || defined(_M_X64)
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -115,9 +115,13 @@ int rt_cpu_message(unsigned needs, unsigned has, char *out, size_t size) {
 void rt_cpu_check(void) {
     char text[640];
     if (!rt_cpu_message(rt_cpu_needs, rt_cpu_has(), text, sizeof text)) return;
-#ifdef _WIN32
-    fprintf(stderr, "[boot] %s\n", text);
-    fflush(stderr);
+#ifdef _WIN32   /* (WriteFile, not stdio: the message needs nothing of the C runtime set up) */
+    char line[sizeof text + 16];
+    int n = snprintf(line, sizeof line, "[boot] %s\n", text);
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD wrote;
+    if (n > 0 && err && err != INVALID_HANDLE_VALUE)
+        WriteFile(err, line, (DWORD)((size_t)n < sizeof line ? (size_t)n : sizeof line - 1), &wrote, NULL);
 #ifndef RT_CPU_TEST   /* (and no box for a test to click away) */
     MessageBoxA(NULL, text, "WindowSmash", MB_OK | MB_ICONERROR);
 #endif
@@ -135,8 +139,8 @@ static int __cdecl cpu_check_start(void) {
     rt_cpu_check();
     return 0;
 }
-#pragma section(".CRT$XIB", long, read)
-__declspec(allocate(".CRT$XIB")) __attribute__((used)) static int (__cdecl *const cpu_check_entry)(void) = cpu_check_start;
+#pragma section(".CRT$XID", long, read)
+__declspec(allocate(".CRT$XID")) __attribute__((used)) static int (__cdecl *const cpu_check_entry)(void) = cpu_check_start;
 #elif defined(__ELF__)
 static void cpu_check_start(int argc, char **argv, char **envp) {
     (void)argc; (void)argv; (void)envp;

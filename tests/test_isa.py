@@ -511,14 +511,14 @@ class CpuCheckTests(unittest.TestCase):
 
     def test_made_up_processors(self):
         code, out, err = self.run_check('check_v2', 'avx2')
-        self.assertEqual((code, out), (5, ''))   # (stopped before main)
+        self.assertEqual((code, out), (5, ''), err)   # (stopped before main)
         self.assertTrue(err.startswith('[boot] This copy of WindowSmash was built for processors with AVX2, and this processor '
                                        'lacks AVX, AVX2, FMA'), err)
         self.assertIn('If this message comes back, build it with SSBU_ISA=x86-64-v2 set', err)
         self.assertEqual(self.run_check('check_everything', 'avx2'), (0, 'main', ''))
         self.assertEqual(self.run_check('check_v2', 'x86-64-v2'), (0, 'main', ''))
         code, out, err = self.run_check('check_old', 'x86-64-v2')
-        self.assertEqual((code, out), (5, ''))
+        self.assertEqual((code, out), (5, ''), err)
         self.assertIn('[boot] This processor lacks SSE4.2, POPCNT, which WindowSmash needs', err)
         self.assertIn('It cannot run on this PC.', err)
 
@@ -545,7 +545,7 @@ class CpuCheckTests(unittest.TestCase):
         self.assertEqual(named(insns, BEYOND_X86_64, SSE4_PREFIXES), [])
         headers = subprocess.run([objdump(), '-h', str(self.check)], capture_output=True, text=True, timeout=60).stdout
         if os.name == 'nt':
-            self.assertIn('.CRT$XIB', headers)   # (a C initialiser: before C++'s and main)
+            self.assertIn('.CRT$XID', headers)   # (a C initialiser: after the C runtime's, before C++'s and main)
         elif not ON_MAC:
             self.assertIn('.preinit_array', headers)   # (before every constructor)
 
@@ -880,6 +880,8 @@ def parse(line):
 
 @unittest.skipUnless(CAN_RUN_X86, WHY_NOT)
 class LiftedCodeTests(unittest.TestCase):
+    maxDiff = None   # (every wrong result shown, up to 20)
+
     @classmethod
     def setUpClass(cls):
         cls.dir = Path(tempfile.mkdtemp(prefix='isa-lifted-'))
