@@ -28,7 +28,7 @@ all       image + build + compile every module of an ExeFS, then link; a module 
           tools/linux/build_linux.py; so does the macOS one, tools/mac/build_mac.py, and on
           macOS all always stops there)
 check     list each module's imports that no module exports and the runtime does not implement
-wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
+wrap-sig  print the code signature (a hash) of a guest function, for an HLE_WRAP (see hle_wraps)
 
 Each module is recompiled for a fixed load address (see MODULES); a function is named after
 its guest address, so names are unique across modules. A module function whose exported
@@ -36,6 +36,7 @@ name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a 
 it, so the replacement is reached by every caller, including direct calls inside the module.
 """
 import bisect
+import hashlib
 import mmap
 import os
 import re
@@ -121,20 +122,39 @@ def hle_names():
     return names
 
 
+# `/* signature: 16 words, sha256 0123456789abcdef */`, then `HLE_WRAP(<address>)` on the next line
+WRAP = re.compile(r"^(?:/\* signature: (\d+) words?, sha256 ([0-9a-f]{16}) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", re.M)
+# any signature comment on the line before an HLE_WRAP, well-formed or not
+ANY_SIGNATURE = re.compile(r"^/\* signature:.*\r?\nHLE_WRAP\(", re.M)
+# the old form, the masked words themselves (`/* signature: 0123abcd 4567ef89 9....... */`): the game's code
+WORDS_SIGNATURE = re.compile(r"/\* signature: [0-9a-f.]{8}(?: |\*/)")
+
+
 def hle_wraps():
     """Guest functions (not exported) wrapped natively: `HLE_WRAP(<address>)` in the runtime
-    sources, address -> code signature or None. The function stays, as f_<address>_orig; its
-    callers reach the native wrapper. The address is 13.0.5's; a comment `/* signature: <words> */`
-    on the line before (`recomp.py wrap-sig` prints one) says what the function there begins with,
-    which resolve_wraps checks. A build of modules that lack it (a made-up game's:
-    tools/mac/boottest) links its f_<address>_orig to rt_wrap_missing (link)."""
+    sources, address -> (word count, hash) of its code signature, or None. The function stays,
+    as f_<address>_orig; its callers reach the native wrapper. The address is 13.0.5's; a
+    comment `/* signature: <n> words, sha256 <16 hex digits> */` on the line before
+    (`recomp.py wrap-sig` prints one) says what the function there begins with, which
+    resolve_wraps checks. Only the hash goes in the source: the words themselves are the
+    game's code (CONTRIBUTING.md, rule 1), so a comment that spells them out stops the build.
+    A build of modules that lack it (a made-up game's: tools/mac/boottest) links its
+    f_<address>_orig to rt_wrap_missing (link)."""
     found = {}
     runtime = os.path.join(ROOT, "runtime")
-    for name in os.listdir(runtime):
+    for name in sorted(os.listdir(runtime)):
         if name.endswith(".c") and not name.startswith("._"):
             with open(os.path.join(runtime, name), encoding="utf-8") as f:
-                for sig, a in re.findall(r"^(?:/\* signature: ([0-9a-f. ]+) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M):
-                    found[int(a, 16)] = sig.split() or None
+                text = f.read()
+            if WORDS_SIGNATURE.search(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature spells out the game's instruction words; "
+                                 "give its hash instead (`tools/recomp.py wrap-sig <module> <address>` prints it)")
+            wraps = WRAP.findall(text)
+            if len(ANY_SIGNATURE.findall(text)) != sum(1 for n, _d, _a in wraps if n):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature is not in the form "
+                                 "`/* signature: <n> words, sha256 <16 hex digits> */`")
+            for n, digest, a in wraps:
+                found[int(a, 16)] = (int(n), digest) if n else None
     return found
 
 
@@ -162,6 +182,17 @@ def signature(mod, off, size, n=16):
     return out
 
 
+def signature_hash(words):
+    """What an HLE_WRAP's signature comment holds: the first 16 hex digits of the SHA-256 of
+    signature()'s masked words, space-separated. A check of the code, not a copy of it."""
+    return hashlib.sha256(" ".join(words).encode("ascii")).hexdigest()[:16]
+
+
+def signature_comment(words):
+    """The comment `recomp.py wrap-sig` prints for the line before an HLE_WRAP."""
+    return f"/* signature: {len(words)} word{'s' if len(words) != 1 else ''}, sha256 {signature_hash(words)} */"
+
+
 def resolve_wraps(mod, base, sizes, name):
     """This module's wraps: {offset: ("wrap", wrapper)}. Each wrapped function must start at its
     address and begin as its signature says: the addresses are 13.0.5's, and one that isn't there
@@ -174,7 +205,8 @@ def resolve_wraps(mod, base, sizes, name):
         if off not in sizes:
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): no function starts there in this module "
                              "(the runtime's hooks are for game version 13.0.5)")
-        if sig is not None and signature(mod, off, sizes[off], len(sig)) != sig:
+        if sig is not None and (len(words := signature(mod, off, sizes[off], sig[0])) != sig[0]
+                                or signature_hash(words) != sig[1]):
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): the function there does not begin as its signature says "
                              "(the runtime's hooks are for game version 13.0.5)")
         forward[off] = ("wrap", f"hle_wrap_{a:x}")
@@ -690,6 +722,6 @@ if __name__ == "__main__":
         sizes = dict(load(nso)[2])
         if off not in sizes:
             sys.exit(f"{a:x} is not a function start in {nso}")
-        print(f"/* signature: {' '.join(signature(m, off, sizes[off]))} */")
+        print(signature_comment(signature(m, off, sizes[off])))
     else:
         sys.exit(__doc__)
