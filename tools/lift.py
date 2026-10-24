@@ -430,7 +430,12 @@ class Lifter(SimdMixin):
                 return wr(rd, sf, f"({t})(({s}){a} >> ({b} & {size - 1}))")
             if opcode == 11:
                 return wr(rd, sf, f"ror{n}({a}, (u32){b})")
-            raise Unsupported("dp2: crc32 / other")
+            if opcode >> 3 == 2:   # crc32 / crc32c: Wd = crc of Wn and Wm, or of Wn and Xm (sf only with x)
+                sz = opcode & 3
+                if sf != (sz == 3):
+                    raise Unsupported("reserved crc32")
+                return wr(rd, 0, f"rt_crc32{'c' if opcode & 4 else ''}{'bhwx'[sz]}({reg(rn, 0)}, {reg(rm, sf)})")
+            raise Unsupported("dp2: other")
         raise Unsupported("reserved dp-reg")
 
     # ------------------------------------------------------------------ branches / system
