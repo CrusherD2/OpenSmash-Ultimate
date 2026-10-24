@@ -148,7 +148,11 @@ static void frame_line(Cpu *c) {
     char line[512];   /* (room to spare: the longest line is FIGHT_LINE_MAX bytes) */
     int n = fight_hash_line(line, sizeof line, &hash_run, &fr);
     fwrite(line, 1, (size_t)n, hash_out);
-    if ((fr.f & 63) == 0) fflush(hash_out);
+    /* A file is written out every 64 fight frames; the standard output each line at once. The
+     * log's other lines go to the same file there (2>&1), and on Windows the standard output is
+     * not line-buffered: a line its buffer kept half of would get another line in its middle,
+     * and fight_hash_diff would leave it out. */
+    if (hash_out == stdout || (fr.f & 63) == 0) fflush(hash_out);
     if (k == 0 && fr.f % 300 == 0 && rb) {   /* which generators are drawn from */
         fprintf(stderr, "[fight] frame %lld: generator calls", fr.f);
         for (int i = 0; i < FIGHT_RNGS; i++) fprintf(stderr, " %u", w[5 * i + 4]);
@@ -193,15 +197,13 @@ static long fixed_calls;
  * addresses, each followed by a generator's set-up. The time of day's too (hle_env.c). Each
  * one's first time is logged. */
 int test_fixed_clock(u64 lr) {
-    static volatile long seen;
+    static volatile LONG seen;   /* (the game reads the tick on many threads: one of them logs it) */
     if (!fixed_on) return 0;
     const u64 at[4] = {GAME_ADDR(CLOCK_READ_1), GAME_ADDR(CLOCK_READ_2), GAME_ADDR(CLOCK_READ_3), GAME_ADDR(CLOCK_READ_4)};
     for (int i = 0; i < 4; i++)
         if (lr == at[i]) {
-            if (!(seen & 1L << i)) {
-                seen |= 1L << i;
+            if (!(InterlockedOr(&seen, 1 << i) & (1 << i)))
                 fprintf(stderr, "[fight] fixed seed: the clock read at %llx gave the constant\n", (unsigned long long)lr);
-            }
             return 1;
         }
     return 0;

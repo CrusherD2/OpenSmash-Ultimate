@@ -104,14 +104,23 @@ class Reading(unittest.TestCase):
         for source in ('HLE_WRAP_EXPORT (nn_a) {}\n', '  HLE_WRAP_EXPORT(nn_a) {}\n', 'static HLE_WRAP_EXPORT(nn_a) {}\n',
                        'HLE_WRAP (7100001000) {}\n', '\tHLE_WRAP(7100001000) {}\n', 'int x; HLE_WRAP(7100001000) {}\n',
                        'HLE_WRAP_EXPORT\n(nn_a) {}\n', '/*\nHLE_WRAP_EXPORT(nn_a) {}\n*/\n',
-                       'HLE_WRAP_EXPORT(nn_b) {}\n#if 0 /* x */\n HLE_WRAP_EXPORT(nn_a) {}\n#endif\n'):
+                       'HLE_WRAP_EXPORT(nn_b) {}\n#if 0 /* x */\n HLE_WRAP_EXPORT(nn_a) {}\n#endif\n',
+                       # (a macro of another name, a name pasted together or cut by a line splice)
+                       '#define W HLE_WRAP_EXPORT\nW(nn_a) {}\n', '#define W(k) HLE_WRAP_##k\nW(EXPORT)(nn_a) {}\n',
+                       'HLE_WRAP_EX\\\nPORT(nn_a) {}\n', 'HLE_WRAP_EXPORT(nn_\\\na) {}\n', '#define W(x) HLE_WRAP_EXPORT(x)\n',
+                       # (inside a string a line splice goes on with)
+                       'const char *s = "\\\nHLE_WRAP_EXPORT(nn_a) {}";\n',
+                       # (any other name that starts as theirs do: those are theirs)
+                       '#define HLE_WRAP_COUNT 2\n'):
             with self.subTest(source=source), self.assertRaises(SystemExit) as e:
                 self.wraps(source)
             self.assertIn('at the start of a line, outside comments', str(e.exception))
         # what is no use of one: comments and strings that only mention it
         self.assertEqual(self.wraps('/* HLE_WRAP_EXPORT(nn_x) wraps... */\n// HLE_WRAP(7100002000) {}\n'
                                     'const char *s = "HLE_WRAP_EXPORT /* (";\nHLE_WRAP_EXPORT(nn_a) {}\n'
-                                    "char q = '\"'; /* HLE_WRAP(7100003000) */\nHLE_WRAP(7100001000) {}\n"),
+                                    "char q = '\"'; /* HLE_WRAP(7100003000) */\nHLE_WRAP(7100001000) {}\n"
+                                    'void f(void) { printf("HLE_WRAP(%llx) has no original\\n", 1ull); }\n'
+                                    'static const char *m = "HLE_WRAP_EXPORT(%s) failed", *n = "a \\" HLE_WRAP_EXPORT(x)";\n'),
                          ({0x7100001000: None}, {'nn_a': None}))
 
     def test_in_the_order_of_the_sources(self):
@@ -163,6 +172,12 @@ class Resolving(unittest.TestCase):
         self.assertEqual(self.resolve(f'HLE_WRAP_EXPORT(nn_third) {{}}\nHLE_WRAP_EXPORT(nn_alias) {{}}\n'
                                       f'HLE_WRAP_EXPORT({NAME}) {{}}\n', exports),
                          {0x40: ('wrap', 'hle_wrap_nn_third', 'export', 'hle_wrap_nn_alias', f'hle_wrap_{NAME}')})
+        # a symbol table that has one of the names twice for it: that wrapper once, not inside itself
+        self.assertEqual(self.resolve(f'HLE_WRAP_EXPORT({NAME}) {{}}\nHLE_WRAP_EXPORT(nn_alias) {{}}\n',
+                                      [export(NAME, 0x40), export('nn_alias', 0x40), export(NAME, 0x40)]),
+                         {0x40: ('wrap', f'hle_wrap_{NAME}', 'export', 'hle_wrap_nn_alias')})
+        self.assertEqual(self.resolve(f'HLE_WRAP_EXPORT({NAME}) {{}}\n', [export(NAME, 0x40), export(NAME, 0x40)]),
+                         {0x40: ('wrap', f'hle_wrap_{NAME}', 'export')})
         # each name's signature is checked against the one function
         funcs = {0x40: WORDS}
         comment = recomp.signature_comment(recomp.signature(fake_module(funcs, []), 0x40, 4 * len(WORDS)))
