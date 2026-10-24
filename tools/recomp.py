@@ -6,12 +6,12 @@ Usage:
   recomp.py emit     <nso> --roots <off>[,<off>...] --out <file.c> [--depth N]
   recomp.py emit     <nso> --sample N --out <file.c>
   recomp.py image    <nso> --out <file.bin>
-  recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS]
+  recomp.py build    <nso> --out <dir> [--jobs N] [--per-file INSNS] [--exefs <dir>]
   recomp.py compile  <dir> [--jobs N]
   recomp.py link     --dirs <dir>[,<dir>...] --out <exe>
   recomp.py all      <exefs dir> --out <build dir> [--jobs N] [--generate-only]
   recomp.py check    <exefs dir>
-  recomp.py wrap-sig <nso> <address>
+  recomp.py wrap-sig <nso> <address | exported name>
 
 The game is version 13.0.5 (tools/game_version.py); its modules are this folder's dump/exefs
 and dump/nro (the fighter modules).
@@ -28,14 +28,21 @@ all       image + build + compile every module of an ExeFS, then link; a module 
           tools/linux/build_linux.py; so does the macOS one, tools/mac/build_mac.py, and on
           macOS all always stops there)
 check     list each module's imports that no module exports and the runtime does not implement
-wrap-sig  print the code signature of a guest function, for an HLE_WRAP (see hle_wraps)
+wrap-sig  print the code signature (a hash) of a guest function, for an HLE_WRAP (see hle_wraps),
+          an HLE_WRAP_EXPORT (by its exported name: hle_export_wraps) or a tools/hooks.txt entry
 
 Each module is recompiled for a fixed load address (see MODULES); a function is named after
 its guest address, so names are unique across modules. A module function whose exported
 name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a forwarder to
 it, so the replacement is reached by every caller, including direct calls inside the module.
+tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list),
+and the hookable ones, which every caller reaches through a slot a hook can take over
+(runtime/hookable.h). When it has an exact-callee or a hookable function, build reads main,
+subsdk0 and sdk from --exefs (dump/exefs if not given) for the names other modules reach it by
+(hook_imports).
 """
 import bisect
+import hashlib
 import mmap
 import os
 import re
@@ -121,21 +128,95 @@ def hle_names():
     return names
 
 
-def hle_wraps():
-    """Guest functions (not exported) wrapped natively: `HLE_WRAP(<address>)` in the runtime
-    sources, address -> code signature or None. The function stays, as f_<address>_orig; its
-    callers reach the native wrapper. The address is 13.0.5's; a comment `/* signature: <words> */`
-    on the line before (`recomp.py wrap-sig` prints one) says what the function there begins with,
-    which resolve_wraps checks. A build of modules that lack it (a made-up game's:
-    tools/mac/boottest) links its f_<address>_orig to rt_wrap_missing (link)."""
-    found = {}
+# `/* signature: 16 words, sha256 0123456789abcdef */`, then `HLE_WRAP(<address>)` or
+# `HLE_WRAP_EXPORT(<exported name>)` on the next line
+WRAP = re.compile(r"^(?:/\* signature: (\d+) words?, sha256 ([0-9a-f]{16}) \*/\r?\n)?"
+                  r"HLE_WRAP(?:\(([0-9a-fA-F]+)\)|_EXPORT\(([A-Za-z_][A-Za-z0-9_]*)\))", re.M)
+# any signature comment on the line before an HLE_WRAP, well-formed or not
+ANY_SIGNATURE = re.compile(r"^/\* signature:.*\r?\nHLE_WRAP(?:_EXPORT)?\(", re.M)
+# the old form, the masked words themselves (`/* signature: 0123abcd 4567ef89 9....... */`): the game's code
+WORDS_SIGNATURE = re.compile(r"/\* signature: [0-9a-f.]{8}(?: |\*/)")
+# C's comments, strings and characters (each one's text, which may seem to open another)
+C_COMMENT = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*', re.S)
+# any name that starts as the macros' do, in code: `HLE_WRAP_EXPORT (x)`, indented, after
+# `static`, `#define W HLE_WRAP_EXPORT`, `HLE_WRAP_##k`, a name a line splice cuts in two...
+ANY_WRAP = re.compile(r"\bHLE_WRAP\w*")
+
+
+def wrap_uses_unread(text):
+    """Whether text names an HLE_WRAP macro in code (not in a comment or a string) other than
+    at the start of a line in one of WRAP's forms, or has one of those forms inside a comment.
+    Each compiles, or could, with the function left unwrapped without a word (an export's:
+    nothing fails to link either). Not followed: the preprocessor's conditions (`#if 0`) and a
+    line splice that makes a comment of the next line, under which a form WRAP reads is no wrap
+    to the compiler (the build then fails to link, where a module has the function)."""
+    code = C_COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+    return ({text.rindex("HLE_WRAP", m.start(), m.end()) for m in WRAP.finditer(text)}
+            != {m.start() for m in ANY_WRAP.finditer(code)})
+
+
+def runtime_wraps():
+    """The runtime's wraps, ({address: signature}, {exported name: signature}): `HLE_WRAP(<address>)`
+    and `HLE_WRAP_EXPORT(<name>)` in its sources (hle_wraps, hle_export_wraps), in the order of the
+    sources (file names', then lines'). A signature is (word count, hash), or None. A use of
+    either macro not in its form at the start of a line, or another name in code that starts as
+    theirs do (wrap_uses_unread), one wrapped twice and a name both replaced (HLE) and wrapped
+    stop the build."""
+    by_address, by_name, replaced = {}, {}, set()
     runtime = os.path.join(ROOT, "runtime")
-    for name in os.listdir(runtime):
+    for name in sorted(os.listdir(runtime)):
         if name.endswith(".c") and not name.startswith("._"):
             with open(os.path.join(runtime, name), encoding="utf-8") as f:
-                for sig, a in re.findall(r"^(?:/\* signature: ([0-9a-f. ]+) \*/\r?\n)?HLE_WRAP\(([0-9a-fA-F]+)\)", f.read(), re.M):
-                    found[int(a, 16)] = sig.split() or None
-    return found
+                text = f.read()
+            if WORDS_SIGNATURE.search(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature spells out the game's instruction words; "
+                                 "give its hash instead (`tools/recomp.py wrap-sig <module> <address>` prints it)")
+            wraps = WRAP.findall(text)
+            if len(ANY_SIGNATURE.findall(text)) != sum(1 for n, _d, _a, _s in wraps if n):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP signature is not in the form "
+                                 "`/* signature: <n> words, sha256 <16 hex digits> */`")
+            if "HLE_WRAP" in text and wrap_uses_unread(text):
+                raise SystemExit(f"runtime/{name}: an HLE_WRAP is not `HLE_WRAP(<hex address>)` or "
+                                 "`HLE_WRAP_EXPORT(<exported name>)` at the start of a line, outside comments "
+                                 "(and code names no other that starts as they do: a string or comment may)")
+            replaced |= set(re.findall(r"^HLE\((\w+)\)", text, re.M))
+            for n, digest, a, symbol in wraps:
+                key, found = (int(a, 16), by_address) if a else (symbol, by_name)
+                if key in found:
+                    raise SystemExit(f"runtime/{name}: {f'HLE_WRAP({a})' if a else f'HLE_WRAP_EXPORT({symbol})'} "
+                                     "is wrapped twice")
+                found[key] = (int(n), digest) if n else None
+    both = sorted(replaced & set(by_name))
+    if both:
+        raise SystemExit(f"runtime: {both[0]} is both replaced (HLE) and wrapped (HLE_WRAP_EXPORT): one or the other")
+    return by_address, by_name
+
+
+def hle_wraps():
+    """Guest functions (not exported) wrapped natively: `HLE_WRAP(<address>)` in the runtime
+    sources, address -> (word count, hash) of its code signature, or None. The function stays,
+    as f_<address>_orig; its callers reach the native wrapper. The address is 13.0.5's; a
+    comment `/* signature: <n> words, sha256 <16 hex digits> */` on the line before
+    (`recomp.py wrap-sig` prints one) says what the function there begins with, which
+    resolve_wraps checks. Only the hash goes in the source: the words themselves are the
+    game's code (CONTRIBUTING.md, rule 1), so a comment that spells them out stops the build.
+    A build of modules that lack it (a made-up game's: tools/mac/boottest) links its
+    f_<address>_orig to rt_wrap_missing (link)."""
+    return runtime_wraps()[0]
+
+
+def hle_export_wraps():
+    """Exported guest functions wrapped natively by name: `HLE_WRAP_EXPORT(<name>)` in the runtime
+    sources, name -> signature as hle_wraps has it. For a function whose address is not the same
+    in every install (a fighter module's: each install places those modules itself). Every
+    module that exports a function under that name has it wrapped as an HLE_WRAP is: the
+    function stays, as f_<address>_orig, and every caller reaches the wrapper. The wrapper is
+    handed the original it was reached through (HLE_WRAP_EXPORT in host.h), so it names no
+    module's function: two modules that define the name each keep their own, and a build in
+    which no module defines it (until that module is compiled in, or a made-up game's) links
+    as it is, with nothing for rt_wrap_missing to stand in for. A function exported under
+    several of the names has each one's wrapper, one inside the other (resolve_wraps)."""
+    return runtime_wraps()[1]
 
 
 def signature(mod, off, size, n=16):
@@ -162,30 +243,301 @@ def signature(mod, off, size, n=16):
     return out
 
 
+def signature_hash(words):
+    """What an HLE_WRAP's signature comment holds: the first 16 hex digits of the SHA-256 of
+    signature()'s masked words, space-separated. A check of the code, not a copy of it."""
+    return hashlib.sha256(" ".join(words).encode("ascii")).hexdigest()[:16]
+
+
+def signature_comment(words):
+    """The comment `recomp.py wrap-sig` prints for the line before an HLE_WRAP."""
+    return f"/* signature: {len(words)} word{'s' if len(words) != 1 else ''}, sha256 {signature_hash(words)} */"
+
+
+def signature_matches(mod, off, size, sig):
+    """Whether the function at module offset `off` begins as sig, (word count, hash), says. None: no check."""
+    return sig is None or (len(words := signature(mod, off, size, sig[0])) == sig[0] and signature_hash(words) == sig[1])
+
+
 def resolve_wraps(mod, base, sizes, name):
-    """This module's wraps: {offset: ("wrap", wrapper)}. Each wrapped function must start at its
-    address and begin as its signature says: the addresses are 13.0.5's, and one that isn't there
-    (the runtime wrapping a function that moved) stops the build rather than leave a hook out."""
-    forward = {}
-    for a, sig in sorted(hle_wraps().items()):
+    """This module's wraps: {offset: ("wrap", wrapper)} for each HLE_WRAP at an address in it, and
+    {offset: ("wrap", wrapper, "export", *inner)} for each function it exports under HLE_WRAP_EXPORT
+    names. A function exported under several of them (aliases, or identical code folded into
+    one) has each name's wrapper, in the order of the runtime's sources: callers reach the
+    first, and each is handed the next (inner) as its original, the last the function itself.
+    Each wrapped function must start at its address and begin as its signature says: the
+    addresses are 13.0.5's, and one that isn't there (the runtime wrapping a function that moved)
+    stops the build rather than leave a hook out. So do a wrapped name this module exports as
+    something other than a function, and a function wrapped both by address and by name."""
+    forward, by_export = {}, {}
+    by_address, by_name = runtime_wraps()
+    for a, sig in sorted(by_address.items()):
         if max((b for b in MODULES.values() if b <= a), default=None) != base:
             continue   # another module's
         off = a - base
         if off not in sizes:
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): no function starts there in this module "
                              "(the runtime's hooks are for game version 13.0.5)")
-        if sig is not None and signature(mod, off, sizes[off], len(sig)) != sig:
+        if not signature_matches(mod, off, sizes[off], sig):
             raise SystemExit(f"{name}: HLE_WRAP({a:x}): the function there does not begin as its signature says "
                              "(the runtime's hooks are for game version 13.0.5)")
         forward[off] = ("wrap", f"hle_wrap_{a:x}")
+    for n, off, _size, info, _shndx in mod.exports if by_name else ():
+        if n not in by_name:
+            continue
+        if info & 0xF != 2:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): this module exports that name, but not as a function")
+        if off not in sizes:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): no function starts at its address {base + off:#x}")
+        if not signature_matches(mod, off, sizes[off], by_name[n]):
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): the function does not begin as its signature says "
+                             "(the runtime's hooks are for game version 13.0.5)")
+        if off in forward:
+            raise SystemExit(f"{name}: HLE_WRAP_EXPORT({n}): the function at {base + off:#x} is wrapped already "
+                             f"({forward[off][1]})")
+        names = by_export.setdefault(off, [])
+        if n not in names:   # (a name the symbol table has twice for it: one wrapper, once)
+            names.append(n)
+    order = {n: i for i, n in enumerate(by_name)}
+    for off, names in by_export.items():
+        first, *inner = (f"hle_wrap_{n}" for n in sorted(names, key=order.get))
+        forward[off] = ("wrap", first, "export", *inner)
     return forward
+
+
+HOOKS = os.path.join(ROOT, "tools", "hooks.txt")
+HOOK_KINDS = ("exact-callee", "exact-caller", "hookable")
+# (a hookable function is an exact-callee too: a hook in its slot sees its callers' registers)
+EXACT_CALLEES = ("exact-callee", "hookable")
+# `<kind> <address> [<n> words, sha256 <16 hex digits>] <name>`
+HOOK_LINE = re.compile(r"(\S+)\s+(?:0x)?([0-9a-fA-F]+)(?:\s+(\d+) words?, sha256 ([0-9a-f]{16}))?\s+(\S+)")
+HOOK_NAME = re.compile(r"[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*")
+# What could be the game's instruction words (word_like), anywhere in a line: a run of hex
+# digits, to count, maybe with digit separators (C++'s ', or _ after 0x: unprefixed, _ is a
+# name's); 8 hex digits and dots, not inside a longer word, the form HLE_WRAP signatures once
+# spelled the game's code in when the dots are a run of 4 or more (signature masks at least
+# that much); and 4 or more bytes in a row, as hex dumps, C arrays and strings write them
+# (`ff 83 00 d1`, `0xff, 0x83, ...`, `\xff\x83...`).
+HEX_RUN = re.compile(r"(?<![0-9A-Fa-f])(?:(?<=0[xX])[0-9A-Fa-f]+(?:[_'][0-9A-Fa-f]+)*|[0-9A-Fa-f]+(?:'[0-9A-Fa-f]+)*)")
+MASKED_WORD = re.compile(r"(?<![0-9A-Za-z])(?:0[xX])?([0-9A-Fa-f.]{8})(?![0-9A-Za-z])")
+BYTE_ROW = re.compile(r"(?<![0-9A-Za-z])(?:(?:0[xX]|\\x)?[0-9A-Fa-f]{2}(?:, ?| |(?=\\x))){3,}(?:0[xX]|\\x)?[0-9A-Fa-f]{2}"
+                      r"(?![0-9A-Za-z])")
+
+
+def word_like(text):
+    """What in text could be one of the game's instruction words, or None: a run of 8 or more
+    hex digits (a word, or words run together as a hex editor copies them), a masked word, or a
+    row of bytes. The only runs that long the list needs are an address (10 digits, 7xxxxxxxxx)
+    and a signature's hash (16 digits, after `sha256 `)."""
+    for m in HEX_RUN.finditer(text):
+        run = m.group()
+        if len(re.sub(r"[_']", "", run)) < 8 or (len(run) == 10 and run[0] == "7") or (
+                len(run) == 16 and text[:m.start()].endswith("sha256 ")):
+            continue
+        return run
+    for m in MASKED_WORD.finditer(text):
+        if "...." in m.group(1) and re.search(r"[0-9A-Fa-f]", m.group(1)):
+            return m.group()
+    m = BYTE_ROW.search(text)
+    return m.group() if m else None
+
+
+def hook_list(path=None):
+    """tools/hooks.txt: {(kind, address): (word count, hash) of its signature, or None}. The
+    functions whose callers' whole register state a hook needs (resolve_hooks); see the file.
+    Read strictly: a line that isn't an entry, a comment or blank, or that holds anything like
+    an instruction word (CONTRIBUTING.md, rule 1: word_like), stops the build."""
+    path = path or HOOKS
+    if not os.path.exists(path):
+        return {}
+    found = {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:   # (as some Windows editors save it: with a BOM)
+            lines = f.read().splitlines()
+    except UnicodeDecodeError as e:
+        raise SystemExit(f"tools/hooks.txt: not UTF-8 ({e.reason} at byte {e.start}): save it as UTF-8") from None
+    for n, line in enumerate(lines, 1):
+        where = f"tools/hooks.txt line {n}"
+        if found_word := word_like(line):
+            raise SystemExit(f"{where}: `{found_word}` could be the game's instruction words, which never go in the "
+                             "repository (CONTRIBUTING.md, rule 1). Hex digits go only in an address (13.0.5's, "
+                             "71xxxxxxxx) and a signature's hash (`<n> words, sha256 <16 hex digits>`, as "
+                             "`tools/recomp.py wrap-sig <module> <address>` prints it)")
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        m = HOOK_LINE.fullmatch(text)
+        if not m or m.group(1) not in HOOK_KINDS:
+            raise SystemExit(f"{where}: not `exact-callee|exact-caller|hookable <address> [<n> words, sha256 <16 hex "
+                             f"digits>] <name>`: {text}")
+        kind, a, count, digest, name = m.groups()
+        a = int(a, 16)
+        if not MODULES["main"] <= a < modcache.NRO_BASE or a & 3:
+            raise SystemExit(f"{where}: {a:#x} is not a function address in main, subsdk0 or sdk (a fighter "
+                             "module's address is each install's own: dump/nro/bases.txt)")
+        if count is not None and int(count) < 1:
+            raise SystemExit(f"{where}: a signature covers at least one word")
+        if not HOOK_NAME.fullmatch(name) or re.fullmatch(r"[0-9a-fA-F]{8,}", name):
+            raise SystemExit(f"{where}: `{name}` is not a function name")
+        if (kind, a) in found:
+            raise SystemExit(f"{where}: {kind} {a:x} is listed twice")
+        if kind in EXACT_CALLEES and any((k, a) in found for k in EXACT_CALLEES):
+            raise SystemExit(f"{where}: {a:x} is both hookable and an exact-callee: a hookable function is an "
+                             "exact-callee already, so list it once, as hookable")
+        found[(kind, a)] = (int(count), digest) if count else None
+    return found
+
+
+# The modules loaded at start, in the order runtime/host.c publishes their exports
+BOOT_MODULES = ("main", "subsdk0", "sdk")
+
+
+def hook_imports(mods, graphs=None):
+    """{symbol: address} for each name the loader binds to code that returns into the caller of
+    an exact-callee of tools/hooks.txt (a hookable function is one too): the exact-callee
+    itself, or a function that reaches one by tail calls (an exported wrapper ending in
+    `b impl`), maybe through import stubs bound to
+    such a name in turn. Other modules call these by name, through an import stub, so those
+    stubs are exact-callees too (resolve_hooks); and a module's stub joining its tail calls can
+    bring in more of its exports, so this goes round until nothing more is added.
+
+    The first of main, subsdk0 and sdk to export a name defines it (runtime/host.c
+    publish_exports). The NROs come later and define only names none of those does, each the
+    first of them loaded, so their exports are not followed here. mods: name -> nso.Module;
+    graphs: name -> (stub_symbols, tail_graph) of main, subsdk0 and sdk (by default
+    module_graph)."""
+    listed = {a for kind, a in hook_list() if kind in EXACT_CALLEES}
+    boot = [name for name in BOOT_MODULES if name in mods] if listed else []
+    bound = {}
+    for name in boot:
+        for n, v, _s, _info, _x in mods[name].exports:
+            bound.setdefault(n, MODULES[name] + v)
+    if graphs is None:
+        graphs = {name: module_graph(name, mods[name]) for name in boot}
+    names = set()
+    while True:
+        reached = set(listed)
+        for name in boot:
+            base, (stubs, tails) = MODULES[name], graphs[name]
+            seeds = {a - base for a in listed if module_base(a) == base} | {s for s, sym in stubs.items() if sym in names}
+            reached |= {base + f for f in close_over_tail_calls(seeds, tails)}
+        more = {n for n, a in bound.items() if a in reached}
+        if more == names:
+            return {n: bound[n] for n in sorted(names)}
+        names = more
+
+
+def module_base(a):
+    """The load address of the module (main, subsdk0, sdk or an NRO) address a is in."""
+    return max((b for b in MODULES.values() if b <= a), default=None)
+
+
+def import_stub_symbols(mod):
+    """{import stub offset: the symbol its GOT slot is bound to}."""
+    from funcs import import_stubs
+    slots = {r[0]: mod.symbols[r[2]][0] for r in mod.relocs if r[2]}
+    return {stub: slots[slot] for stub, slot in import_stubs(mod).items() if slot in slots}
+
+
+def native_only(forward):
+    """The functions of a module's forward (forwards) whose code never runs: replaced by a
+    native function (a wrap's original still runs, called by its wrapper)."""
+    return {a for a, v in forward.items() if isinstance(v, str)}
+
+
+def stub_symbols(mod, sizes):
+    """{import stub offset: the symbol it is bound to}, for the stubs that are functions here."""
+    return {stub: sym for stub, sym in import_stub_symbols(mod).items() if stub in sizes}
+
+
+def tail_graph(mod, sizes, entries=None, native=()):
+    """{function: the functions it jumps to without a call} (lift.tail_calls, with the Lifter's
+    entries: by default the function starts). A function replaced natively (native:
+    native_only) runs none of its own code, so its jumps are left out: they would only make
+    more calls exact than need be."""
+    from lift import tail_calls
+    return tail_calls(mod.image, sorted((a, s) for a, s in sizes.items() if a not in native), entries or set(sizes))
+
+
+def module_graph(name, mod):
+    """How a module (main, subsdk0, sdk) reaches an exact-callee without a call of its own, for
+    hook_imports: (stub_symbols, tail_graph), from its functions as build lifts them."""
+    found, funcs = functions(mod)
+    sizes = dict(funcs)
+    native = native_only(forwards(mod, MODULES[name], found, funcs, name))
+    return stub_symbols(mod, sizes), tail_graph(mod, sizes, set(found), native)
+
+
+def close_over_tail_calls(callees, tails):
+    """callees and every function that reaches one of them by tail calls ({function: the
+    functions it jumps to}, lift.tail_calls)."""
+    jumpers = {}
+    for f, targets in tails.items():
+        for t in targets:
+            jumpers.setdefault(t, set()).add(f)
+    out, work = set(callees), list(callees)
+    while work:
+        for f in jumpers.get(work.pop(), ()):
+            if f not in out:
+                out.add(f)
+                work.append(f)
+    return out
+
+
+def resolve_hooks(mod, base, sizes, name, entries=None, imports=None, native=()):
+    """This module's entries of tools/hooks.txt: (exact-callee offsets, exact-caller offsets),
+    for the Lifter. As with a wrap, each must be a function start that begins as its signature
+    (if any) says: one that isn't stops the build rather than leave a hook's registers stale.
+
+    A hook's registers are those of the call it returns to (its LR), so exact-callees are also:
+    this module's import stubs bound to a name in imports (hook_imports: the exact-callees'
+    names, and those of functions that reach one), which calls from another module go through;
+    and every function that reaches one by tail calls (tail_graph, with the Lifter's entries,
+    by default the function starts, and the functions replaced natively: native_only), since
+    what it reaches returns to the caller of the function that jumped. A hookable function is
+    an exact-callee (hookables gives the Lifter its slots)."""
+    exact = {kind: set() for kind in HOOK_KINDS}
+    for (kind, a), sig in sorted(hook_list().items()):
+        if module_base(a) != base:
+            continue   # another module's
+        off = a - base
+        if off not in sizes:
+            raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: no function starts there in this module "
+                             "(the list is for game version 13.0.5)")
+        if not signature_matches(mod, off, sizes[off], sig):
+            raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: the function there does not begin as its "
+                             "signature says (the list is for game version 13.0.5)")
+        exact[kind].add(off)
+    callees = exact["exact-callee"] | exact["hookable"]
+    if imports:
+        callees |= {stub for stub, sym in stub_symbols(mod, sizes).items() if sym in imports}
+    if callees:
+        callees = close_over_tail_calls(callees, tail_graph(mod, sizes, entries, native))
+    return callees, exact["exact-caller"]
+
+
+def hookables(base, setjmp=()):
+    """This module's hookable functions of tools/hooks.txt (offsets), each reached only through
+    its slot (lift.Lifter.entry; runtime/hookable.h). resolve_hooks checks they are functions.
+    A call to setjmp becomes the host's setjmp (setjmp_targets), which no slot could stand in
+    for, so listing one stops the build."""
+    found = {a - base for kind, a in hook_list() if kind == "hookable" and module_base(a) == base}
+    if found & set(setjmp):
+        raise SystemExit(f"tools/hooks.txt: hookable {base + min(found & set(setjmp)):x}: calls to it become the "
+                         "host's setjmp, which cannot go through a slot")
+    return found
 
 
 def tools_fingerprint():
     """What the generated C depends on besides the module and its address (modcache)."""
     import lift
-    wraps = sorted(hle_wraps().items())
-    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + f"\nregcache {int(lift.REGCACHE)}")
+    by_address, by_name = runtime_wraps()
+    wraps = sorted(by_address.items())
+    hooks = sorted(hook_list().items())
+    return modcache.fingerprint("\n".join(sorted(hle_names())) + "\n" + repr(wraps) + "\n" + repr(hooks)
+                                + f"\nregcache {int(lift.REGCACHE)}"
+                                # (in the sources' order: the order of the wrappers of a function exported under several)
+                                + (f"\nexport wraps {list(by_name.items())!r}" if by_name else ""))
 
 
 def write_if_changed(path, text):
@@ -199,10 +551,11 @@ def write_if_changed(path, text):
     return True
 
 
-def _init(image_path, entries, base, forward, setjmp=None, pads=None):
+def _init(image_path, entries, base, forward, setjmp=None, pads=None, exact_callees=None, exact_callers=None,
+          hookable=None):
     f = open(image_path, "rb")
     _state["img"] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    _state["args"] = (entries, base, forward, setjmp, pads)
+    _state["args"] = (entries, base, forward, setjmp, pads, exact_callees, exact_callers, hookable)
 
 
 def unwind_jumpto(mod, found):
@@ -224,10 +577,8 @@ SETJMP_NAMES = {"setjmp", "_setjmp", "__setjmp"}
 
 def setjmp_targets(mod):
     """Where calls to setjmp land in this module: its own definitions and its import stubs."""
-    from funcs import import_stubs
     targets = {v for n, v, _s, info, _x in mod.exports if n in SETJMP_NAMES}
-    slots = {r[0]: mod.symbols[r[2]][0] for r in mod.relocs if r[2]}
-    targets |= {stub for stub, slot in import_stubs(mod).items() if slots.get(slot) in SETJMP_NAMES}
+    targets |= {stub for stub, sym in import_stub_symbols(mod).items() if sym in SETJMP_NAMES}
     return targets
 
 
@@ -267,16 +618,31 @@ def _emit(args):
         bodies.append(code)
         ext |= callees
     name = f"g{index:04d}.c"
-    text = ('#include "recomp.h"\n\n' + "".join(f"GuestFn f_{lifter.base + a:x};\n" for a in sorted(ext | own))
+    slots = sorted(lifter.hookable & (ext | own))   # (the hookable functions it calls or defines)
+    text = ('#include "recomp.h"\n' + ('#include "hookable.h"\n' if slots else "") + "\n"
+            + "".join(f"GuestFn f_{lifter.base + a:x};\n" for a in sorted(ext | own))
+            + "".join(f"extern RtHook rt_hook_{lifter.base + a:x};\n" for a in slots)
             + "\n" + "\n\n".join(bodies) + "\n")
+    # Each listed function reached only through its slot. The list is read again here, not taken
+    # from the Lifter, so a build that lost the Lifter's hookable set (build's Pool arguments out
+    # of step with _init's) stops rather than generate plain calls.
+    problems, listed = [], lifter.hookable | hookables(lifter.base)
+    if listed:
+        import hook_inline_check
+        problems = hook_inline_check.check_c({name: text}, {lifter.base + a for a in listed}, whole=False)
     write_if_changed(os.path.join(outdir, name), text)
     insns = sum(s for _, s in funcs) // 4
-    return name, ext - own, insns, max(s for _, s in funcs) // 4, bad, lifter.unresolved
+    return name, ext - own, insns, max(s for _, s in funcs) // 4, bad, lifter.unresolved, problems
 
 
 def load(path):
     """(module, {entry: sources}, [(entry, size)]) with every function that has code."""
     mod = Module(path)
+    return (mod, *functions(mod))
+
+
+def functions(mod):
+    """({entry: sources}, [(entry, size)]) with every function of a module that has code."""
     found, sizes = discover(mod)
     funcs = sorted((a, sizes[a]) for a, src in found.items() if "eh" in src or "plt" in src)
     # Hand-written assembly (system-call wrappers, memcpy, setjmp, ...) has no unwind entry.
@@ -311,7 +677,7 @@ def load(path):
             end -= 4
         if end > a:
             extra.append((a, end - a))
-    return mod, found, sorted(funcs + extra)
+    return found, sorted(funcs + extra)
 
 
 def image_file(mod):
@@ -448,15 +814,31 @@ def module_table(mod, name, base, funcs, missing):
     return "".join(out), len(imports), len(relocs)
 
 
-def build(path, outdir, jobs, per_file):
+def forwards(mod, base, found, funcs, name):
+    """{offset: what replaces the function there}: the native function of an exported name
+    the runtime implements (hle_names), libunwind's jumpto, and the wraps (resolve_wraps). A
+    function both replaced and wrapped (two names for it) stops the build."""
+    hle = hle_names()
+    forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
+    forward.update(unwind_jumpto(mod, found))
+    for off, wrap in sorted(resolve_wraps(mod, base, dict(funcs), name).items()):
+        if off in forward:
+            raise SystemExit(f"{name}: the function at {base + off:#x} is both replaced ({forward[off]}) "
+                             f"and wrapped ({wrap[1]})")
+        forward[off] = wrap
+    return forward
+
+
+def build(path, outdir, jobs, per_file, imports=None):
+    """imports: hook_imports, for this module's import stubs (none: the stubs are not exact)."""
     mod, found, funcs = load(path)
     name, base = module_key(path), base_of(path)
     os.makedirs(outdir, exist_ok=True)
     modcache.clear_stamp(outdir)   # (until generated and compiled again)
-    hle = hle_names()
-    forward = {v: f"hle_{n}" for n, v, _s, info, _x in mod.exports if n in hle and info & 0xF == 2}
-    forward.update(unwind_jumpto(mod, found))
-    forward.update(resolve_wraps(mod, base, dict(funcs), name))
+    forward = forwards(mod, base, found, funcs, name)
+    exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name, set(found), imports, native_only(forward))
+    setjmp = setjmp_targets(mod)
+    hookable = hookables(base, setjmp)
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -469,14 +851,19 @@ def build(path, outdir, jobs, per_file):
     if cur:
         chunks.append(cur)
     defined = {a for a, _ in funcs}
-    missing, manifest, bad, unresolved = set(), [], 0, []
-    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp_targets(mod), pads)) as pool:
+    missing, manifest, bad, unresolved, problems = set(), [], 0, [], []
+    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp, pads, exact_callees, exact_callers,
+                            hookable)) as pool:
         tasks = [(i, c, outdir) for i, c in enumerate(chunks)]
-        for fname, ext, insns, biggest, b, unres in pool.imap_unordered(_emit, tasks):
+        for fname, ext, insns, biggest, b, unres, probs in pool.imap_unordered(_emit, tasks):
             missing |= ext - defined
             manifest.append((fname, insns, biggest))
             bad += b
             unresolved += unres
+            problems += probs
+    if problems:   # (the stamp stays cleared: the next build generates the C again)
+        raise SystemExit(f"{name}: a hookable function is reached other than through its slot (tools/hook_inline_check.py): "
+                         + "; ".join(sorted(problems)[:5]))
     table, imports, relocs = module_table(mod, name, base, funcs, missing)
     write_if_changed(os.path.join(outdir, "g_module.c"), table)
     keep = {n for n, _i, _b in manifest} | {"g_module.c"}
@@ -488,7 +875,7 @@ def build(path, outdir, jobs, per_file):
     print(f"{name}: {len(manifest)} files, {size / 1048576:,.0f} MB of C, {len(defined):,} functions, "
           f"{sum(i for _n, i, _b in manifest):,} instructions; {bad} untranslated, {len(missing)} calls to nowhere, "
           f"{len(unresolved)} unresolved jump tables, {len(forward)} replaced natively; "
-          f"{imports:,} symbols referenced by {relocs:,} relocations")
+          f"{imports:,} symbols referenced by {relocs:,} relocations" + (f"; {len(hookable)} hookable" if hookable else ""))
 
 
 def stale_files(outdir):
@@ -616,11 +1003,16 @@ def build_all(exefs, out, jobs, compile_c=True):
     targets = {name: os.path.join(out, "nro", name) if os.path.dirname(nso) == NRO_DIR else os.path.join(out, name)
                for name, nso in paths.items()}
     shown = progress.Build(min(jobs, 16), compile=compile_c, link=progress.LINK if compile_c else None)
+    generate = False
     for name, mod in mods.items():
         current = modcache.build_info(targets[name]) == (mod.build_id, MODULES[name], name, fp)
+        generate |= not current
         shown.module(name, (mod.text.end - mod.text.mem) // 4,
                      [(t[0], t[3]) for t in stale_files(targets[name])] if current else None)
     build_ids = {name: mod.build_id for name, mod in mods.items()}
+    # (for the modules whose C is generated again; the names come from the boot modules, 13.0.5's,
+    # so a module whose C is current has them already)
+    imports = hook_imports(mods) if generate else {}
     del mods   # (the compilers want the memory)
     exe = os.path.join(out, "ssbu.exe")
     with progress.Line(shown.status, title=f"building {os.path.basename(exe)}" if compile_c else "writing the game's C"):
@@ -635,7 +1027,7 @@ def build_all(exefs, out, jobs, compile_c=True):
                 print(f"{name}: C up to date (build id {build_id[:16]}, same tools)")
                 reused += 1
             else:
-                build(nso, target, jobs, 40000)
+                build(nso, target, jobs, 40000, imports)
             if not compile_c:
                 modcache.write_stamp(target, build_id, base, name, fp)
             shown.written(name, [(t[0], t[3]) for t in stale_files(target)])
@@ -670,7 +1062,15 @@ if __name__ == "__main__":
     elif cmd == "image":
         image(nso, arg("--out"))
     elif cmd == "build":
-        build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")))
+        imports = None
+        if any(kind in EXACT_CALLEES for kind, _a in hook_list()):   # (this module's import stubs: hook_imports)
+            exefs = arg("--exefs", os.path.join(ROOT, "dump", "exefs"))
+            if not all(os.path.isfile(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")):
+                sys.exit(f"tools/hooks.txt has exact-callees (or hookable functions, which are exact-callees too), and "
+                         f"finding the import stubs bound to them needs "
+                         f"main, subsdk0 and sdk: not all in {exefs} (--exefs <dir>)")
+            imports = hook_imports({n: Module(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")})
+        build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")), imports)
     elif cmd in ("compile", "link") and sys.platform == "darwin":
         sys.exit(f"recomp.py {cmd} builds with clang-cl, for Windows: on macOS, tools/mac/build_mac.py compiles and links")
     elif cmd == "compile":
@@ -683,13 +1083,19 @@ if __name__ == "__main__":
         sys.exit(0 if build_all(nso, arg("--out"), int(arg("--jobs", "20")), compile_c) else 1)
     elif cmd == "check":
         check(nso)
-    elif cmd == "wrap-sig":
+    elif cmd == "wrap-sig":   # (an address, or for HLE_WRAP_EXPORT the exported name)
         m = Module(nso)
-        a = int(sys.argv[3], 16)
-        off = a - base_of(nso)
+        if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", sys.argv[3]):
+            a = int(sys.argv[3], 16)
+            off = a - base_of(nso)
+        else:
+            off = next((v for n, v, _s, info, _x in m.exports if n == sys.argv[3] and info & 0xF == 2), None)
+            if off is None:
+                sys.exit(f"{nso} exports no function named {sys.argv[3]}")
+            a = base_of(nso) + off
         sizes = dict(load(nso)[2])
         if off not in sizes:
             sys.exit(f"{a:x} is not a function start in {nso}")
-        print(f"/* signature: {' '.join(signature(m, off, sizes[off]))} */")
+        print(signature_comment(signature(m, off, sizes[off])))
     else:
         sys.exit(__doc__)
