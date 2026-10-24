@@ -1001,6 +1001,7 @@ static void print_status(void) {
     fiber_counts(&fiber_slots, &fibers_finalized, &fibers_made);
     fprintf(stderr, "[status] fibers: %llu started, %u host fibers (%u finalized, kept for the next ones)\n",
             (unsigned long long)fibers_made, fiber_slots, fibers_finalized);
+    kernel_map_status();
     kernel_dump_threads();
     fflush(stderr);
 }

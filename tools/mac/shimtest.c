@@ -1311,7 +1311,7 @@ static void g_start(Cpu *c) {   /* nn::init::Start, standing in for the game */
     memcpy(G2H(HEAP_BASE + 0x3000), "sm:", 4);
     c->x[1] = HEAP_BASE + 0x3000;
     rt_svc(c, 0x1F);
-    say(c->x[0] == 0 && c->x[1] >= 0xA000, "svcConnectToNamedPort with the name in guest memory");
+    say(c->x[0] == 0 && c->x[1] && c->x[1] < 0x40000000, "svcConnectToNamedPort with the name in guest memory");   /* (either handle layout: kernel.c) */
     u64 dst = STACK_BASE + 0x100000;
     c->x[0] = dst; c->x[1] = HEAP_BASE; c->x[2] = 0x10000;
     rt_svc(c, 0x04);
