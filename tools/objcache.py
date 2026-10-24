@@ -10,7 +10,9 @@ An object is current when the key it was compiled with is this build's. The key 
   - the compiler: its path and what it prints for --version (compiler_id, once per build),
   - the whole compile command: optimisation level, instruction set, defines, include folders.
 So another flag, header or compiler compiles the objects built with it again, and a file saved
-again unchanged does not: the decision goes by content, never by date.
+again unchanged does not: the decision goes by content, never by date. (An object the compile
+ladder compiled another way, tools/ladder.py, is keyed on the command it was compiled with, its
+optnone header's content with it, and recorded with how: ladder.check.)
 
 Each build folder keeps its record in objcache.json: each object's key, with the parts it is made
 of (which say why an object is compiled again), and each source's SHA-256 with its size and time
@@ -255,6 +257,12 @@ class Record:
             return os.stat(obj).st_mtime_ns >= max([self.adopt_ns, found] + [os.stat(p).st_mtime_ns for p in sources])
         except OSError:
             return False
+
+    def recorded(self, obj):
+        """The entry an object was recorded with, or None (with its fields beyond entry()'s: the compile
+        ladder's "ladder", the way it compiled the object, tools/ladder.py)."""
+        with self.lock:
+            return self.objects.get(self.name(obj))
 
     def forget(self, objs):
         """Before these objects are compiled: their keys gone from the record on disk. A record that

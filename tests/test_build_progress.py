@@ -6,13 +6,13 @@ import io
 import os
 import sys
 import tempfile
-import types
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import cc  # noqa: E402
+import ladder  # noqa: E402
 import progress as P  # noqa: E402
 import recomp  # noqa: E402
 
@@ -248,9 +248,8 @@ class LineTests(unittest.TestCase):
 class CompileReportTests(unittest.TestCase):
     def test_compile_each_reports_each_file(self):
         seen = []
-        ok = types.SimpleNamespace(returncode=0, stdout='', stderr='')
-        bad = types.SimpleNamespace(returncode=1, stdout='error: x', stderr='')
-        with mock.patch.object(cc.subprocess, 'run', side_effect=lambda args, **kw: bad if 'b.c' in args else ok):
+        ok, bad = ladder.Run(0, '', 0.5), ladder.Run(1, 'error: x', 0.5)
+        with mock.patch.object(ladder, 'run', side_effect=lambda args, *a, **kw: bad if 'b.c' in args else ok):
             failures = cc.compile_each([('a.c', 'a.obj', '/O2'), ('b.c', 'b.obj', '/O2')], 2,
                                        lambda job: seen.append(('start', job[0])),
                                        lambda job, secs: seen.append(('end', job[0], secs >= 0)))
@@ -258,7 +257,7 @@ class CompileReportTests(unittest.TestCase):
         self.assertEqual(sorted(seen), [('end', 'a.c', True), ('end', 'b.c', True), ('start', 'a.c'), ('start', 'b.c')])
 
     def test_compile_dir_follows_the_stale_files(self):
-        def fake(jobs, n, started=None, finished=None, compiled=None, flags=None):
+        def fake(jobs, n, started=None, finished=None, compiled=None, flags=None, **kw):
             for job in jobs:
                 if started:
                     started(job)

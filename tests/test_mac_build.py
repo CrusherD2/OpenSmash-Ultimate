@@ -48,6 +48,10 @@ def stub_toolchain(runtime=ROOT / 'runtime', sdl3_dir=ROOT / 'deps' / 'SDL3'):
     tc.SDL3_DIR, tc.SDL3_FRAMEWORK = str(sdl3_dir), str(Path(sdl3_dir) / 'SDL3.framework')
     tc.compile_each = lambda jobs, n=16, extra=(): []
     tc.run = lambda cmd: (0, '')
+    tc.wrapped = lambda cmd: (['nice', '-n', '10', *cmd], {})
+    tc.compile_command = lambda src, obj, opt, flags=(), extra=(), header=None: [
+        tc.CLANG, '-c', opt, *tc.CFLAGS, *(tc.CXXFLAGS if src.endswith('.cpp') else []), *extra, *flags,
+        *(['-include', header] if header else []), src, '-o', obj]
     return tc
 
 

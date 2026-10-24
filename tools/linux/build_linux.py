@@ -18,22 +18,27 @@ compile command or the compiler changed (tools/objcache.py: <out>/rt/ and each m
 an objcache.json); --link-only links only when nothing is to be compiled, so that <out>/isa.txt, which
 the link writes (tools/isa.py), says what all of it is compiled for. <out> holds one tree's game
 (port.txt): build another tree's into another <out>, or give --replace to start this one over. A
-progress bar shows how far it has got and the time left (tools/progress.py)."""
+progress bar shows how far it has got and the time left (tools/progress.py). A file the compiler
+crashes on, or a generated one that runs over its time limit, is compiled again another way
+(tools/ladder.py: <out>/ladder_report.txt lists them); <out>/compile_times.json keeps what each
+generated file took, for the next build's time left and time limits (its order too, only with
+SSBU_LONGEST_FIRST=1)."""
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
 from toolchain import (CFLAGS, CLANG, DXVK_INCLUDE, DXVK_LIBS, HOST_LINUX, ISA, ISA_TOLD, ISA_WHY, LLVM, LLVM_NM, REPO,
-                       RUNTIME, SYSROOT, TARGET, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, compile_each,
-                       default_port, read_port_stamp, run, same_path, write_port_stamp)
+                       RUNTIME, SYSROOT, TARGET, TOOLCHAIN, VKD3D_BUILD, VKD3D_SRC, compile_command, default_port,
+                       read_port_stamp, run, same_path, wrapped, write_port_stamp)
 
 sys.path.insert(0, os.path.join(REPO, "tools"))
 import isa  # noqa: E402
+import ladder  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
 
@@ -53,20 +58,14 @@ RUNTIME_INCLUDES = ["-I", os.path.join(RUNTIME, "linux", "include"), "-I", os.pa
 RUNTIME_DEFINES = ["-D_GNU_SOURCE", "-D_REENTRANT", "-DSSBU_HAVE_OPUS", "-DSSBU_HAVE_VPX", "-DSSBU_HAVE_SDL2"]
 # Each job's estimated compile in seconds, by its source, for the progress bar (tools/progress.py).
 # A game file's grows with its size and with the square of its biggest function, as on Windows
-# (progress.file_cost), but measured here (13.0.5's main and lua2cpp_master, compiled for Linux):
-# the square counts half as much as with clang-cl, a file compiled as C++ takes a third longer,
-# and -O0 (giant functions full of landing sites) has no square at all. A runtime file's goes by
-# its size.
+# (progress.clang_cost, measured with this build), or is what it took last time (compile_times.json:
+# ladder.Times). A runtime file's goes by its size.
 ESTIMATES = {}
-PER_INSN, PER_BIGGEST_SQUARED, CXX, PER_INSN_O0 = 1.05e-4, 6e-9, 1.35, 9e-5
 RUNTIME_PER_BYTE = 1e-5   # (gpu_d3d11.c, 210 KB: about 2 s)
 LINK = 10.0               # the link and the symbol list (4 s on a fast PC)
-
-
-def game_estimate(insns, biggest, opt, cxx):
-    if opt == "-O0":
-        return PER_INSN_O0 * insns
-    return (PER_INSN * insns + PER_BIGGEST_SQUARED * biggest * biggest) * (CXX if cxx else 1.0)
+INFOS = {}                # object -> its ladder.Info, of each generated file to compile (game_jobs)
+TIMES = None              # <out>/compile_times.json (ladder.Times), once game_jobs has read it
+STEPS = None              # the build's ladder.Ladder (main): one pace, one report
 
 
 def modules():
@@ -103,24 +102,35 @@ def needs(obj, *srcs):
     return not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(s) for s in srcs)
 
 
-KEYS = {}   # object -> (its folder's objcache.Record, the key it is compiled with), for each job to compile
+# object -> (its folder's objcache.Record, the key it is compiled with, key_for(step): its key compiled a
+# ladder step's way), for each job to compile
+KEYS = {}
 LANDING_SITES = b"__try"   # (what a generated file with exception landing sites has)
 
 
-def stale(record, job, inputs, headers, why):
+def stale(record, job, inputs, headers, why, info=None):
     """Whether a job's object is to be compiled (objcache.py): built from other `inputs` (files),
-    headers (objcache.digest_files), command or compiler; why[reason] counts it."""
+    headers (objcache.digest_files), command or compiler; why[reason] counts it. info: a generated
+    file's ladder.Info (its object may be one the ladder compiled another way: ladder.check)."""
     src, obj, opt = job[:3]
-    key = record.entry(inputs, compile_command(src, obj, opt, job[3] if len(job) > 3 else []),
-                       objcache.compiler_id(CLANG), headers)
-    reason = record.check(obj, key)
+    flags = job[3] if len(job) > 3 else []
+
+    def key(level, header):
+        command = compile_command(src, obj, level, flags, header=ladder.header_name(obj) if header else None)
+        return record.entry(inputs, ladder.key_command(command, header), objcache.compiler_id(CLANG), headers)
+
+    def key_for(step):
+        return ladder.ladder_entry(key(step.level, step.header), step, info.above)
+    entry = key(opt, info.header if info else None)
+    reason = ladder.check(record, obj, entry, key_for, info.c, info.above) if info else record.check(obj, entry)
     if reason:
-        KEYS[obj] = (record, key)
+        KEYS[obj] = (record, entry, key_for)
         why[reason] += 1
     return reason is not None
 
 
 def game_jobs():
+    global TIMES
     # what the generated files include: recomp.h, one with hook slots hookable.h too, g_module.c
     # module.h (tools/recomp.py; objcache.game_headers)
     headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, *h)) for h in objcache.GAME_HEADERS}
@@ -129,6 +139,7 @@ def game_jobs():
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
     adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
              if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
+    TIMES, above = ladder.Times(OUT), ladder.optnone_setting()
     for name, src_dir, out_dir in modules():
         record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt,
                                  adopt_found={objcache.HOOK_SLOTS: objcache.header_files(RUNTIME, "hookable.h")})
@@ -137,15 +148,19 @@ def game_jobs():
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
             src = os.path.join(src_dir, fname)
             obj = os.path.join(out_dir, fname[:-2] + ".o")
-            # very large functions make the optimiser superlinear; build those at a lower level (as on Windows)
-            opt = "-O1" if int(biggest) > 20000 or fname == "g_module.c" else "-O2"
             insns, biggest = int(insns), int(biggest)
+            own = ladder.eager(src, biggest, above) if fname != "g_module.c" else None   # (SSBU_OPTNONE_ABOVE's)
+            left = own.left if own else biggest
+            # very large functions make the optimiser superlinear; build those at a lower level (as on Windows)
+            opt = "-O1" if left > 20000 or fname == "g_module.c" else "-O2"
             job, inputs = (src, obj, opt), [src]
-            if fname != "g_module.c" and LANDING_SITES in record.source(src)[1]:
+            digest, found = record.source(src)
+            cxx = fname != "g_module.c" and LANDING_SITES in found
+            if cxx:
                 # As C++, a huge function full of landing sites (lua2cpp item/fighter tables: up to
                 # 210k instructions, 41k sites) takes the optimiser hours even at -O1 - and seconds
                 # at -O0. Those are one-off set-up code; 38k-instruction ones still take 20 s at -O1.
-                if biggest > 50000:
+                if left > 50000:
                     opt = "-O0"
                 wrapper = os.path.join(out_dir, fname[:-2] + "_cxx.cpp")
                 os.makedirs(out_dir, exist_ok=True)
@@ -154,11 +169,15 @@ def game_jobs():
                     with open(wrapper, "w") as f:
                         f.write(text)
                 job, inputs = (wrapper, obj, opt), [wrapper, src]
-            if not stale(record, job, inputs, headers[objcache.game_headers(fname, record.source(src)[1])], why):
+            model = progress.TABLE if fname == "g_module.c" else progress.clang_cost(insns, left, opt, cxx)
+            rel = os.path.relpath(obj, OUT)[:-2].replace(os.sep, "/") + ".c"
+            measured = TIMES.measured(rel, digest, opt)
+            info = ladder.Info(src, rel, insns, biggest, cxx, model, model if measured is None else measured, digest,
+                               *((own.above, own.header, own.names, own.left) if own else ()), measured=measured is not None)
+            if not stale(record, job, inputs, headers[objcache.game_headers(fname, record.source(src)[1])], why, info):
                 continue
             jobs.append(job)
-            ESTIMATES[jobs[-1][0]] = (progress.TABLE if fname == "g_module.c" else
-                                      game_estimate(insns, biggest, opt, jobs[-1][0].endswith("_cxx.cpp")))
+            ESTIMATES[job[0]], INFOS[obj] = info.estimate, info
         record.save()   # (the sources' digests: the next build reads only the files that changed)
     if objcache.summary(why):
         print(f"game: {objcache.summary(why)}")
@@ -264,7 +283,13 @@ def runtime_jobs():
 
 
 def in_order(jobs):
-    """Biggest first: a few files take minutes, and started last they would hold up the end."""
+    """Biggest first: a few files take minutes, and started last they would hold up the end. With
+    SSBU_LONGEST_FIRST=1, once a build has measured them, the longest first by what they took
+    (ladder.longest_first: compile_times.json)."""
+    measured = ladder.longest_first(jobs, INFOS)
+    if measured:
+        return measured
+
     def source_size(job):   # (a C++ wrapper's size is that of the generated file it includes)
         src = job[0]
         if src.endswith("_cxx.cpp"):
@@ -287,41 +312,50 @@ def forget(jobs):
             os.remove(job[1])
 
 
+def new_ladder():
+    """A build's compile ladder (tools/ladder.py), its compilers at the priority run() gives them."""
+    return ladder.Ladder(progress.clang_cost, "clang", popen=wrapped([])[1])
+
+
 def compile_all(jobs, what, shown=None):
-    """Compile the jobs (from stale: each one's key is recorded once it compiles); `shown`, a
-    progress.Build with a module named `what`, follows them."""
+    """Compile the jobs (from stale: each one's key is recorded once it compiles), a crash compiled again
+    and a generated file over its time limit compiled another way (STEPS, else a ladder of its own,
+    whose report is said at the end: tools/ladder.py); `shown`, a progress.Build with a module named
+    `what`, follows them."""
     if not jobs:
         print(f"{what}: up to date")
         return True
     t0 = time.time()
-    failures = []
     jobs = in_order(jobs)
     forget(jobs)
+    for job in jobs:
+        os.makedirs(os.path.dirname(job[1]), exist_ok=True)
     if shown:
         shown.begin("compile", what, [(job[0], estimate(job)) for job in jobs])
+    done, lock = [0], threading.Lock()
 
-    def one(job):
+    def finished(job, seconds):
         if shown:
-            shown.started(job)
-        t = time.time()
-        failed = compile_each([job], 1)
-        if shown:
-            shown.finished(job, time.time() - t)
-        if not failed:
-            record, key = KEYS[job[1]]
-            record.compiled(job[1], key)
-        return failed
-    from concurrent.futures import as_completed
-    with ThreadPoolExecutor(JOBS) as pool:
-        futures = [pool.submit(one, job) for job in jobs]
-        for done, fut in enumerate(as_completed(futures), 1):
-            failures += fut.result()
-            if done % 64 == 0 or done == len(jobs):
-                print(f"{what}: {done}/{len(jobs)} compiled, {time.time() - t0:,.0f}s", flush=True)
+            shown.finished(job, seconds)
+        with lock:
+            done[0] += 1
+            if done[0] % 64 == 0 or done[0] == len(jobs):
+                print(f"{what}: {done[0]}/{len(jobs)} compiled, {time.time() - t0:,.0f}s", flush=True)
+
+    def compiled(job, _level, step=None):
+        record, key, key_for = KEYS[job[1]]
+        record.compiled(job[1], key if step is None else key_for(step))
+
+    def argv(job, level, header):
+        return wrapped(compile_command(job[0], job[1], level, job[3] if len(job) > 3 else [], header=header))[0]
+    steps = STEPS or new_ladder()
+    failures = steps.compile(jobs, JOBS, argv, INFOS, shown, None, finished, compiled, TIMES)
     if shown:
         shown.end("compile", what)
     for src, err in failures[:8]:
         print(f"FAILED {src}:\n{err[:3000]}")
+    if STEPS is None:
+        steps.end(OUT)
     return not failures
 
 
@@ -407,6 +441,8 @@ def dxvk_libs():
 
 
 def main():
+    global STEPS
+    ladder.settings()   # (SSBU_COMPILE_LIMIT, SSBU_OPTNONE_ABOVE, SSBU_LONGEST_FIRST: one that is not a number stops the build now)
     os.makedirs(OUT, exist_ok=True)
     if not os.path.exists(os.path.join(VKD3D_BUILD, "linux", "libvkd3d-shader.a")):
         raise SystemExit("vkd3d-shader is not built: run tools/linux/build_vkd3d.py linux")
@@ -430,13 +466,17 @@ def main():
     shown = progress.Build(JOBS, link=None if runtime_only else LINK)
     shown.module("runtime", 0, [(job[0], estimate(job)) for job in rt])
     shown.module("game", 0, [(job[0], estimate(job)) for job in game])
+    STEPS = new_ladder()
     with progress.Line(shown.status, title="building ssbu"):
-        if not compile_all(rt, "runtime", shown):
-            return False
-        if runtime_only:
-            return True
-        if not compile_all(game, "game", shown):
-            return False
+        try:
+            if not compile_all(rt, "runtime", shown):
+                return False
+            if runtime_only:
+                return True
+            if not compile_all(game, "game", shown):
+                return False
+        finally:
+            STEPS.end(OUT)
         shown.begin("link")
         ok = link()
         shown.end("link")

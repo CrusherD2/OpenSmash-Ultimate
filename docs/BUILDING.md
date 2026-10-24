@@ -365,6 +365,7 @@ python tools/recomp.py all dump/exefs --out build --jobs 16
 
 - It takes **30 minutes to a few hours**, and prints a lot while it works. The PC can be slow meanwhile. A bar on the last line shows how far it has got and the time left (once the first files are compiled); the window's title shows it too.
 - If it's interrupted (a restart, the PC going to sleep), run the same command again: it carries on where it stopped.
+- Now and then the compiler crashes on a file, or takes far longer on one than it should. The build then compiles that file again another way and carries on: on its own, a little less optimised, or with its longest functions unoptimised. It says so in the log, lists those files again at the end, and adds them to `build\ladder_report.txt`. Nothing needs doing.
 - It's finished when a line says `linked … objects into build\ssbu.exe` and the `PS C:\WindowSmash>` line comes back.
 
 > [!TIP]
@@ -429,6 +430,7 @@ By hand: download the ZIP again, unblock it as in [step 5](#step-5-download-wind
 | Step 13 fails with `romfs.cfg` or `data.arc` in the message | The game data isn't connected yet. Do [step 10](#step-10-connect-your-game-data) first. |
 | `The system cannot find the file specified`, or `clang-cl` in an error, when the build starts | No compiler was found. Get one ([step 4](#step-4-install-the-compiler)); with Visual Studio, check the Clang tick (the tip at the end of that step). `python tools\build_game.py --check` tries the compiler and says which one it found. |
 | The build says `FAILED`, or the PC runs out of memory | Run the build again with a smaller `--jobs` number, such as `--jobs 4`. |
+| `did not finish compiling within its time limit` | A file took longer than its time limit every way the build tried. The PC is most likely short of memory: close other programs and run the build again with a smaller `--jobs`. To give each file more time, set `SSBU_COMPILE_LIMIT` to seconds before building (`$env:SSBU_COMPILE_LIMIT = '7200'`), or to `0` for no limit. |
 | `The game isn't built here yet` when starting the game | The build hasn't finished. Run [step 14](#step-14-build-the-game) again. |
 | The game closes, or stays black | Look at the end of `C:\WindowSmash\build\play.log` and in the `reports` folder. [Getting help](../README.md#getting-help) says what to send. |
 | No music, or movies don't play | The build was made before the codecs came with WindowSmash. Download the newest WindowSmash and build again ([Update WindowSmash](#update-windowsmash)); see [Audio and video codecs](#audio-and-video-codecs). |
@@ -607,6 +609,14 @@ The game checks the processor as it starts, before any of its own code runs. One
 ### What the build does
 
 `tools/recomp.py all` translates each module (`main`, `subsdk0`, `sdk` and the fighter modules) to C, makes the relocation images and registries, compiles everything with `clang-cl`, compiles the runtime, and links `build/ssbu.exe`. Builds after the first are incremental: a file is compiled again when its C, the runtime headers it includes, the compile flags or the compiler change ([how](TECHNICAL.md#incremental-builds)). The first build gives each fighter module an address and records it in `dump/nro/bases.txt`; keep that file with your build, and don't copy it from another build.
+
+A file the compiler crashes on is compiled again on its own once the others are done, then at `/O1`. A file still compiling well past its estimate (never sooner than 10 minutes; time the PC spends asleep doesn't count) is stopped and compiled again with its longest functions unoptimised, then whole at `/Od` ([the compile ladder](TECHNICAL.md#the-compile-ladder)). Such a file stays compiled that way until its C or the flags change. Each file's compile time is kept in `build\compile_times.json`, so the next build's time left is closer. Three switches, set before building:
+
+| Switch | What it does |
+| :--- | :--- |
+| `SSBU_COMPILE_LIMIT=<seconds>` | Every game file gets this time limit instead of one from its estimate. `0`: no limit, and files compiled another way are compiled again the normal way. |
+| `SSBU_OPTNONE_ABOVE=<instructions>` | For benchmarking only; off unless set. Compiles every function longer than this unoptimised from the start, and the rest of its file at the level it would have without them. |
+| `SSBU_LONGEST_FIRST=1` | For benchmarking only; off unless set. Starts the files that took longest last time first, instead of in the manifest's order. |
 
 Before compiling, it lists imported symbols that nothing provides in `build/imports.unresolved.txt`; a *strong* one there is the first sign that the game needs something the runtime doesn't have yet ([the imports check](TECHNICAL.md#the-imports-check)). It also checks that each of the runtime's hooks into the game's code finds the 13.0.5 function it expects, and stops if one doesn't ([code tied to the game version](TECHNICAL.md#code-tied-to-the-game-version)).
 
