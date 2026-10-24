@@ -414,7 +414,7 @@ python tools/linux/package_linux.py --tar
 | Command | What it does |
 | :--- | :--- |
 | `build_vkd3d.py` | Builds vkd3d-shader, once. |
-| `build_linux.py` | Builds the checkout's game (its `dump/` and `build/`) into `build-linux/ssbu`, about 1.2 GB, with `ssbu.syms` for the profiler. `--port <folder>` builds another checkout's game instead; each output folder holds one game, so give that one its own `--out`. The first build compiles every game file again, about 25 minutes with 20 jobs; later builds only redo what changed. |
+| `build_linux.py` | Builds the checkout's game (its `dump/` and `build/`) into `build-linux/ssbu`, about 1.2 GB, with `ssbu.syms` for the profiler. `--port <folder>` builds another checkout's game instead; each output folder holds one game, so give that one its own `--out`. The first build compiles every game file again, about 25 minutes with 20 jobs; later builds only redo what changed. A file the compiler crashes on, or that runs past its time limit, is compiled again another way and listed in `build-linux/ladder_report.txt` ([the compile ladder](TECHNICAL.md#the-compile-ladder); `SSBU_COMPILE_LIMIT` as in [what the build does](BUILDING.md#what-the-build-does)). |
 | `package_linux.py` | Makes `dist-linux/ssbu-linux` from it, and `ssbu-linux.tar` with `--tar`. `--build` and `--out` package another tree's build. |
 
 To check the Linux renderer path without a Linux machine, `python tools/linux/wintest.py --vkd3d`
