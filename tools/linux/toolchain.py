@@ -156,20 +156,28 @@ CHECK_CFLAGS = cflags(isa.ANY)
 _PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
 
 
-def run(cmd):
+def wrapped(cmd):
+    """(what runs a command at that priority, what subprocess is given for it): on Linux nice, when
+    cross-compiling on Windows the process's priority class (tools/ladder.py starts the compilers so)."""
     if HOST_LINUX:
-        r = subprocess.run(["nice", "-n", "10", *cmd], capture_output=True, text=True)
-    else:
-        r = subprocess.run(cmd, capture_output=True, text=True, creationflags=_PRIORITY)
+        return ["nice", "-n", "10", *cmd], {}
+    return list(cmd), {"creationflags": _PRIORITY}
+
+
+def run(cmd):
+    argv, priority = wrapped(cmd)
+    r = subprocess.run(argv, capture_output=True, text=True, **priority)
     return r.returncode, r.stdout + r.stderr
 
 
-def compile_command(src, obj, opt, flags=(), extra=()):
+def compile_command(src, obj, opt, flags=(), extra=(), header=None):
     """The command compile_each compiles src into obj with (and what objcache.py keys the object on).
-    flags: the job's own, where "c++" compiles it as C++ and "baseline" with CHECK_CFLAGS for CFLAGS."""
+    flags: the job's own, where "c++" compiles it as C++ and "baseline" with CHECK_CFLAGS for CFLAGS;
+    header: the compile ladder's optnone header, given before the file (-include), when it has one."""
     lang = ["-x", "c++", "-std=gnu++20", "-fexceptions"] if src.endswith((".cpp", ".cc")) or "c++" in flags else []
     base = CHECK_CFLAGS if "baseline" in flags else CFLAGS
-    return [CLANG, "-c", opt, *base, *lang, *extra, *[f for f in flags if f not in ("c++", "baseline")], src, "-o", obj]
+    return [CLANG, "-c", opt, *base, *lang, *extra, *[f for f in flags if f not in ("c++", "baseline")],
+            *(["-include", header] if header else []), src, "-o", obj]
 
 
 def compile_each(jobs_list, jobs=16, extra=()):
