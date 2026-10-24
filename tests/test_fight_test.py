@@ -332,10 +332,10 @@ class RuntimeTests(unittest.TestCase):
 
 
 class WrapTests(unittest.TestCase):
-    def test_the_new_hooks_have_no_signature_yet(self):
-        """(tools/recomp.py wrap-sig adds them, from the game; test_wrap_signature knows which.)"""
+    def test_the_hooks(self):
+        """The wraps the switches stand on (the frame end and the record builder by address,
+        test_game_addr; their signatures: test_wrap_signature)."""
         text = (ROOT / 'runtime' / 'hle_fight_test.c').read_text(encoding='utf-8')
-        self.assertNotIn('signature:', text)
         self.assertEqual(re.findall(r'^HLE_WRAP\((\w+)\)', text, re.M), ['71038701e0', '71017880c0'])
         self.assertEqual(re.findall(r'^HLE_WRAP_EXPORT\((\w+)\)', text, re.M),
                          ['_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv', '_ZN2nn2os13GetSystemTickEv',
