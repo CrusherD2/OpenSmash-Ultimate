@@ -226,8 +226,10 @@ class Lifter(SimdMixin):
                                           start in self.exact_callers)
             body = [(pc, s, f) for (pc, s), (_pc, _s, f) in zip(cached, body)]
         head = f"void {name}(Cpu *c)" if wrapper else self.entry(start)
+        pair = any("ex_w" in s for _pc, s, _f in body)   # (ldxp / stxp of X registers: the second doubleword)
         out = [f"{head} {{",
-               "    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0;"] + ["    " + d for d in decl]
+               f"    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0{', ex_w = 0' if pair else ''};"]
+        out += ["    " + d for d in decl]
         for pc, stmt, _falls in body:
             if pc in self.leaders:
                 out.append(f"L_{pc:x}:;")
@@ -820,7 +822,9 @@ class Lifter(SimdMixin):
         o2, load, o1, rs = (w >> 23) & 1, (w >> 22) & 1, (w >> 21) & 1, (w >> 16) & 31
         bits = 8 << size
         if o1:
-            raise Unsupported("exclusive pair / compare-and-swap")
+            if o2 or size < 2:   # cas, casp: LSE (ARMv8.1), not on the console's CPU
+                raise Unsupported("compare-and-swap (LSE)")
+            return self.exclusive_pair(w, size, base, rt, rs)
         if o2:   # ldar / stlr (and ldlar / stllr): accesses with ordering guarantees (recomp.h lda, sta)
             if load:
                 return wr(rt, 1, f"lda{bits}({base})")
@@ -829,6 +833,29 @@ class Lifter(SimdMixin):
             ld = "lda" if (w >> 15) & 1 else "ld"
             return f"{{ ex_a = {base}; ex_v = {ld}{bits}(ex_a); {wr(rt, 1, 'ex_v')} }}"
         ok = f"({base} == ex_a && cas{bits}(ex_a, ex_v, {reg(rt)}))"
+        return f"{{ u32 ok_ = {ok}; ex_a = 0; {wr(rs, 0, '!ok_')} }}"
+
+    @staticmethod
+    def exclusive_pair(w, size, base, rt, rs):
+        """ldxp / ldaxp / stxp / stlxp, as ldxr / stxr above. Two W registers are one 8-byte
+        exclusive, Rt the low half. Two X registers are one 16-byte location (recomp.h's ld128,
+        lda128, cas128), its second doubleword kept in ex_w. Arm leaves some forms CONSTRAINED
+        UNPREDICTABLE; these get one of the outcomes it allows. A status register that is also
+        Rt, Rt2 or Rn: every operand is read before the status is written, so the original values
+        go to the original address (as stxr here). An ldxp with Rt == Rt2: the register gets the
+        high half, an UNKNOWN value (as ldp here). A misaligned address faults on the console;
+        here it is not checked (the 16-byte atomics fault on it too, the 8-byte ones may not)."""
+        load, rt2, ordered = (w >> 22) & 1, (w >> 10) & 31, (w >> 15) & 1
+        ld = "lda" if ordered else "ld"
+        if size == 2:
+            if load:
+                return f"{{ ex_a = {base}; ex_v = {ld}64(ex_a); {wr(rt, 0, 'ex_v')} {wr(rt2, 0, 'ex_v >> 32')} }}"
+            ok = f"({base} == ex_a && cas64(ex_a, ex_v, (u64){reg(rt2, 0)} << 32 | {reg(rt, 0)}))"
+        else:
+            if load:
+                return (f"{{ ex_a = {base}; u128 p_ = {ld}128(ex_a); ex_v = (u64)p_; ex_w = (u64)(p_ >> 64); "
+                        f"{wr(rt, 1, 'ex_v')} {wr(rt2, 1, 'ex_w')} }}")
+            ok = f"({base} == ex_a && cas128(ex_a, ex_v, ex_w, {reg(rt)}, {reg(rt2)}))"
         return f"{{ u32 ok_ = {ok}; ex_a = 0; {wr(rs, 0, '!ok_')} }}"
 
     # ------------------------------------------------------------------ scalar floating point
