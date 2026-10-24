@@ -190,10 +190,21 @@ static SRWLOCK fixed_lock = SRWLOCK_INIT;
 static long fixed_calls;
 
 /* A clock read the game turns into a random seed: ssbu-recomp found these by their return
- * addresses, each followed by a generator's set-up. The time of day's too (hle_env.c). */
+ * addresses, each followed by a generator's set-up. The time of day's too (hle_env.c). Each
+ * one's first time is logged. */
 int test_fixed_clock(u64 lr) {
-    return fixed_on && (lr == GAME_ADDR(CLOCK_READ_1) || lr == GAME_ADDR(CLOCK_READ_2) || lr == GAME_ADDR(CLOCK_READ_3) ||
-                        lr == GAME_ADDR(CLOCK_READ_4));
+    static volatile long seen;
+    if (!fixed_on) return 0;
+    const u64 at[4] = {GAME_ADDR(CLOCK_READ_1), GAME_ADDR(CLOCK_READ_2), GAME_ADDR(CLOCK_READ_3), GAME_ADDR(CLOCK_READ_4)};
+    for (int i = 0; i < 4; i++)
+        if (lr == at[i]) {
+            if (!(seen & 1L << i)) {
+                seen |= 1L << i;
+                fprintf(stderr, "[fight] fixed seed: the clock read at %llx gave the constant\n", (unsigned long long)lr);
+            }
+            return 1;
+        }
+    return 0;
 }
 /* Random bytes from the seed's stream instead; 0 when off. The first 16 calls are logged. */
 int test_fixed_random(u64 buffer, u64 size, const char *who, u64 caller) {
@@ -261,6 +272,7 @@ HLE_WRAP(71017880c0) {
 
 /* ---- SSBU_DEBUG_END --------------------------------------------------------------------- */
 static long long end_limit, shown;
+static int fights;
 static DebugEnd end;
 static volatile long long end_fired;
 
@@ -292,7 +304,7 @@ void test_fight_presented(void) {
     if (n == 1) {
         u64 block = GAME_ADDR(MATCH_BLOCK), sel = stage_choice();
         fprintf(stderr, "[fight] fight %d on (the game's ready-go) at frame %lld shown: p1 kind %d, p2 kind %d type %u cpu power %u | stage id %x, "
-                "ui_stage %llx form %u, hazards %u | rule: stock %u, item appear %u\n", match_fight, shown, (int)(i8)ld8(block + 0x588),
+                "ui_stage %llx form %u, hazards %u | rule: stock %u, item appear %u\n", ++fights, shown, (int)(i8)ld8(block + 0x588),
                 (int)(i8)ld8(block + 0x588 + 0x260), ld8(block + 0x580 + 0x260 + 0xa), ld8(block + 0x580 + 0x260 + 0x79), ld32(block + 0x420),
                 (unsigned long long)ld64(sel), ld32(sel + 8), ld8(GAME_ADDR(STAGE_HAZARDS)), ld8(block + 0x4c), ld32(block + 0x54));
     }

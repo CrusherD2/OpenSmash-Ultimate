@@ -297,7 +297,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(f'state 1 chara {chara("link"):016x} type 1 colour 0 level 9 stocks 2 x224 ffffffff\n', r.stdout)
         self.assertIn(f'state 2 chara {chara("kirby"):016x} type 1 colour 2 level 9 stocks 2 x224 ffffffff\n', r.stdout)
         self.assertIn('state 3 chara c1000000000000ad type 3 colour 0 level 0 stocks 3 x224 00000000\n', r.stdout)   # (not asked for)
-        self.assertIn('[fight] fight 0 on (the game\'s ready-go) at frame 2 shown', r.stderr)
+        self.assertIn('[fight] fight 1 on (the game\'s ready-go) at frame 2 shown', r.stderr)
 
     def test_debug_match_list(self):
         path = os.path.join(self.dir, 'list.txt')
@@ -314,6 +314,8 @@ class RuntimeTests(unittest.TestCase):
         r = self.run_scenario('seed', SSBU_FIXED_SEED='42')
         s = Stream(42)
         self.assertIn(f'bytes {(s.take(21) + s.take(3)).hex()}\n', r.stdout)
+        clocks = re.findall(r'^\[fight\] fixed seed: the clock read at ([0-9a-f]+) gave the constant$', r.stderr, re.M)
+        self.assertEqual(clocks, ['7100047d20', '7100138534', '710366d7a0', '710366d938'], 'each once, the first time')
 
     def test_debug_end(self):
         """A fight from frame 3 to 52, then the next from 56: 120 fight frames are the 120th frame of
@@ -324,6 +326,7 @@ class RuntimeTests(unittest.TestCase):
                 r = self.run_scenario('end', SSBU_DEBUG_END=end, SSBU_FIGHT_HASH=path)
                 self.assertIn('[fight] SSBU_DEBUG_END: 120 fight frames at frame 175 shown: the run ends\n', r.stderr)
                 self.assertIn('fight off (the game\'s ready-go cleared) at frame 53 shown, after 50 fight frames', r.stderr)
+                self.assertEqual(re.findall(r'\] fight (\d+) on .* at frame (\d+) shown', r.stderr), [('1', '3'), ('2', '56')])
                 with open(path) as f:
                     self.assertEqual(len(f.read().splitlines()), 19, 'the hash lines written out at the end')
 
