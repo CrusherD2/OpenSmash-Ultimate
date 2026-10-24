@@ -155,16 +155,19 @@ class Record:
     save() keeps the objects and sources this Record looked at (check, compiled): a build looks at
     every object of its folder, and one it did not look at is no longer built there."""
 
-    def __init__(self, folder, scan=(), log=print, adopt_by_date=None):
+    def __init__(self, folder, scan=(), log=print, adopt_by_date=None, adopt_found=None):
         """adopt_by_date: the runtime headers (paths) of a game folder. If the folder has no record at
         all (an older version built it), an object there newer than its sources and these headers is
-        taken as current: what the old rule did. None: an object without a key is compiled again."""
+        taken as current: what the old rule did. None: an object without a key is compiled again.
+        adopt_found: {one of `scan`: more headers}, which an object must be newer than too when its
+        source holds that (HOOK_SLOTS: hookable.h, which only those files include)."""
+        assert all(s in scan for s in adopt_found or ()), "adopt_found goes by what scan finds"
         self.folder, self.path, self.scan, self.log = folder, os.path.join(folder, RECORD), tuple(scan), log
         self.lock = threading.Lock()
         self.objects, self.sources = {}, {}
         self.seen_objects, self.seen_sources, self.recent = set(), set(), set()
         self.unrecorded = UNRECORDED
-        self.adopt_ns, self.adopted, self.inputs = None, 0, {}
+        self.adopt_ns, self.adopt_found, self.adopted, self.inputs = None, {}, 0, {}
         try:
             with _retried(lambda: open(self.path, encoding="utf-8")) as f:
                 data = json.load(f)
@@ -175,6 +178,8 @@ class Record:
         except FileNotFoundError:
             if adopt_by_date is not None:
                 self.adopt_ns = max((os.stat(h).st_mtime_ns for h in adopt_by_date), default=0)
+                self.adopt_found = {s: max((os.stat(h).st_mtime_ns for h in hs), default=0)
+                                    for s, hs in (adopt_found or {}).items()}
         except OSError as e:   # there but not to be opened: not taken for no record, which compiles hours again
             raise SystemExit(f"{self.path} could not be opened ({e}). Build again once no other program holds it "
                              f"open; deleting it compiles the objects in {folder} again.") from e
@@ -212,8 +217,10 @@ class Record:
                  "source": sha(*(self.source(p)[0] for p in sources))}
         entry = {"key": sha(*(parts[p] for p in PARTS)), **{p: parts[p][:16] for p in PARTS}}
         if self.adopt_ns is not None:
+            found = max((self.adopt_found[s] for p in sources for s in self.source(p)[1] if s in self.adopt_found),
+                        default=0)
             with self.lock:
-                self.inputs[entry["key"]] = [os.path.abspath(p) for p in sources]
+                self.inputs[entry["key"]] = ([os.path.abspath(p) for p in sources], found)
         return entry
 
     def check(self, obj, entry):
@@ -239,13 +246,13 @@ class Record:
 
     def _older_rule_kept(self, obj, entry):
         """Whether the rule before this record (by date) kept this object: newer than its sources and
-        the runtime headers."""
+        the runtime headers (adopt_found's too, for a source that holds one)."""
         with self.lock:
-            sources = self.inputs.get(entry["key"])
+            sources, found = self.inputs.get(entry["key"], ((), 0))
         if not sources:
             return False
         try:
-            return os.stat(obj).st_mtime_ns >= max([self.adopt_ns] + [os.stat(p).st_mtime_ns for p in sources])
+            return os.stat(obj).st_mtime_ns >= max([self.adopt_ns, found] + [os.stat(p).st_mtime_ns for p in sources])
         except OSError:
             return False
 

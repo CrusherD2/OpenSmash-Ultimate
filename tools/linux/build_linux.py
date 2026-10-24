@@ -127,10 +127,11 @@ def game_jobs():
     jobs, why = [], Counter()
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
-    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h", "hookable.h")
+    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
              if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     for name, src_dir, out_dir in modules():
-        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt)
+        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt,
+                                 adopt_found={objcache.HOOK_SLOTS: objcache.header_files(RUNTIME, "hookable.h")})
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
