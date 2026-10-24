@@ -26,15 +26,22 @@ import isa  # noqa: E402
 import objcache  # noqa: E402
 import recomp  # noqa: E402
 
-REAL_RUN = subprocess.run
+REAL_RUN, REAL_POPEN = subprocess.run, subprocess.Popen
 # The made-up compiler. --version prints version.txt beside it. Otherwise it compiles the one source
-# it is given (.c or .cpp) into the object named by -o or /Fo, as a line naming the source and the
-# rest of the command; a source with "#error" is an error in the code, one with "crash at /O2" makes
-# it crash at /O2 (as cc.py tells a crash), one with "half-written" leaves half an object and fails.
-# Each run leaves a file of its own in runs/ beside it: "<source> <level>". (One shared file would
-# lose lines when two compiles of a parallel build append at once: on Windows, appends aren't atomic.)
+# it is given (.c or .cpp; a C++ wrapper's text is that of the C it includes too) into the object
+# named by -o or /Fo, as a line naming the source and the rest of the command; a source with "#error"
+# is an error in the code, one with "crash at /O2" makes it crash at /O2 as clang-cl does (and at any
+# other level so named), "crash like clang at -O2" as clang's driver says its compiler crashed,
+# "crash by signal at -O2" by a signal (not on Windows), one with "half-written" leaves half an object
+# and fails. "slow unless optnone on f_<address>" runs (a minute) unless the optnone header given
+# before the file (-include, /FI: tools/ladder.py) names that function, "slow unless O0" unless it
+# is compiled at -O0 or /Od, "slow" always: first it leaves half an object and clang's temporary
+# file, and starts a process of its own, which sleeps too (its id in grandchildren.txt).
+# Each run leaves a file of its own in runs/ beside it: "<source> <level>", and one with the whole
+# command and when (commands()). (One shared file would lose lines when two compiles of a parallel
+# build append at once: on Windows, appends aren't atomic.)
 FAKE_CC = r'''
-import os, sys, tempfile
+import json, os, re, signal, subprocess, sys, tempfile, time
 here = os.path.dirname(os.path.abspath(__file__))
 args = sys.argv[1:]
 if args == ["--version"]:
@@ -43,19 +50,44 @@ if args == ["--version"]:
     sys.exit(0)
 src = next(a for a in args if a.endswith((".c", ".cpp")))
 obj = args[args.index("-o") + 1] if "-o" in args else next(a[3:] for a in args if a.startswith("/Fo"))
-level = next(a for a in args if a in ("/O1", "/O2", "-O0", "-O1", "-O2"))
+level = next(a for a in args if a in ("/O1", "/O2", "/Od", "-O0", "-O1", "-O2"))
+header = args[args.index("-include") + 1] if "-include" in args else next((a[3:] for a in args if a.startswith("/FI")), None)
 os.makedirs(os.path.join(here, "runs"), exist_ok=True)
-fd, _ = tempfile.mkstemp(dir=os.path.join(here, "runs"), suffix=".txt")
+fd, run = tempfile.mkstemp(dir=os.path.join(here, "runs"), suffix=".txt")
 with os.fdopen(fd, "w") as f:
     f.write(os.path.basename(src) + " " + level + "\n")
+with open(run[:-4] + ".command.json", "w") as f:
+    json.dump({"when": time.time(), "args": args}, f)
 with open(src) as f:
     text = f.read()
+if src.endswith("_cxx.cpp"):
+    for included in re.findall(r'#include "([^"]+[.]c)"', text):
+        with open(included) as f:
+            text += f.read()
+optnone = open(header).read() if header else ""
 if "#error" in text:
     sys.stderr.write(src + "(1,2): error: a made-up error\n1 error generated.\n")
     sys.exit(1)
-if "crash at /O2" in text and level == "/O2":
+if "crash at " + level in text:
     sys.stderr.write("PLEASE submit a bug report\nStack dump:\nException Code: 0xC0000005\n")
     sys.exit(1)
+if "crash like clang at " + level in text:
+    sys.stderr.write("clang: error: unable to execute command: Segmentation fault: 11\n"
+                     "clang: error: clang frontend command failed due to signal (use -v to see invocation)\n")
+    sys.exit(254)
+if "crash by signal at " + level in text:
+    os.kill(os.getpid(), signal.SIGSEGV)
+wanted = re.search(r"slow unless optnone on (f_[0-9a-f]+)", text)
+if (wanted and wanted.group(1) + "(Cpu *c) __attribute__((optnone, noinline))" not in optnone) or \
+        ("slow unless O0" in text and level not in ("-O0", "/Od")) or re.search(r"\bslow\b(?! unless)", text):
+    stem, ext = os.path.splitext(obj)
+    for partial in (obj, stem + "-1a2b3c4d" + ext + ".tmp"):
+        with open(partial, "w") as f:
+            f.write("half")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    with open(os.path.join(here, "grandchildren.txt"), "a") as f:
+        f.write(f"{child.pid}\n")
+    time.sleep(60)
 with open(obj, "w") as f:
     f.write("half" if "half-written" in text else "object of " + os.path.basename(src) + ": "
             + " ".join(a for a in args if a not in (src, obj, "/Fo" + obj)) + "\n")
@@ -98,13 +130,32 @@ class FakeCompiler:
             path.unlink()
         return sorted(lines)
 
+    def commands(self):
+        """The whole commands it was given since the last call, in the order they ran (each one after
+        its program's name)."""
+        found = []
+        for path in (self.folder / 'runs').glob('*.command.json'):
+            found.append(json.loads(path.read_text()))
+            path.unlink()
+        return [c['args'] for c in sorted(found, key=lambda c: c['when'])]
+
+    def grandchildren(self):
+        """The processes the slow compiles started, by their ids."""
+        path = self.folder / 'grandchildren.txt'
+        return [int(n) for n in path.read_text().split()] if path.exists() else []
+
+    def command(self, args):
+        """What runs for a command: the made-up compiler for one that names it (on Linux, toolchain.run puts
+        "nice -n 10" before it)."""
+        args = list(args)
+        if self.name in args:
+            args = [sys.executable, str(self.script), *args[args.index(self.name) + 1:]]
+        return args
+
     def patch(self):
-        def run(args, **kw):
-            args = list(args)
-            if self.name in args:   # (on Linux, toolchain.run puts "nice -n 10" before it)
-                args = [sys.executable, str(self.script), *args[args.index(self.name) + 1:]]
-            return REAL_RUN(args, **kw)
-        return mock.patch.object(subprocess, 'run', run)
+        """subprocess.run and subprocess.Popen (the compile ladder's run: tools/ladder.py) running it."""
+        return mock.patch.multiple(subprocess, run=lambda args, **kw: REAL_RUN(self.command(args), **kw),
+                                   Popen=lambda args, *a, **kw: REAL_POPEN(self.command(args), *a, **kw))
 
 
 class Folder(unittest.TestCase):
@@ -512,23 +563,24 @@ class WindowsBuildTests(Folder):
         self.assertIn('FAILED g0001.c', self.said)
         self.assertFalse((self.module / 'g0001.obj').exists())
         self.assertEqual(self.compile()[1], ['g0001.c /O1'])   # (tried again)
-        # stopped during g0001.c's compile (Ctrl+C): the objects compiled are kept, g0001's is not
+        # stopped during g0000.c's compile (Ctrl+C; g0001.c, the longer, was first): the objects compiled are
+        # kept, g0000's is not
         write(self.module / 'g0000.c', '#include "recomp.h"\nint changed;\n')
         write(self.module / 'g0001.c', '#include "recomp.h"\nint changed;\n')
-        run = subprocess.run
+        popen = subprocess.Popen
 
-        def interrupted(args, **kw):
-            if any(str(a).endswith('g0001.c') for a in args):
+        def interrupted(args, *a, **kw):
+            if any(str(a).endswith('g0000.c') for a in args):
                 raise KeyboardInterrupt
-            return run(args, **kw)
-        with mock.patch.object(subprocess, 'run', interrupted), self.assertRaises(KeyboardInterrupt), \
+            return popen(args, *a, **kw)
+        with mock.patch.object(subprocess, 'Popen', interrupted), self.assertRaises(KeyboardInterrupt), \
                 contextlib.redirect_stdout(io.StringIO()):
             recomp.compile_dir(str(self.module), 1)
-        self.cc.runs()
+        self.assertEqual(self.cc.runs(), ['g0001.c /O1'])
         recorded = json.loads((self.module / objcache.RECORD).read_text())['objects']
-        self.assertIn('g0000.obj', recorded)
-        self.assertNotIn('g0001.obj', recorded)
-        self.assertEqual(self.compile(), (True, ['g0001.c /O1']))
+        self.assertIn('g0001.obj', recorded)
+        self.assertNotIn('g0000.obj', recorded)
+        self.assertEqual(self.compile(), (True, ['g0000.c /O2']))
 
     def test_runtime(self):
         """link's runtime objects: compiled again for a header, the flags (the stamp cflags.txt was) or the compiler."""

@@ -50,6 +50,7 @@ from multiprocessing import Pool
 # sets up when the PC has none) does not put a script's own folder on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import isa  # noqa: E402
+import ladder  # noqa: E402
 import modcache  # noqa: E402
 import objcache  # noqa: E402
 import progress  # noqa: E402
@@ -501,11 +502,13 @@ def build_folder(outdir):
     return os.path.dirname(out) if os.path.basename(out) == "nro" else out
 
 
-def plan(outdir):
-    """(stale_files, the folder's objcache.Record, {object: its key}, Counter of why each stale
-    one is). A generated file includes recomp.h, g_module.c module.h (_emit, module_table). The key's
-    command names the file and its object by their names in the folder: the folder spelled another
-    way (build/main, .\\build\\main, a full path), or moved, compiles nothing again."""
+def plan(outdir, times=None):
+    """(stale_files, the folder's objcache.Record, {object: (its key, key_for(step): its key compiled a
+    ladder step's way)}, Counter of why each stale one is, {object: its ladder.Info}). A generated file
+    includes recomp.h, g_module.c module.h (_emit, module_table). The key's command names the file and
+    its object by their names in the folder: the folder spelled another way (build/main, .\\build\\main,
+    a full path), or moved, compiles nothing again. times: the build folder's ladder.Times (read when
+    not given), by which the longest come first."""
     import cc
     with open(os.path.join(outdir, "manifest.tsv")) as f:
         rows = [line.split("\t") for line in f.read().splitlines()]
@@ -516,33 +519,60 @@ def plan(outdir):
     record = objcache.Record(outdir, adopt_by_date=adopt)
     compiler = objcache.compiler_id(cc.CLANG)
     headers = {h: objcache.digest_files(objcache.header_files(cc.RUNTIME, h)) for h in ("recomp.h", "module.h")}
-    todo, keys, why = [], {}, Counter()
+    times = times or ladder.Times(build_folder(outdir))
+    above = ladder.optnone_setting()
+    todo, keys, infos, why = [], {}, {}, Counter()
     for name, insns, biggest in rows + [["g_module.c", "0", "0"]]:
         src = os.path.join(outdir, name)
         obj = src[:-2] + ".obj"
+        insns, biggest = int(insns), int(biggest)
+        own = ladder.eager(src, biggest, above) if name != "g_module.c" else None   # (SSBU_OPTNONE_ABOVE's)
+        left = own.left if own else biggest
         # very large functions make the optimiser superlinear; build those at a lower level
-        opt = "/O1" if int(biggest) > 20000 or name == "g_module.c" else "/O2"
-        keys[obj] = record.entry([src], cc.compile_command(name, name[:-2] + ".obj", opt, cc.GAME_CFLAGS), compiler,
-                                 headers["module.h" if name == "g_module.c" else "recomp.h"])
-        reason = record.check(obj, keys[obj])
+        opt = "/O1" if left > 20000 or name == "g_module.c" else "/O2"
+        key = game_key(record, src, compiler, headers["module.h" if name == "g_module.c" else "recomp.h"])
+        keys[obj] = (key(opt, own.header if own else None),
+                     lambda step, key=key: {**key(step.level, step.header), "ladder": step.record()})
+        reason = ladder.check(record, obj, *keys[obj], src)
         if reason:
             why[reason] += 1
-            todo.append((src, obj, opt, progress.TABLE if name == "g_module.c" else progress.file_cost(int(insns), int(biggest))))
+            model = progress.TABLE if name == "g_module.c" else progress.file_cost(insns, left)
+            rel = os.path.relpath(src, build_folder(outdir)).replace(os.sep, "/")
+            digest = record.source(src)[0]
+            estimate = times.estimate(rel, digest, opt, model)
+            infos[obj] = ladder.Info(src, rel, insns, biggest, False, model, estimate, digest,
+                                     *((own.above, own.header, own.names, own.left) if own else ()))
+            todo.append((src, obj, opt, estimate))
     record.save()   # (the sources' digests: the next look reads only the files that changed)
-    return todo, record, keys, why
+    todo.sort(key=lambda t: -t[3])   # the longest first: started last, one would hold up the end
+    return todo, record, keys, why, infos
+
+
+def game_key(record, src, compiler, headers):
+    """key(level, header): a generated file's objcache key compiled at that level, with that optnone
+    header's text (or None: tools/ladder.py), its command naming it and its object by their names in
+    their folder."""
+    import cc
+    name = os.path.basename(src)
+    obj = name[:-2] + ".obj"
+    return lambda level, header: record.entry(
+        [src], ladder.key_command(cc.compile_command(name, obj, level, cc.GAME_CFLAGS, ladder.header_name(obj) if header else None),
+                                  header), compiler, headers)
 
 
 def stale_files(outdir):
-    """What compile_dir compiles, in order: (source, object, optimisation level, estimated
-    seconds: progress.file_cost) of each file whose object is missing or not current: compiled
-    from other C, headers or flags, or by another compiler (objcache.py)."""
+    """What compile_dir compiles, in order (the longest first): (source, object, optimisation level,
+    estimated seconds: what it took last time, else progress.file_cost) of each file whose object is
+    missing or not current: compiled from other C, headers or flags, or by another compiler (objcache.py)."""
     return plan(outdir)[0]
 
 
-def compile_dir(outdir, jobs, shown=None):
-    """Compile a module's stale files; `shown`, a progress.Build, follows them."""
+def compile_dir(outdir, jobs, shown=None, steps=None):
+    """Compile a module's stale files; `shown`, a progress.Build, follows them. steps: the build's
+    ladder.Ladder (tools/ladder.py), else one of its own, whose report is said at the end."""
     import cc
-    todo, record, keys, why = plan(outdir)
+    times = ladder.Times(build_folder(outdir))
+    todo, record, keys, why, infos = plan(outdir, times)
     if objcache.summary(why):
         print(f"{os.path.basename(outdir)}: {objcache.summary(why)}")
     record.forget([obj for _src, obj, _opt, _cost in todo])
@@ -553,12 +583,16 @@ def compile_dir(outdir, jobs, shown=None):
     if shown:
         shown.begin("compile", os.path.basename(outdir), [(src, cost) for src, _obj, _opt, cost in todo])
 
-    def compiled(job, _level):
+    def compiled(job, _level, step=None):
         # under the key of its own level even when a crash had it compiled at /O1 instead (cc.RETRY): kept until what
-        # it is built from changes, rather than compiled again at every build in case the compiler no longer crashes
-        record.compiled(job[1], keys[job[1]])
+        # it is built from changes, rather than compiled again at every build in case the compiler no longer crashes;
+        # one the ladder compiled another way, under the key of that way (ladder.check)
+        key, key_for = keys[job[1]]
+        record.compiled(job[1], key if step is None else key_for(step))
+    own = steps is None
+    steps = steps or ladder.Ladder(progress.level_cost, "clang-cl")
     failures = cc.compile_each([t[:3] for t in todo], jobs, *((shown.started, shown.finished) if shown else ()),
-                               compiled=compiled, flags=cc.GAME_CFLAGS)
+                               compiled=compiled, flags=cc.GAME_CFLAGS, shown=shown, infos=infos, steps=steps, times=times)
     if shown:
         shown.end("compile", os.path.basename(outdir))
     objs = [n for n in os.listdir(outdir) if n.endswith(".obj")]
@@ -567,6 +601,8 @@ def compile_dir(outdir, jobs, shown=None):
           f"{time.time() - t0:,.0f}s; {len(objs)} objects, {total / 1048576:,.0f} MB")
     for src, err in failures[:5]:
         print(f"FAILED {os.path.basename(src)}:\n{err[:1500]}")
+    if own:
+        steps.end(build_folder(outdir))
     return not failures
 
 
@@ -657,7 +693,7 @@ def link_compiled(dirs, exe, rt_dir=None):
         if not os.path.isfile(os.path.join(d, "manifest.tsv")):
             print(f"{d}: not a folder recomp.py generated (no manifest.tsv): recomp.py link links only those")
             return False
-        todo, _record, _keys, why = plan(d)
+        todo, _record, _keys, why, _infos = plan(d)
         if todo:
             built = isa.built_for(build_folder(d))
             print(f"{os.path.basename(d)}: {len(todo)} object{'s' if len(todo) != 1 else ''} not compiled for this build"
@@ -724,10 +760,14 @@ def build_all(exefs, out, jobs, compile_c=True):
         if not compile_c:
             print(f"the C of {len(paths)} modules is in {out} (--generate-only: not compiled here)")
             return True
-        for name in paths:
-            if not compile_dir(targets[name], min(jobs, 16), shown):
-                return False
-            modcache.write_stamp(targets[name], build_ids[name], MODULES[name], name, fp)
+        steps = ladder.Ladder(progress.level_cost, "clang-cl")   # (one pace and one report for the whole build)
+        try:
+            for name in paths:
+                if not compile_dir(targets[name], min(jobs, 16), shown, steps):
+                    return False
+                modcache.write_stamp(targets[name], build_ids[name], MODULES[name], name, fp)
+        finally:
+            steps.end(out)
         shown.begin("link")
         ok = link(list(targets.values()), exe)
         shown.end("link")
