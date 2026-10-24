@@ -15,6 +15,7 @@
 #include "host.h"
 #include "clock.h"
 #include "display.h"
+#include "hookable.h"
 #include "settings.h"
 #ifdef _WIN32
 #include <dbghelp.h>
@@ -863,18 +864,22 @@ static u32 bind_module(u32 m) {
 }
 
 static void load(const char *dir) {
-    u32 funcs = 0, exports = 0, relocs = 0;
+    u32 funcs = 0, exports = 0, relocs = 0, hooked = 0;
     for (u32 m = 0; m < module_count; m++) { funcs += modules[m]->func_count; exports += modules[m]->export_count; }
     for (u32 m = 0; m < rt_nro_count; m++) exports += rt_nro_modules[m]->export_count;
+    for (RtHook *h = rt_hook_list(); h; h = h->next) hooked++;
     for (symtab_size = 1024; symtab_size < exports * 3 + 65536; symtab_size *= 2) {}
     symtab = calloc(symtab_size, sizeof *symtab);
-    by_host_cap = funcs + 16;
+    by_host_cap = funcs + hooked + 16;
     by_host = malloc(sizeof *by_host * by_host_cap);
 
     for (u32 m = 0; m < module_count; m++) {
         map_module(m, dir);
         publish_exports(m);
     }
+    /* a hookable function's own code (hookable.h): the module's table holds only what calls it
+     * through its slot */
+    for (RtHook *h = rt_hook_list(); h; h = h->next) by_host[by_host_count++] = (struct HostFn){(u64)h->body, h->addr};
     /* The NROs the game loads later each have a fixed address: keep their ranges free now,
      * before the graphics driver and the heap start taking address space (they did, and a
      * fighter's module then could not be mapped). */

@@ -18,7 +18,7 @@
  *     does not answer at all given up on in seconds, not TCP's 75;
  *   - the profiler: every thread's stack (named from ssbu.syms beside the program), a sampling
  *     report, the hitch log.
- * Built with -DSHIMTEST_HOST and the loader and kernel (runtime/host.c, kernel.c, linux/upnp.c),
+ * Built with -DSHIMTEST_HOST and the loader and kernel (runtime/host.c, kernel.c, hle_hooks.c, linux/upnp.c),
  * it also starts a made-up game in a child process the way the game starts (guest window,
  * modules mapped at guest addresses, kernel areas, the guest main thread), checks its memory
  * and system calls, and lets it crash on purpose: the crash report must name the guest
@@ -31,8 +31,8 @@
  *      runtime/macos/platform.c runtime/macos/profile.c"
  *   mkdir -p build-mac/shimtest
  *   clang $F -Dmain=rt_host_main -c runtime/host.c -o build-mac/shimtest/host.o
- *   clang $F -DSHIMTEST_HOST tools/mac/shimtest.c build-mac/shimtest/host.o runtime/kernel.c runtime/linux/upnp.c $S \
- *       -o build-mac/shimtest/shimtest
+ *   clang $F -DSHIMTEST_HOST tools/mac/shimtest.c build-mac/shimtest/host.o runtime/kernel.c runtime/hle_hooks.c \
+ *       runtime/linux/upnp.c $S -o build-mac/shimtest/shimtest
  *   nm -n --defined-only build-mac/shimtest/shimtest > build-mac/shimtest/ssbu.syms   (the profiler's names)
  *   (cd build-mac/shimtest && ./shimtest)
  * or without the loader and kernel: clang $F tools/mac/shimtest.c $S -o build-mac/shimtest/shimtest. Exit

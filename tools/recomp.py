@@ -35,9 +35,11 @@ Each module is recompiled for a fixed load address (see MODULES); a function is 
 its guest address, so names are unique across modules. A module function whose exported
 name has a native implementation - `HLE(name)` in runtime/*.c - is emitted as a forwarder to
 it, so the replacement is reached by every caller, including direct calls inside the module.
-tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list).
-When it has an exact-callee, build reads main, subsdk0 and sdk from --exefs (dump/exefs if not
-given) for the names other modules reach it by (hook_imports).
+tools/hooks.txt lists functions whose callers' whole register state a hook needs (hook_list),
+and the hookable ones, which every caller reaches through a slot a hook can take over
+(runtime/hookable.h). When it has an exact-callee or a hookable function, build reads main,
+subsdk0 and sdk from --exefs (dump/exefs if not given) for the names other modules reach it by
+(hook_imports).
 """
 import bisect
 import hashlib
@@ -222,7 +224,9 @@ def resolve_wraps(mod, base, sizes, name):
 
 
 HOOKS = os.path.join(ROOT, "tools", "hooks.txt")
-HOOK_KINDS = ("exact-callee", "exact-caller")
+HOOK_KINDS = ("exact-callee", "exact-caller", "hookable")
+# (a hookable function is an exact-callee too: a hook in its slot sees its callers' registers)
+EXACT_CALLEES = ("exact-callee", "hookable")
 # `<kind> <address> [<n> words, sha256 <16 hex digits>] <name>`
 HOOK_LINE = re.compile(r"(\S+)\s+(?:0x)?([0-9a-fA-F]+)(?:\s+(\d+) words?, sha256 ([0-9a-f]{16}))?\s+(\S+)")
 HOOK_NAME = re.compile(r"[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)*")
@@ -282,8 +286,8 @@ def hook_list(path=None):
             continue
         m = HOOK_LINE.fullmatch(text)
         if not m or m.group(1) not in HOOK_KINDS:
-            raise SystemExit(f"{where}: not `exact-callee|exact-caller <address> [<n> words, sha256 <16 hex digits>] "
-                             f"<name>`: {text}")
+            raise SystemExit(f"{where}: not `exact-callee|exact-caller|hookable <address> [<n> words, sha256 <16 hex "
+                             f"digits>] <name>`: {text}")
         kind, a, count, digest, name = m.groups()
         a = int(a, 16)
         if not MODULES["main"] <= a < modcache.NRO_BASE or a & 3:
@@ -295,6 +299,9 @@ def hook_list(path=None):
             raise SystemExit(f"{where}: `{name}` is not a function name")
         if (kind, a) in found:
             raise SystemExit(f"{where}: {kind} {a:x} is listed twice")
+        if kind in EXACT_CALLEES and any((k, a) in found for k in EXACT_CALLEES):
+            raise SystemExit(f"{where}: {a:x} is both hookable and an exact-callee: a hookable function is an "
+                             "exact-callee already, so list it once, as hookable")
         found[(kind, a)] = (int(count), digest) if count else None
     return found
 
@@ -305,8 +312,9 @@ BOOT_MODULES = ("main", "subsdk0", "sdk")
 
 def hook_imports(mods, graphs=None):
     """{symbol: address} for each name the loader binds to code that returns into the caller of
-    an exact-callee of tools/hooks.txt: the exact-callee itself, or a function that reaches one
-    by tail calls (an exported wrapper ending in `b impl`), maybe through import stubs bound to
+    an exact-callee of tools/hooks.txt (a hookable function is one too): the exact-callee
+    itself, or a function that reaches one by tail calls (an exported wrapper ending in
+    `b impl`), maybe through import stubs bound to
     such a name in turn. Other modules call these by name, through an import stub, so those
     stubs are exact-callees too (resolve_hooks); and a module's stub joining its tail calls can
     bring in more of its exports, so this goes round until nothing more is added.
@@ -316,7 +324,7 @@ def hook_imports(mods, graphs=None):
     first of them loaded, so their exports are not followed here. mods: name -> nso.Module;
     graphs: name -> (stub_symbols, tail_graph) of main, subsdk0 and sdk (by default
     module_graph)."""
-    listed = {a for kind, a in hook_list() if kind == "exact-callee"}
+    listed = {a for kind, a in hook_list() if kind in EXACT_CALLEES}
     boot = [name for name in BOOT_MODULES if name in mods] if listed else []
     bound = {}
     for name in boot:
@@ -404,7 +412,8 @@ def resolve_hooks(mod, base, sizes, name, entries=None, imports=None, native=())
     names, and those of functions that reach one), which calls from another module go through;
     and every function that reaches one by tail calls (tail_graph, with the Lifter's entries,
     by default the function starts, and the functions replaced natively: native_only), since
-    what it reaches returns to the caller of the function that jumped."""
+    what it reaches returns to the caller of the function that jumped. A hookable function is
+    an exact-callee (hookables gives the Lifter its slots)."""
     exact = {kind: set() for kind in HOOK_KINDS}
     for (kind, a), sig in sorted(hook_list().items()):
         if module_base(a) != base:
@@ -417,12 +426,24 @@ def resolve_hooks(mod, base, sizes, name, entries=None, imports=None, native=())
             raise SystemExit(f"{name}: tools/hooks.txt: {kind} {a:x}: the function there does not begin as its "
                              "signature says (the list is for game version 13.0.5)")
         exact[kind].add(off)
-    callees = exact["exact-callee"]
+    callees = exact["exact-callee"] | exact["hookable"]
     if imports:
         callees |= {stub for stub, sym in stub_symbols(mod, sizes).items() if sym in imports}
     if callees:
         callees = close_over_tail_calls(callees, tail_graph(mod, sizes, entries, native))
     return callees, exact["exact-caller"]
+
+
+def hookables(base, setjmp=()):
+    """This module's hookable functions of tools/hooks.txt (offsets), each reached only through
+    its slot (lift.Lifter.entry; runtime/hookable.h). resolve_hooks checks they are functions.
+    A call to setjmp becomes the host's setjmp (setjmp_targets), which no slot could stand in
+    for, so listing one stops the build."""
+    found = {a - base for kind, a in hook_list() if kind == "hookable" and module_base(a) == base}
+    if found & set(setjmp):
+        raise SystemExit(f"tools/hooks.txt: hookable {base + min(found & set(setjmp)):x}: calls to it become the "
+                         "host's setjmp, which cannot go through a slot")
+    return found
 
 
 def tools_fingerprint():
@@ -445,10 +466,11 @@ def write_if_changed(path, text):
     return True
 
 
-def _init(image_path, entries, base, forward, setjmp=None, pads=None, exact_callees=None, exact_callers=None):
+def _init(image_path, entries, base, forward, setjmp=None, pads=None, exact_callees=None, exact_callers=None,
+          hookable=None):
     f = open(image_path, "rb")
     _state["img"] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    _state["args"] = (entries, base, forward, setjmp, pads, exact_callees, exact_callers)
+    _state["args"] = (entries, base, forward, setjmp, pads, exact_callees, exact_callers, hookable)
 
 
 def unwind_jumpto(mod, found):
@@ -511,11 +533,18 @@ def _emit(args):
         bodies.append(code)
         ext |= callees
     name = f"g{index:04d}.c"
-    text = ('#include "recomp.h"\n\n' + "".join(f"GuestFn f_{lifter.base + a:x};\n" for a in sorted(ext | own))
+    slots = sorted(lifter.hookable & (ext | own))   # (the hookable functions it calls or defines)
+    text = ('#include "recomp.h"\n' + ('#include "hookable.h"\n' if slots else "") + "\n"
+            + "".join(f"GuestFn f_{lifter.base + a:x};\n" for a in sorted(ext | own))
+            + "".join(f"extern RtHook rt_hook_{lifter.base + a:x};\n" for a in slots)
             + "\n" + "\n\n".join(bodies) + "\n")
+    problems = []
+    if lifter.hookable:   # (each listed function reached only through its slot)
+        import hook_inline_check
+        problems = hook_inline_check.check_c({name: text}, {lifter.base + a for a in lifter.hookable}, whole=False)
     write_if_changed(os.path.join(outdir, name), text)
     insns = sum(s for _, s in funcs) // 4
-    return name, ext - own, insns, max(s for _, s in funcs) // 4, bad, lifter.unresolved
+    return name, ext - own, insns, max(s for _, s in funcs) // 4, bad, lifter.unresolved, problems
 
 
 def load(path):
@@ -715,6 +744,8 @@ def build(path, outdir, jobs, per_file, imports=None):
     modcache.clear_stamp(outdir)   # (until generated and compiled again)
     forward = forwards(mod, base, found, funcs, name)
     exact_callees, exact_callers = resolve_hooks(mod, base, dict(funcs), name, set(found), imports, native_only(forward))
+    setjmp = setjmp_targets(mod)
+    hookable = hookables(base, setjmp)
     from eh import landing_pads
     pads = landing_pads(mod)
     chunks, cur, count = [], [], 0
@@ -727,15 +758,19 @@ def build(path, outdir, jobs, per_file, imports=None):
     if cur:
         chunks.append(cur)
     defined = {a for a, _ in funcs}
-    missing, manifest, bad, unresolved = set(), [], 0, []
-    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp_targets(mod), pads, exact_callees,
-                            exact_callers)) as pool:
+    missing, manifest, bad, unresolved, problems = set(), [], 0, [], []
+    with Pool(jobs, _init, (image_file(mod), set(found), base, forward, setjmp, pads, exact_callees, exact_callers,
+                            hookable)) as pool:
         tasks = [(i, c, outdir) for i, c in enumerate(chunks)]
-        for fname, ext, insns, biggest, b, unres in pool.imap_unordered(_emit, tasks):
+        for fname, ext, insns, biggest, b, unres, probs in pool.imap_unordered(_emit, tasks):
             missing |= ext - defined
             manifest.append((fname, insns, biggest))
             bad += b
             unresolved += unres
+            problems += probs
+    if problems:   # (the stamp stays cleared: the next build generates the C again)
+        raise SystemExit(f"{name}: a hookable function is reached other than through its slot (tools/hook_inline_check.py): "
+                         + "; ".join(sorted(problems)[:5]))
     table, imports, relocs = module_table(mod, name, base, funcs, missing)
     write_if_changed(os.path.join(outdir, "g_module.c"), table)
     keep = {n for n, _i, _b in manifest} | {"g_module.c"}
@@ -747,7 +782,7 @@ def build(path, outdir, jobs, per_file, imports=None):
     print(f"{name}: {len(manifest)} files, {size / 1048576:,.0f} MB of C, {len(defined):,} functions, "
           f"{sum(i for _n, i, _b in manifest):,} instructions; {bad} untranslated, {len(missing)} calls to nowhere, "
           f"{len(unresolved)} unresolved jump tables, {len(forward)} replaced natively; "
-          f"{imports:,} symbols referenced by {relocs:,} relocations")
+          f"{imports:,} symbols referenced by {relocs:,} relocations" + (f"; {len(hookable)} hookable" if hookable else ""))
 
 
 def stale_files(outdir):
@@ -935,10 +970,11 @@ if __name__ == "__main__":
         image(nso, arg("--out"))
     elif cmd == "build":
         imports = None
-        if any(kind == "exact-callee" for kind, _a in hook_list()):   # (this module's import stubs: hook_imports)
+        if any(kind in EXACT_CALLEES for kind, _a in hook_list()):   # (this module's import stubs: hook_imports)
             exefs = arg("--exefs", os.path.join(ROOT, "dump", "exefs"))
             if not all(os.path.isfile(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")):
-                sys.exit(f"tools/hooks.txt has exact-callees, and finding the import stubs bound to them needs "
+                sys.exit(f"tools/hooks.txt has exact-callees (or hookable functions, which are exact-callees too), and "
+                         f"finding the import stubs bound to them needs "
                          f"main, subsdk0 and sdk: not all in {exefs} (--exefs <dir>)")
             imports = hook_imports({n: Module(os.path.join(exefs, n)) for n in ("main", "subsdk0", "sdk")})
         build(nso, arg("--out"), int(arg("--jobs", "20")), int(arg("--per-file", "40000")), imports)

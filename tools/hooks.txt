@@ -1,5 +1,6 @@
-# Guest functions where a hook needs the whole register state of the code that calls them
-# (tools/recomp.py hook_list, read at every build; a change generates the C again).
+# Guest functions where a hook needs the whole register state of the code that calls them, and
+# the ones a hook can take over at run time through a slot (tools/recomp.py hook_list, read at
+# every build; a change generates the C again).
 #
 # The register cache (tools/regcache.py) keeps guest registers in C locals and brings the Cpu
 # context up to date only with what the ABI lets the other side read: before a call x0-x18,
@@ -12,6 +13,12 @@
 #       before the call and reads back every register the caller uses after it
 #   exact-caller <address> [<signature>] <name>
 #       every call the function makes (direct, indirect, svc) does the same
+#   hookable <address> [<signature>] <name>
+#       the function gets a hook slot (runtime/hookable.h): every direct call, tail call,
+#       indirect call and import stub reaches it through a pointer a hook can swap at run time,
+#       and its own code is never inlined or folded into another function. It is an
+#       exact-callee too (list it once, as hookable). A function whose calls become the host's
+#       setjmp cannot be hookable.
 #
 # A hook's caller is the code it returns to (where its LR points), so an exact-callee also
 # makes exact, in every module:
@@ -44,3 +51,4 @@
 #
 # exact-callee 7100001000 16 words, sha256 0123456789abcdef example_hooked_function
 # exact-caller 7100002000 example_caller
+# hookable 7100003000 example_hookable_function
