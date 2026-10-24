@@ -32,8 +32,10 @@ def build(folder):
     src = str(ROOT / 'tools' / 'dev' / 'maptest.c')
     if os.name == 'nt':
         exe = os.path.join(folder, 'maptest.exe')
+        # (as cc.link links the game: kernel_init reserves the guest's areas at fixed addresses, and with
+        # high-entropy ASLR Windows can put a heap or a thread stack there first)
         cmd = [cc.CLANG, '/nologo', '/O1', *cc.LINK_FLAGS, *cc.BASE_CFLAGS, src, '/Fe' + exe, '/Fo' + os.path.join(folder, 'maptest.obj'),
-               '/link', *cc.LINK_OPTIONS]
+               '/link', *cc.LINK_OPTIONS, '/HIGHENTROPYVA:NO']
     else:
         exe = os.path.join(folder, 'maptest')
         layer = ['runtime/linux/win32.c']   # (the platform layer)
