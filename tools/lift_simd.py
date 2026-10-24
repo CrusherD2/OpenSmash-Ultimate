@@ -190,6 +190,11 @@ class SimdMixin:
                 m, wide = 64 // esize, UF[esize * 2]
                 return vset(rd, rn, rn, [(f"{wide}[{i}]", f"(u64)a_.{uf}[{i + (m if q else 0)}] << {esize}")
                                          for i in range(m)])
+            if opcode in (2, 6) and size != 3:           # saddlp / uaddlp, sadalp / uadalp (6: accumulating)
+                xf, wide = (UF if u else SF)[esize], UF[esize * 2]
+                cast = "(u64)" if u else "(u64)(i64)"
+                acc = f"(u64)d_.{wide}[i_] + " if opcode == 6 else ""
+                return vop(rd, rn, rn, lanes // 2, wide, f"{acc}{cast}a_.{xf}[2 * i_] + {cast}a_.{xf}[2 * i_ + 1]")
         if opcode in (8, 9, 10, 11):
             if (scalar and size != 3) or (size == 3 and not (q or scalar)):
                 raise Unsupported("simd: reserved element size")
@@ -401,7 +406,7 @@ class SimdMixin:
             if opcode == 0x1C:
                 return vop(rd, rn, rn, n, ff, f"(f{esize})a_.{uf if u else sf_}[i_] * {hexf(2.0 ** -rsh, esize == 32)}")
             return vop(rd, rn, rn, n, uf, f"f2{'u' if u else 'i'}{esize}((f64)a_.{ff}[i_] * {hexf(2.0 ** rsh, False)})")
-        if opcode in (0x10, 0x14):
+        if opcode in (0x10, 0x11, 0x14):
             if scalar or esize == 64:
                 raise Unsupported("simd: reserved")
             m, wide = 64 // esize, UF[esize * 2]
@@ -411,18 +416,30 @@ class SimdMixin:
                 return vset(rd, rn, rn, [(f"{wide}[{i}]", f"{src.format(i + part)} << {lsh}") for i in range(m)])
             if u:
                 raise Unsupported("simd: saturating narrow")
-            return vset(rd, rn, rn, [(f"{uf}[{i + part}]", f"a_.{wide}[{i}] >> {rsh}") for i in range(m)], bool(q))
+            # shrn / rshrn (and the "2" forms: the upper half, the lower one kept). rshrn rounds in
+            # 64 bits: a carry out of them would land above the narrow lane.
+            src = f"a_.{wide}[{{}}] >> {rsh}" if opcode == 0x10 else f"((u64)a_.{wide}[{{}}] + {const(1 << (rsh - 1))}) >> {rsh}"
+            return vset(rd, rn, rn, [(f"{uf}[{i + part}]", src.format(i)) for i in range(m)], bool(q))
         if (scalar and esize != 64) or (esize == 64 and not (q or scalar)):
             raise Unsupported("simd: reserved element size")
         n = 1 if scalar else (64 << q) // esize
         ua, sa, ud = f"a_.{uf}[i_]", f"a_.{sf_}[i_]", f"d_.{uf}[i_]"
         right = ("0" if rsh == esize else f"{ua} >> {rsh}") if u else f"{sa} >> {min(rsh, esize - 1)}"
+        rounded = f"(u64)({right}) + (({ua} >> {rsh - 1}) & 1)"   # (x + 2^(rsh-1)) >> rsh, with no overflow
+        ones = (1 << esize) - 1
+        sli = f"({ud} & {const((1 << lsh) - 1)}) | ((u64){ua} << {lsh})"
         if opcode == 0x00:
             return vop(rd, rn, rn, n, uf, right)
         if opcode == 0x02:
             return vop(rd, rn, rn, n, uf, f"(u64){ud} + (u64)({right})")
-        if opcode == 0x0A and not u:
-            return vop(rd, rn, rn, n, uf, f"(u64){ua} << {lsh}")
+        if opcode == 0x04:   # srshr / urshr
+            return vop(rd, rn, rn, n, uf, rounded)
+        if opcode == 0x06:   # srsra / ursra
+            return vop(rd, rn, rn, n, uf, f"(u64){ud} + {rounded}")
+        if opcode == 0x08 and u:   # sri: the destination keeps its top rsh bits
+            return vop(rd, rn, rn, n, uf, ud if rsh == esize else f"({ud} & {const(ones ^ ones >> rsh)}) | ({ua} >> {rsh})")
+        if opcode == 0x0A:   # shl / sli (which keeps the destination's low lsh bits)
+            return vop(rd, rn, rn, n, uf, sli if u else f"(u64){ua} << {lsh}")
         raise Unsupported(f"simd: shift-by-immediate opcode {opcode:#x}")
 
     # ------------------------------------------------------------------ vector x indexed element
