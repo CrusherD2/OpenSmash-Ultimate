@@ -146,10 +146,13 @@ def needs(obj, *srcs):
 
 def hook_slots_stale(obj, src, hookable_time):
     """Whether obj, of a generated file with hook slots (#include "hookable.h"), is older than
-    hookable.h (hookable_time: its time, None without one). The C is read only for an object older
-    than hookable.h, which rarely changes."""
-    return hookable_time is not None and os.path.getmtime(obj) < hookable_time and \
-        b'#include "hookable.h"' in read(src, "rb")
+    hookable.h (hookable_time: its time, None without one). Asked only of an object older than
+    hookable.h, but then at every build: the objects of files without slots stay older than it once
+    it has changed. So only the head of the C is read, where tools/recomp.py puts its includes."""
+    if hookable_time is None or os.path.getmtime(obj) >= hookable_time:
+        return False
+    with open(src, "rb") as f:
+        return b'#include "hookable.h"' in f.read(256)
 
 
 def has_landing_sites(path):

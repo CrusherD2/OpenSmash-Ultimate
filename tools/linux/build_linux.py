@@ -137,7 +137,7 @@ def game_jobs():
     jobs, why = [], Counter()
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
-    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h")
+    adopt = (objcache.header_files(RUNTIME, "recomp.h", "module.h", "hookable.h")
              if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     TIMES, above = ladder.Times(OUT), ladder.optnone_setting()
     for name, src_dir, out_dir in modules():

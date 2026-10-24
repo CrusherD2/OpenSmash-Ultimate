@@ -903,7 +903,7 @@ def plan(outdir, times=None):
         rows = [line.split("\t") for line in f.read().splitlines()]
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
-    adopt = (objcache.header_files(cc.RUNTIME, "recomp.h", "module.h")
+    adopt = (objcache.header_files(cc.RUNTIME, "recomp.h", "module.h", "hookable.h")
              if isa.adopts(build_folder(outdir), cc.ISA, isa.CLANG_CL[cc.ISA], isa.LEGACY_CLANG_CL) else None)
     record = objcache.Record(outdir, scan=(objcache.HOOK_SLOTS,), adopt_by_date=adopt)
     compiler = objcache.compiler_id(cc.CLANG)
