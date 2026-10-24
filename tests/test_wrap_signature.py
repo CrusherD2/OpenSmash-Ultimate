@@ -89,13 +89,27 @@ class HleWraps(unittest.TestCase):
                 self.wraps(bad + 'HLE_WRAP(7100001000) {}\n')
             self.assertIn('not in the form', str(e.exception))
 
+    # Hooks still waiting for theirs (tools/recomp.py wrap-sig prints it, from the game): the fight
+    # test switches' frame end and player record builder (runtime/hle_fight_test.c).
+    AWAITING = {0x71038701e0, 0x71017880c0}
+
     def test_the_runtimes_own_hooks_all_carry_a_hash(self):
         wraps = recomp.hle_wraps()   # (raises on a signature that spells out words)
         self.assertGreater(len(wraps), 0)
         for address, sig in wraps.items():
             with self.subTest(address=f'{address:x}'):
+                if address in self.AWAITING:
+                    continue
                 self.assertIsNotNone(sig, 'every hook says what the function it wraps begins with')
                 self.assertTrue(1 <= sig[0] <= 16)
+
+    def test_the_awaiting_ones_are_still_waiting(self):
+        """(One given its signature comes off the list above.)"""
+        wraps = recomp.hle_wraps()
+        for address in self.AWAITING:
+            with self.subTest(address=f'{address:x}'):
+                self.assertIn(address, wraps)
+                self.assertIsNone(wraps[address])
 
 
 class ResolveWraps(unittest.TestCase):

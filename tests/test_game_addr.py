@@ -99,5 +99,25 @@ class GameAddressTests(unittest.TestCase):
         self.assertEqual(by_name['MATCH_BLOCK'], 0x71052c41b0)
 
 
+class RuntimeUseTests(unittest.TestCase):
+    """The runtime's own uses of the table (game_addr.h alone, no ssbu-recomp needed)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.at_13_0_5 = {r[0]: r[2] for r in header_rows(HEADER.read_text(encoding='utf-8'))}
+        cls.sources = {p.name: p.read_text(encoding='utf-8', errors='replace') for p in (ROOT / 'runtime').rglob('*.[ch]')}
+
+    def test_wraps_by_address_are_the_rows(self):
+        """hle_fight_test.c's HLE_WRAP lines (a literal, as tools/recomp.py reads them) are the
+        13.0.5 addresses of the rows named beside them."""
+        text = self.sources['hle_fight_test.c']
+        wraps = [int(a, 16) for a in re.findall(r'^HLE_WRAP\(([0-9a-f]+)\)', text, re.M)]
+        self.assertEqual(wraps, [self.at_13_0_5['FRAME_END'], self.at_13_0_5['PLAYER_RECORD_BUILDER']])
+
+    def test_every_name_used_is_a_row(self):
+        used = {name for text in self.sources.values() for name in re.findall(r'\bGAME_ADDR\((\w+)\)', text)} - {'name'}
+        self.assertGreaterEqual(len(used), 9)   # (hle_fight_test.c alone uses 9)
+        self.assertEqual(used - set(self.at_13_0_5), set())
+
+
 if __name__ == '__main__':
     unittest.main()
