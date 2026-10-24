@@ -234,6 +234,12 @@ class CrashSignTests(unittest.TestCase):
             self.assertTrue(elsewhere.exists())   # (only what clang wrote into the temporary folder)
 
 
+def stopped_now(pid):
+    """Whether a process is stopped now (ps's state T), on Linux and macOS."""
+    r = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True, timeout=30)
+    return r.stdout.strip().startswith('T')
+
+
 class RunTests(unittest.TestCase):
     """ladder.run: the time its compiler was stopped with the build (Ctrl+Z) is not counted against a time limit,
     nor in a compile's seconds; time the build was only too busy to look is; a compile that ends by itself just as
@@ -284,6 +290,12 @@ class RunTests(unittest.TestCase):
             return
         self.assertIs(ladder.stopped(p), False)
         os.kill(p.pid, signal.SIGSTOP)
+        # (let go on only once it has stopped: on Linux a SIGCONT that comes before the stop has taken effect
+        # throws the stop away, and a process never stopped has no going on to report)
+        end = time.monotonic() + 10
+        while not stopped_now(p.pid) and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertTrue(stopped_now(p.pid))
         os.kill(p.pid, signal.SIGCONT)
         end = time.monotonic() + 10
         while not ladder.stopped(p) and time.monotonic() < end:
