@@ -144,6 +144,14 @@ def needs(obj, *srcs):
     return not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(s) for s in srcs)
 
 
+def hook_slots_stale(obj, src, hookable_time):
+    """Whether obj, of a generated file with hook slots (#include "hookable.h"), is older than
+    hookable.h (hookable_time: its time, None without one). The C is read only for an object older
+    than hookable.h, which rarely changes."""
+    return hookable_time is not None and os.path.getmtime(obj) < hookable_time and \
+        b'#include "hookable.h"' in read(src, "rb")
+
+
 def has_landing_sites(path):
     with open(path, "rb") as f:
         return b"__try" in f.read()
@@ -261,6 +269,8 @@ def record_compiled(job, _level=None, step=None):
 def game_jobs():
     global TIMES
     recomp_h, module_h = os.path.join(RUNTIME, "recomp.h"), os.path.join(RUNTIME, "module.h")
+    hookable_h = os.path.join(RUNTIME, "hookable.h")   # (what a file with hook slots includes too)
+    hookable_time = os.path.getmtime(hookable_h) if os.path.exists(hookable_h) else None
     record, why = read_game_sources()
     TIMES, above = ladder.Times(OBJ), ladder.optnone_setting()
     kept = []
@@ -279,7 +289,8 @@ def game_jobs():
             ident = source_id(src)
             was = record.get(key)
             if was and was[2] == ident and kept_way(was, fname, src, biggest, above) and \
-                    not needs(obj, src, recomp_h, *([module_h] if fname == "g_module.c" else [])):
+                    not needs(obj, src, recomp_h, *([module_h] if fname == "g_module.c" else [])) and \
+                    not hook_slots_stale(obj, src, hookable_time):
                 kept.append(record_line(key, *was))
                 continue
             cxx = fname != "g_module.c" and has_landing_sites(src)

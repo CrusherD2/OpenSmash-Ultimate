@@ -15,6 +15,8 @@
 #include "host.h"
 #include "clock.h"
 #include "display.h"
+#include "hookable.h"
+#include "input_seq.h"
 #include "settings.h"
 /* rt_cpu_needs: what this file was compiled for, which cpu_check.c checks the processor for first */
 #define RT_CPU_DEFINE_NEEDS
@@ -51,6 +53,8 @@ extern u64 gpu_stat_batches, gpu_stat_lists, gpu_stat_draws, gpu_stat_dispatches
     gfx_stat_shaders, gfx_stat_shader_failures, gfx_stat_textures, gfx_stat_unpacked, gfx_stat_watch_us, gfx_skip_shader, gfx_skip_topology,
     gfx_skip_target, gfx_stat_unmap_dropped;
 u64 present_frames(void);
+void movie_test_start(void);   /* (hle_movie_skip.c) SSBU_SKIP_MOVIES, SSBU_SEQ's mark movie */
+void test_fight_start(void);   /* (hle_fight_test.c) SSBU_FIGHT_HASH, SSBU_DETERMINISTIC, SSBU_DEBUG_MATCH... */
 void gfx_report_compiles(void (*line)(const char *text));
 void gfx_status_lines(void);
 #ifdef _WIN32
@@ -764,6 +768,14 @@ static struct Sym *sym_slot(const char *name) {
 
 u64 rt_symbol(const char *name) { return sym_slot(name)->addr; }
 
+const char *rt_symbol_at(u64 addr, const char *prefix) {   /* (every export looked at: for start-up checks) */
+    size_t n = strlen(prefix);
+    for (u32 m = 0; m < module_count; m++)
+        for (u32 i = 0; i < modules[m]->export_count; i++)
+            if (modules[m]->exports[i].addr == addr && !strncmp(modules[m]->exports[i].name, prefix, n)) return modules[m]->exports[i].name;
+    return NULL;
+}
+
 /* Functions the loader wraps so that progress through start-up is visible. */
 static u64 real_startup, real_main;
 static void wrap_startup(Cpu *c) { phase = "nninitStartup"; printf("[boot] nninitStartup\n"); fflush(stdout); rt_call(c, real_startup); phase = "start-up after nninitStartup"; }
@@ -866,18 +878,22 @@ static u32 bind_module(u32 m) {
 }
 
 static void load(const char *dir) {
-    u32 funcs = 0, exports = 0, relocs = 0;
+    u32 funcs = 0, exports = 0, relocs = 0, hooked = 0;
     for (u32 m = 0; m < module_count; m++) { funcs += modules[m]->func_count; exports += modules[m]->export_count; }
     for (u32 m = 0; m < rt_nro_count; m++) exports += rt_nro_modules[m]->export_count;
+    for (RtHook *h = rt_hook_list(); h; h = h->next) hooked++;
     for (symtab_size = 1024; symtab_size < exports * 3 + 65536; symtab_size *= 2) {}
     symtab = calloc(symtab_size, sizeof *symtab);
-    by_host_cap = funcs + 16;
+    by_host_cap = funcs + hooked + 16;
     by_host = malloc(sizeof *by_host * by_host_cap);
 
     for (u32 m = 0; m < module_count; m++) {
         map_module(m, dir);
         publish_exports(m);
     }
+    /* a hookable function's own code (hookable.h): the module's table holds only what calls it
+     * through its slot */
+    for (RtHook *h = rt_hook_list(); h; h = h->next) by_host[by_host_count++] = (struct HostFn){(u64)h->body, h->addr};
     /* The NROs the game loads later each have a fixed address: keep their ranges free now,
      * before the graphics driver and the heap start taking address space (they did, and a
      * fighter's module then could not be mapped). */
@@ -935,6 +951,11 @@ u64 rt_load_nro(Cpu *c, u64 image) {
     printf("[ro] loaded %s at %#llx: %u functions, %u exports, %u symbol relocations\n",
            mod->name, mod->base, mod->func_count, mod->export_count, relocs);
     fflush(stdout);
+    if (input_seq_on()) {   /* (SSBU_SEQ's @module:<name>) */
+        char mark[SEQ_TEXT];
+        snprintf(mark, sizeof mark, "module:%s", mod->name);
+        input_seq_mark(mark);
+    }
     if (mod->init != mod->base) rt_call(c, mod->init);
     return mod->base;
 }
@@ -988,6 +1009,7 @@ static void print_status(void) {
     fiber_counts(&fiber_slots, &fibers_finalized, &fibers_made);
     fprintf(stderr, "[status] fibers: %llu started, %u host fibers (%u finalized, kept for the next ones)\n",
             (unsigned long long)fibers_made, fiber_slots, fibers_finalized);
+    kernel_map_status();
     kernel_dump_threads();
     fflush(stderr);
 }
@@ -1167,6 +1189,8 @@ int main(int argc, char **argv) {
     rt_data_dir = dir;
     kernel_init();
     load(dir);
+    movie_test_start();
+    test_fight_start();
 #ifndef _WIN32
     rt_window_init();   /* (SDL wants its window and events on the main thread, which then runs them) */
 #endif

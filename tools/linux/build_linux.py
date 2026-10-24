@@ -131,8 +131,9 @@ def stale(record, job, inputs, headers, why, info=None):
 
 def game_jobs():
     global TIMES
-    # what the generated files include: recomp.h, g_module.c module.h (tools/recomp.py)
-    headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, h)) for h in ("recomp.h", "module.h")}
+    # what the generated files include: recomp.h, one with hook slots hookable.h too, g_module.c
+    # module.h (tools/recomp.py; objcache.game_headers)
+    headers = {h: objcache.digest_files(objcache.header_files(RUNTIME, *h)) for h in objcache.GAME_HEADERS}
     jobs, why = [], Counter()
     # (a folder an older version built, without a record: its objects that the date said were current are kept -
     # only if they were compiled with today's flags, for today's instruction set: isa.adopts, which no target is today)
@@ -140,7 +141,7 @@ def game_jobs():
              if isa.adopts(OUT, ISA, isa.CLANG[ISA], isa.LEGACY_CLANG) else None)
     TIMES, above = ladder.Times(OUT), ladder.optnone_setting()
     for name, src_dir, out_dir in modules():
-        record = objcache.Record(out_dir, scan=(LANDING_SITES,), adopt_by_date=adopt)
+        record = objcache.Record(out_dir, scan=(LANDING_SITES, objcache.HOOK_SLOTS), adopt_by_date=adopt)
         with open(os.path.join(src_dir, "manifest.tsv")) as f:
             rows = [line.split("\t") for line in f.read().splitlines() if line]
         for fname, insns, biggest in rows + [["g_module.c", "0", "0"]]:
@@ -172,7 +173,7 @@ def game_jobs():
             measured = TIMES.measured(rel, digest, opt)
             info = ladder.Info(src, rel, insns, biggest, cxx, model, model if measured is None else measured, digest,
                                *((own.above, own.header, own.names, own.left) if own else ()), measured=measured is not None)
-            if not stale(record, job, inputs, headers["module.h" if fname == "g_module.c" else "recomp.h"], why, info):
+            if not stale(record, job, inputs, headers[objcache.game_headers(fname, record.source(src)[1])], why, info):
                 continue
             jobs.append(job)
             ESTIMATES[job[0]], INFOS[obj] = info.estimate, info
