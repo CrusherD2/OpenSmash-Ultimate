@@ -674,7 +674,8 @@ class TestProgramTests(unittest.TestCase):
                     'runtime/macos/platform.c', 'runtime/macos/profile.c']
             host, exe = os.path.join(tmp, 'host.o'), os.path.join(tmp, 'shimtest')
             self.build(*f, '-Dmain=rt_host_main', '-c', 'runtime/host.c', '-o', host)
-            self.build(*f, '-DSHIMTEST_HOST', 'tools/mac/shimtest.c', host, 'runtime/kernel.c', 'runtime/linux/upnp.c', *shim, '-o', exe)
+            self.build(*f, '-DSHIMTEST_HOST', 'tools/mac/shimtest.c', host, 'runtime/kernel.c', 'runtime/hle_hooks.c',
+                       'runtime/linux/upnp.c', *shim, '-o', exe)
             with open(os.path.join(tmp, 'ssbu.syms'), 'w') as syms:   # (the profiler's names)
                 subprocess.run(['nm', '-n', '--defined-only', exe], stdout=syms, check=True)
             out = self.run_program(exe, cwd=tmp)

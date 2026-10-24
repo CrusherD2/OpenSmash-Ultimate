@@ -86,10 +86,11 @@ REGCACHE = os.environ.get("SSBU_REGCACHE", "1") != "0"
 # freely: the context is right at every call and return either way).
 REGCACHE_MAX = 20000
 
-_RE_CALL = re.compile(r"(X\(30\) = 0x[0-9A-F]+ull; )(f_[0-9a-f]+\(c\);)")
+# (a call or tail call to a hookable function loads its slot: Lifter.callee)
+_RE_CALL = re.compile(r"(X\(30\) = 0x[0-9A-F]+ull; )((?:f_[0-9a-f]+|RT_HOOK\(rt_hook_[0-9a-f]+\))\(c\);)")
 _RE_SVC = re.compile(r"(rt_svc\(c, 0x[0-9a-f]+\);)")
 _RE_PAD = re.compile(r"if \(lp_\) (goto L_[0-9a-f]+;)")
-_RE_TAIL = re.compile(r"TAIL\((f_[0-9a-f]+)\)")
+_RE_TAIL = re.compile(r"TAIL\((f_[0-9a-f]+|RT_HOOK\(rt_hook_[0-9a-f]+\))\)")
 _RE_TRAP = re.compile(r"(rt_trap\(c, [^;]*;)")
 
 
@@ -157,7 +158,7 @@ def fp_imm8(imm8):
 
 class Lifter(SimdMixin):
     def __init__(self, image, entries, base=BASE, forward=None, setjmp=None, pads=None, exact_callees=None,
-                 exact_callers=None):
+                 exact_callers=None, hookable=None):
         self.img = image
         self.base = base         # guest address the module is loaded at
         self.forward = forward or {}   # entry offset -> native function that replaces it
@@ -168,6 +169,8 @@ class Lifter(SimdMixin):
         # of functions that do so at each of their calls
         self.exact_callees = exact_callees or set()
         self.exact_callers = exact_callers or set()
+        # and of the hookable functions: each is reached only through its slot (runtime/hookable.h)
+        self.hookable = hookable or set()
         self.entries = entries   # set of known function entry offsets
         self.tables = 0          # jump tables resolved
         self.indirect_tail = 0   # br sites treated as indirect tail calls
@@ -182,7 +185,7 @@ class Lifter(SimdMixin):
         self.leaders, self.callees, self.exact_sites = set(), set(), set()
         native = self.forward.get(start)
         if isinstance(native, str):   # replaced by a native implementation: every caller reaches it
-            return (f"GuestFn {native};\nvoid f_{self.base + start:x}(Cpu *c) {{ {native}(c); }}",
+            return (f"GuestFn {native};\n{self.entry(start)} {{ {native}(c); }}",
                     Counter(), set())
         name, wrapper = f"f_{self.base + start:x}", ""
         if isinstance(native, tuple) and native[2:3] == ("export",):   # wrapped by name: handed this original
@@ -191,10 +194,10 @@ class Lifter(SimdMixin):
             for i in range(len(chain) - 1, 0, -1):
                 wrapper += f"static void {name}_w{i}(Cpu *c) {{ {chain[i]}(c, {inner}); }}\n"
                 inner = f"{name}_w{i}"
-            wrapper += f"void {name}(Cpu *c) {{ {chain[0]}(c, {inner}); }}\n"
+            wrapper += f"{self.entry(start)} {{ {chain[0]}(c, {inner}); }}\n"
             name += "_orig"
         elif isinstance(native, tuple):   # wrapped natively: callers reach the wrapper, which may call this one
-            wrapper = f"GuestFn {native[1]};\nvoid {name}(Cpu *c) {{ {native[1]}(c); }}\n"
+            wrapper = f"GuestFn {native[1]};\n{self.entry(start)} {{ {native[1]}(c); }}\n"
             name += "_orig"
         self.words = struct.unpack_from(f"<{size // 4}I", self.img, start)
         self.sites = self.pads.get(start, [])
@@ -213,7 +216,7 @@ class Lifter(SimdMixin):
             body.append((pc, stmt, falls))
         if falls and self.fend in self.entries:   # assembly routines may run on into the next one
             self.callees.add(self.fend)
-            body.append((None, f"TAIL(f_{self.base + self.fend:x})", False))
+            body.append((None, f"TAIL({self.callee(self.fend)})", False))
         elif falls:
             body.append((None, f'rt_trap(c, {const(self.base + self.fend)}, "fell off the end of a function");', False))
         decl = []
@@ -222,7 +225,8 @@ class Lifter(SimdMixin):
                                           bool(self.sites) or any("rt_setjmp" in s for _pc, s, _f in body),
                                           start in self.exact_callers)
             body = [(pc, s, f) for (pc, s), (_pc, _s, f) in zip(cached, body)]
-        out = [f"void {name}(Cpu *c) {{",
+        head = f"void {name}(Cpu *c)" if wrapper else self.entry(start)
+        out = [f"{head} {{",
                "    u32 nf = 0, zf = 0, cf = 0, vf = 0; u64 ex_a = 0, ex_v = 0;"] + ["    " + d for d in decl]
         for pc, stmt, _falls in body:
             if pc in self.leaders:
@@ -231,13 +235,29 @@ class Lifter(SimdMixin):
         out.append("}")
         return wrapper + "\n".join(out), reasons, self.callees
 
+    def entry(self, start):
+        """The head of the definition that guest code reaching start runs: f_<address>, or for a
+        hookable function its slot, f_<address> calling through it, and the function itself,
+        f_<address>_body, out of line (runtime/hookable.h)."""
+        if start not in self.hookable:
+            return f"void f_{self.base + start:x}(Cpu *c)"
+        a = f"{self.base + start:x}"
+        return (f"GuestFn f_{a}_body;\nRtHook rt_hook_{a} = {{{const(self.base + start)}, f_{a}_body, f_{a}_body}};\n"
+                f"RT_HOOK_ADD(rt_hook_{a})\nvoid f_{a}(Cpu *c) {{ TAIL(RT_HOOK(rt_hook_{a})) }}\n"
+                f"RT_HOOKABLE void f_{a}_body(Cpu *c)")
+
+    def callee(self, target):
+        """What a call or tail call to the function at target calls: f_<address>, or what a
+        hookable function's slot holds."""
+        return f"RT_HOOK(rt_hook_{self.base + target:x})" if target in self.hookable else f"f_{self.base + target:x}"
+
     def goto(self, target):
         if self.fstart <= target < self.fend:
             self.leaders.add(target)
             return f"goto L_{target:x};"
         if target in self.entries:
             self.callees.add(target)
-            return f"TAIL(f_{self.base + target:x})"
+            return f"TAIL({self.callee(target)})"
         raise Unsupported("branch into another function's body")
 
     def call(self, target, ret):
@@ -253,7 +273,7 @@ class Lifter(SimdMixin):
             # import stubs other modules call it through. A call through rt_lookup cannot be
             # known to reach one: its caller is listed as an exact-caller instead.)
             self.exact_sites.add(ret - 4)
-        return self.landing(ret, f"X(30) = {const(self.base +ret)}; f_{self.base + target:x}(c);")
+        return self.landing(ret, f"X(30) = {const(self.base +ret)}; {self.callee(target)}(c);")
 
     def call_indirect(self, rn, ret):
         return self.landing(ret, f"{{ u64 t_ = {reg(rn)}; X(30) = {const(self.base +ret)}; rt_lookup(t_)(c); }}")
