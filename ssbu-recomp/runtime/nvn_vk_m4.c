@@ -81,7 +81,7 @@ static const char *ho_text(uint64_t hb) {
     for (int n = 0; n < 16; n++, i = (i + 1) & 65535) if (g_ho[i].hb == hb) { snprintf(b, sizeof b, "code first handed over at frame %d by %s", g_ho[i].frame, g_ho[i].origin == 2 ? "the preparation" : g_ho[i].origin ? "the container scan" : "nvnProgramSetShaders"); return b; }
     return "code never handed over before this draw";
 }
-static uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ULL; return h; }
+uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ULL; return h; }
 /* Session 7: the cache folder. SSBU_VK_CACHE=<folder> (tests: a first run on a cache of one's own, without touching the
  * shared ..\cache\vk); first called on the starting thread, before the workers exist. */
 static const char *vkc_dir(void) {
@@ -666,7 +666,7 @@ static void gpl_destroy(void) {
  * one stays alive until shutdown (command buffers in flight use it). SSBU_VK_GPL_OPT=0 turns this off. */
 static void gpl_opt_push(struct Pipe *p);          /* g_sh_lock held (defined after the job queue) */
 static LONG64 g_gpl_opt_q, g_gpl_opt_n, g_gpl_opt_tk;
-static int g_m4_quit;
+int g_m4_quit;
 /* MEASURED (runs s9g3n1 / s9g3i1 against s9g2n1 / s9g2i1, first runs): OFF by default. It cost 195 s (NVIDIA) and 304 s
  * (Intel) of worker time in one run, the GPU time per fight frame did not change (NVIDIA 3.23 against 3.34 ms, Intel 8.60
  * against 8.80) and the holds went UP (16 / 744 ms against 13 / 732 ms; Intel 53 / 2,055 ms against 37 / 1,199 ms). A second
@@ -913,7 +913,7 @@ static void skip_queue_stage(const SSrc *src, const uint32_t *key, uint32_t fo) 
     LeaveCriticalSection(&g_sh_lock);
 }
 static void gpl_opt_push(Pipe *p) { Job *j = calloc(1, sizeof *j); j->kind = 6; j->pipe = p; g_gpl_opt_q++; job_push_bg(j); }
-static int g_m4_on, g_m4_quit, g_scan_on;
+static int g_m4_on, g_scan_on;
 static LONG64 g_scan_jobs, g_scan_pipes, g_cs_pairs;
 static volatile LONG g_in_fight;
 static struct { int w, h, ncol, cf, df, lv; long long n, fight, first; } g_rtlog[256];      /* SSBU_VK_RTLOG=1: render-target sizes (nvn_vk_draw.c, where a pass begins) */
@@ -2058,7 +2058,7 @@ static int cont_range_empty(uint64_t above, uint64_t control) {      /* 1: reada
     }
     return 1;
 }
-static int cont_stage(uint64_t control, uint64_t data, SSrc *o) {      /* as nvnProgramSetShaders reads a stage (nvn_gl.c prog_set_shaders): 0 vertex, 1 fragment, 2 compute, -1 none, -2 a stage this back end does not take */
+static int cont_stage(uint64_t control, uint64_t data, SSrc *o) {      /* as nvnProgramSetShaders reads a stage (nvn_front.c prog_set_shaders): 0 vertex, 1 fragment, 2 compute, -1 none, -2 a stage this back end does not take */
     static const int8_t stage_of_type[16] = {-1, 0, 3, 4, 2, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     uint32_t ctl[8];
     memset(o, 0, sizeof *o);
@@ -2324,8 +2324,8 @@ static char g_prep_marker[240];
 static int g_prep_marked;
 static int g_prep_loadall;                          /* shader_load = start on a marked start: every container into memory before the first frame */
 static void pcache_save(void);
-static volatile int g_store_pct;
-#include "nvn_vk_store.c"                          /* session 11: the container store made by the host from data.arc */
+volatile int g_store_pct;
+#include "nvn_vk_int.h"                           /* session 11: the container store made by the host from data.arc (nvn_vk_store.c) */
 static int prepfile_cmp(const void *a, const void *b) { const PrepFile *x = a, *y = b; return x->size < y->size ? 1 : x->size > y->size ? -1 : strcmp(x->name, y->name); }
 static void prep_line(const char *what) {
     PROCESS_MEMORY_COUNTERS_EX pm;

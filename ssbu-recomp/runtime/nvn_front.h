@@ -1,7 +1,7 @@
 /* NVN front end: the types both render back ends share (plan\phases\V1_vulkan.md, section 1, seam steps S1 and S2).
  * Moved here from nvn_gl.c without renames. The front end itself (entry points, command recording, the job queue, the
- * texture source logic) still lives in nvn_gl.c until step S3; what the Vulkan back end needs of it is declared at the
- * end of this file (the nvn_front_* functions, defined at the end of nvn_gl.c). */
+ * texture source logic) is nvn_front.c since step S3; what the Vulkan back end needs of it is declared at the end of
+ * this file (the nvn_front_* functions, defined at the end of nvn_front.c). */
 #ifndef NVN_FRONT_H
 #define NVN_FRONT_H
 #include <stdio.h>
@@ -115,11 +115,11 @@ void nvn_vk_memory_retire(void *arg);        /* PR #41: Range, render thread: dr
 void nvn_vk_container_seen(uint64_t control, uint64_t prog);      /* Vulkan, GUEST thread, from nvnProgramSetShaders: the "BNSH" container around this control section / variation program is scanned when new (nvn_vk_m4.c) */
 /* Session 8: where one nvnProgramSetShaders call spent its time, in performance-counter ticks, per calling thread:
  * 0 gl_barrier, 1 container_seen (all), 2 container search, 3 container copy / walk, 4 program_set (all), 5 hashing + job copy,
- * 6 waiting for the shader lock, 7 caller held for the workers. Printed by nvn_gl.c prog_set_shaders ("nvn_setsh:"). */
+ * 6 waiting for the shader lock, 7 caller held for the workers. Printed by nvn_front.c prog_set_shaders ("nvn_setsh:"). */
 extern __declspec(thread) long long nvn_setsh_part[8];
 void nvn_vk_program_set(void *prog);        /* Vulkan, GUEST thread, from nvnProgramSetShaders: the program's stages go to the workers (nvn_vk_m4.c) */
 
-/* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_gl.c) */
+/* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_front.c) */
 int nvn_front_fmt(int nvn_format, Fmt *f);                                  /* fmt_get */
 uint8_t *nvn_front_list(uint64_t handle, size_t *len);                      /* list_lookup */
 void nvn_front_batch_begin(void);                                           /* a new submitted batch: texture memory is looked at again once */

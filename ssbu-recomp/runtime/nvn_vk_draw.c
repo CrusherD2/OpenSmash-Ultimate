@@ -296,7 +296,7 @@ static struct {
 
 static void pass_end(void) { if (R.in_pass) { vkCmdEndRendering(R.cmd); R.in_pass = 0; CKPT_OP("pass end (w, h)", 0, R.pass_w, R.pass_h, 0); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
-static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* Session 5, SSBU_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
  * read when the buffer has finished; "nvn_vk_gpu:" line every 300 frames. The span of a buffer includes the time the GPU
  * gave to other processes while it ran. */
@@ -566,7 +566,7 @@ static float rs_scale(void) {
 static int rs_screen_class(int w, int h) { for (int k = 0; k < 7; k++) if (w == 1920 >> k && h == 1080 >> k) return 1; return 0; }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s + 0.5f); return r < 0 ? 0 : r > max ? max : r; }
-/* Session 9: the textures of the game's window (nvn_gl.c win_initialize keeps the list; also noted here at every present).
+/* Session 9: the textures of the game's window (nvn_front.c win_initialize keeps the list; also noted here at every present).
  * SSBU_VK_UI_NATIVE=1 (resolution scale, experiment): a window texture is NOT scaled, so what the game draws straight into it
  * (its last full-screen pass and the 2D interface after it) is drawn at the game's 1920x1080. */
 int nvn_front_tex_is_window(const Tex *t);
@@ -1832,7 +1832,7 @@ static int g_cb_merge = -1;                        /* SSBU_VK_CBMERGE=0: the who
  * (buffer copies, texel copies), or when two batches have passed without a dispatch into it. What a draw reads is the
  * same bytes as before as long as the GAME does not write the range itself between two dispatches (it would be
  * overwritten by the old copy-back as well, one batch later) and does not read compute's output from guest memory.
- * The game writing the range is not left to luck: the game's heap is write-watched (nvn_gl.c, ww_newest); before a
+ * The game writing the range is not left to luck: the game's heap is write-watched (nvn_front.c, ww_newest); before a
  * kept buffer is taken again the watch is asked, and when a page of the range was written by the CPU since the buffer
  * was filled, the buffer lands with the word-by-word merge of session 5 (a word the game changed stays the game's) and is
  * filled from guest memory again: what the old path did every batch, now only when there was a write (counted). Memory
@@ -1845,7 +1845,7 @@ static int g_cb_merge = -1;                        /* SSBU_VK_CBMERGE=0: the who
 static int g_cb_keep = -1, g_cb_nkept, g_cb_dl = -1;
 static uint64_t g_kept_lo = ~0ull, g_kept_hi, g_live_lo = ~0ull, g_live_hi;      /* g_live_*: bounds of the buffers live in this batch (cb_inside / cb_overlap are not asked for a range outside them) */
 static LONG64 g_ck_hits, g_ck_fills, g_ck_fill_bytes, g_ck_land[5], g_ck_land_bytes, g_ck_guard_fail, g_ck_unwatched, g_ck_gwords, g_ck_conflicts, g_ck_land_tk, g_ck_land_max;     /* landings by cause: 0 not dispatched into for two batches, 1 a read of an overlapping range, 2 a new compute buffer over another extent, 3 a guest-memory command, 4 the game wrote a page of the range */
-uint64_t nvn_front_mem_newest(const void *p, size_t n);      /* nvn_gl.c */
+uint64_t nvn_front_mem_newest(const void *p, size_t n);      /* nvn_front.c */
 static SRWLOCK g_cg_lock = SRWLOCK_INIT;
 static struct { uintptr_t lo, hi; DWORD old; } g_cg[256];
 static volatile LONG64 g_cg_reads, g_cg_writes, g_cg_render;
@@ -2951,7 +2951,7 @@ static void copy_buf_tex(const Cmd *m) {
     int r[6];
     if (!t || t->dead || !m->a[0]) return;
     memcpy(&v, BLOB(m), sizeof v); memcpy(r, BLOB(m) + 24, 24);
-    write_region(t, &v, r, P(m->a[0]), (int64_t)m->a[5], (int64_t)m->a[6]);     /* PR #14 (xtlg511): the strides of its own command buffer (nvn_gl.c cmd_copy_buf_tex) */
+    write_region(t, &v, r, P(m->a[0]), (int64_t)m->a[5], (int64_t)m->a[6]);     /* PR #14 (xtlg511): the strides of its own command buffer (nvn_front.c cmd_copy_buf_tex) */
 }
 static void vk_write_texels(void *arg) {
     WriteJob *j = arg;
@@ -3087,7 +3087,7 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
  * of the bytes in the Vulkan buffer at the bound offset when the draw was recorded (ring = the stream ring's copy; cb = a
  * compute buffer, whose content at that moment is not what the GPU will read), and the state values set for the draw. */
 #include "nvn_dt.h"
-int nvn_front_draw_tag(void); int nvn_front_draw_tag_next(void); void nvn_front_draw_tag_clear(void);      /* nvn_gl.c */
+int nvn_front_draw_tag(void); int nvn_front_draw_tag_next(void); void nvn_front_draw_tag_clear(void);      /* nvn_front.c */
 static uint64_t g_dt_voff[16];
 static VkBuffer g_dt_vb[16];
 static void *dt_host(uint64_t a) { return P(a); }
