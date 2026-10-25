@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-#include <GL/gl.h>
 #include "runtime.h"
 #include "hostrt.h"
 #include "mx_translate.h"
@@ -1841,7 +1840,7 @@ static void ms_get_grid_on(Ctx *c) { RET((rd8(A0 + 3) >> 2) & 1); }
 static void ms_get_covmod(Ctx *c) { RET((rd8(A0 + 3) >> 3) & 3); }
 static void ms_get_c2c_output(Ctx *c) { RET(rd8(A0 + 3) >> 5); }
 static void ms_get_grid(Ctx *c) {                       /* (state, int *width, int *height): the grid this GPU repeats sample locations over */
-    GLint wh[2] = {1, 1};
+    int wh[2] = {1, 1};
     if ((rd8(A0 + 3) >> 2) & 1) gl_run(g_rb->sample_grid, wh);
     if (A1) wr32(A1, (uint32_t)wh[0]);
     if (A2) wr32(A2, (uint32_t)wh[1]);

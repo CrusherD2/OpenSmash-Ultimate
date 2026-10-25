@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <windows.h>
-#include <GL/gl.h>
 #include "mx_translate.h"
 
 typedef struct { uint8_t bpb, bw, bh, kind; } Fmt;   /* bytes per block, block width and height in texels; kind: 0 colour, 1 depth, 2 stencil, 3 depth+stencil, 4 compressed */
@@ -29,7 +28,10 @@ typedef struct {                                                                
     uint32_t glname;                       /* nvnTextureBuilderSetGLTextureName (OpenGL interop of the Windows NVN; only stored) */
 } TexBuilder;
 
-typedef struct { GLuint gl; int nh, alias; struct { GLuint smp; uint64_t h; } *h; } TexObj;
+/* The OpenGL back end's data (nvn_gl.c) is kept in these records: TexObj (Tex.o, Tex.views) and Stage.gl, glsl and the
+ * glsl_* fields; only OpenGL compiles the NV assembly text the front end keeps in Stage.text. The Vulkan back end keeps its
+ * own behind .vk. The names are GLuint there, which is unsigned int, as uint32_t is. */
+typedef struct { uint32_t gl; int nh, alias; struct { uint32_t smp; uint64_t h; } *h; } TexObj;
 typedef struct { int target, format, lvl0, nlvl, lay0, nlay, dsmode; uint8_t swz[4]; } EView;
 typedef struct VNode { EView e; TexObj o; struct VNode *next; } VNode;
 typedef struct Tex {
@@ -53,7 +55,7 @@ Tex *nvn_front_tex_first(void);            /* the newest texture record; ->all_n
 typedef struct { Tex *tex; View view; } TexPoolEnt;
 typedef struct { int count; TexPoolEnt *e; uint64_t mempool, offset; } TexPool;
 typedef struct { int count; SamplerParams *e; uint8_t *used; uint64_t mempool, offset; } SamplerPool;
-typedef struct { char *text; int len, state, nbuf; GLuint gl; uint8_t map[16]; uint32_t storage, storage_w, glsl_ssbo_w, local[3], smem_bytes, lmem_bytes, glsl_images, glsl_images_w, glsl_images_r; uint16_t glsl_img_key[8], glsl_img_fmt[8]; const uint8_t *code; int code_len, dumped, glsl_state, glsl_alpha; GLuint glsl; uint32_t glsl_cbufs, glsl_ssbos, glsl_dep, glsl_tex, glsl_key[4], ctl[8]; void *vk; } Stage;   /* state: 0 none, 1 text ready, 2 compiled, 3 rejected, 4 machine code only; vk: the Vulkan back end's last variant of this stage */
+typedef struct { char *text; int len, state, nbuf; uint32_t gl; uint8_t map[16]; uint32_t storage, storage_w, glsl_ssbo_w, local[3], smem_bytes, lmem_bytes, glsl_images, glsl_images_w, glsl_images_r; uint16_t glsl_img_key[8], glsl_img_fmt[8]; const uint8_t *code; int code_len, dumped, glsl_state, glsl_alpha; uint32_t glsl; uint32_t glsl_cbufs, glsl_ssbos, glsl_dep, glsl_tex, glsl_key[4], ctl[8]; void *vk; } Stage;   /* state: 0 none, 1 text ready, 2 compiled, 3 rejected, 4 machine code only; vk: the Vulkan back end's last variant of this stage */
 typedef struct { Stage st[6]; int serial, sample_shading, label_dirty; volatile LONG dead; uint64_t guest; } Prog;
 typedef struct { uint32_t op, size; uint64_t a[7]; } Cmd;                                                    /* a blob may follow */
 typedef struct {
