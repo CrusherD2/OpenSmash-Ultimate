@@ -122,9 +122,4 @@ extern const char *const k_stage_name[6];        /* "vertex", "fragment", "geome
 extern int g_draw_tag, g_dt_idx;                 /* render thread (nvn_dt.h, SSBU_DRAWTAG) */
 void nvn_front_draw_tag_clear(void);
 
-/* ---- the OpenGL back end (nvn_gl.c) as the front end calls it, besides rb_gl */
-void rb_gl_init(void);                           /* render thread, at start: the context; then the front end runs the job loop */
-void rb_gl_report(FILE *out);                    /* the nvn_gl: lines of the exit report */
-void rb_gl_frame_stats(void);                    /* SSBU_GLSTATS=1, every 300 frames */
-void rb_gl_program_set(Prog *p);                 /* guest thread, nvnProgramSetShaders: the stages go to the shader workers */
 #endif

@@ -87,9 +87,10 @@ typedef struct { SyncObj *o; int flags; uint64_t timeout; int result; } SyncJob;
 typedef struct { Tex *tex; View view; int has_view; int region[6]; const void *data; int64_t row_stride; } WriteJob;
 typedef struct { Tex *tex; View view; int has_view, to_pool; int region[6]; void *out; int64_t row_stride, image_stride; } ReadJob;      /* to_pool: nvnTextureInvalidateTexels */
 
-/* Seam step S2: what a render back end is. Every member runs on the render thread with the argument the entry point
- * built (the type is named beside it); the entry points call rb_run / rb_post (g_rb-><member>, argument). A member a
- * back end does not implement stops the game with the NVN operation's name (nvn_vk_missing). */
+/* Seam step S2: what a render back end is. Every member up to idle runs on the render thread with the argument the entry
+ * point built (the type is named beside it); the entry points call rb_run / rb_post (g_rb-><member>, argument). A member a
+ * back end does not implement stops the game with the NVN operation's name (nvn_vk_missing). The members after idle are
+ * called directly, where the comment says. */
 typedef struct RBackend {
     const char *name;                       /* "gl" | "vk" */
     void (*submit)(void *);                 /* SubmitJob: replay the command lists */
@@ -108,6 +109,10 @@ typedef struct RBackend {
     void (*reset_status)(void *);           /* int * */
     void (*sample_grid)(void *);            /* int[2] */
     void (*idle)(void);                     /* before every job (GL: deferred deletion); may be NULL */
+    void (*init)(void);                     /* render thread, once, before its job loop: the context or device for the window (nvn_front_hwnd) */
+    void (*report)(FILE *out);              /* the back end's lines of the exit report (nvn_gl_report) */
+    void (*frame_stats)(void);              /* render thread, every 300 frames after the nvn_perf: lines (pf_frame_mark); may be NULL */
+    void (*program_set)(Prog *p);           /* GUEST thread, nvnProgramSetShaders, once the stages are read: they go to the back end's shader workers */
 } RBackend;
 extern const RBackend rb_gl, rb_vk;
 extern const RBackend *g_rb;
@@ -117,7 +122,6 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog);      /* Vulkan, GUE
  * 0 gl_barrier, 1 container_seen (all), 2 container search, 3 container copy / walk, 4 program_set (all), 5 hashing + job copy,
  * 6 waiting for the shader lock, 7 caller held for the workers. Printed by nvn_front.c prog_set_shaders ("nvn_setsh:"). */
 extern __declspec(thread) long long nvn_setsh_part[8];
-void nvn_vk_program_set(void *prog);        /* Vulkan, GUEST thread, from nvnProgramSetShaders: the program's stages go to the workers (nvn_vk_m4.c) */
 
 /* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_front.c) */
 int nvn_front_fmt(int nvn_format, Fmt *f);                                  /* fmt_get */

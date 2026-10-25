@@ -20,12 +20,10 @@
 static void *volatile g_window_sync;                                  /* the sync object of the last nvnWindowAcquireTexture */
 /* V1 (plan\phases\V1_vulkan.md, seam step S0): SSBU_RENDERER=vk. The render thread then starts nvn_vk.c instead of an
  * OpenGL context and its jobs go through vk_route (end of this file); nothing else in this file changes behaviour. */
-int nvn_vk_init(void *hwnd);
 void nvn_vk_present_black(void);
 void nvn_vk_flush(int finish);
 void nvn_vk_shutdown(void);
 void nvn_vk_missing(const char *what);
-void nvn_vk_report(FILE *out);
 static int g_vk;
 const RBackend *g_rb = &rb_gl;                 /* seam step S2: chosen once in nvn_gl_start (SSBU_RENDERER) */
 static void vk_shutdown_at_exit(void);
@@ -661,7 +659,8 @@ void pf_frame_mark(LONG64 frame) {
     printf(" | MB/frame: streamed %.2f, read back %.2f, hashed %.2f\n", (double)(g_pf_arena_bytes - b0[0]) / 300.0 / 1048576.0, (double)(g_pf_cflush_bytes - b0[1]) / 300.0 / 1048576.0,
            (double)(g_pf_hash_bytes - b0[2]) / 300.0 / 1048576.0);
     b0[0] = g_pf_arena_bytes; b0[1] = g_pf_cflush_bytes; b0[2] = g_pf_hash_bytes;
-    rb_gl_frame_stats();                        /* SSBU_GLSTATS=1: nvn_gl.c */
+    rb_gl.frame_stats();                        /* SSBU_GLSTATS=1 (nvn_gl.c): with either renderer, as before */
+    if (g_rb != &rb_gl && g_rb->frame_stats) g_rb->frame_stats();
     {   /* P3 round 2: the snapshot of all threads (CreateToolhelp32Snapshot) took 30-70 ms on the render thread: one long
          * frame in every 300 (hitch log, "present" scope). It is taken by a helper thread now. */
         static HANDLE ev;
@@ -708,14 +707,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
         int p = e ? atoi(e) : 0;
         if (p > 0) { SetThreadPriority(GetCurrentThread(), p >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL); printf("nvn: render thread priority %s (SSBU_RENDER_PRIO)\n", p >= 2 ? "highest" : "above normal"); }
     }
-    if (g_vk) {                                 /* V1 step S0: no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
-        nvn_vk_init(g_hwnd);
-        hitch_set_render();
-        SetEvent(g_ready_event);
-        render_loop();
-        return 0;
-    }
-    rb_gl_init();                               /* nvn_gl.c: the OpenGL context; also the shader cache and the self-test hook */
+    g_rb->init();                               /* OpenGL: the context, the shader cache, the self-test hook (nvn_gl.c); Vulkan: the device (nvn_vk.c) */
     SetEvent(g_ready_event);
     render_loop();
     return 0;
@@ -745,9 +737,9 @@ void nvn_gl_start(void *hwnd) {
 }
 
 void nvn_gl_report(FILE *out) {
-    rb_gl_report(out);
+    rb_gl.report(out);                          /* the nvn_gl: lines with either renderer, as before: the first ones are the front end's counters */
     hitch_report(out);
-    if (g_vk) { nvn_vk_report(out); vk_shutdown_at_exit(); }
+    if (g_vk) { g_rb->report(out); vk_shutdown_at_exit(); }
 }
 
 /* ================================================================ the NVN entry points */
@@ -968,8 +960,7 @@ static void prog_set_shaders_(Ctx *c) {
         if (s < 0 || len <= 0 || len > (4 << 20)) { logf_limited(&nlog2, 10, "nvn_gl: program #%d shader %d: unexpected program header %08x, code size %d\n", p->serial, i, rd32(data + 0x30), len); continue; }
         p->st[s].code = P(data + 0x30); p->st[s].code_len = len; p->st[s].state = 4; p->st[s].dumped = 0; p->st[s].glsl_state = 0; memcpy(p->st[s].ctl, P(control + 0x6f0), 32);
     }
-    if (g_rb == &rb_vk) { LONG64 tb = pf_now(); nvn_vk_program_set(p); nvn_setsh_part[4] += pf_now() - tb; RET(1); return; }       /* V1 M4: the stages go to the Vulkan workers at once (nvn_vk_m4.c) */
-    rb_gl_program_set(p);                       /* OpenGL (Vulkan returned above): nvn_gl.c */
+    { LONG64 tb = pf_now(); g_rb->program_set(p); nvn_setsh_part[4] += pf_now() - tb; }      /* the stages go to the back end's workers at once (V1 M4: nvn_vk_m4.c; OpenGL: nvn_gl.c) */
     RET(1);
 }
 

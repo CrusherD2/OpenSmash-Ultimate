@@ -2868,7 +2868,7 @@ static void save_bmp(const char *path, Tex *t) {
     fflush(stdout);
 }
 /* SSBU_GLSTATS=1: one line every 300 frames with per-frame counts (pf_frame_mark, nvn_front.c). */
-void rb_gl_frame_stats(void) {
+static void rb_gl_frame_stats(void) {
     static int on = -1;
     static LONG64 z[16];
     if (on < 0) on = getenv("SSBU_GLSTATS") != NULL;
@@ -2995,7 +2995,7 @@ static void job_write_texels(void *arg) {
 }
 /* The render thread's start in OpenGL mode (render_thread, nvn_front.c): the context, the functions beyond 1.1, the
  * state every batch starts from. The front end then runs the job loop. */
-void rb_gl_init(void) {
+static void rb_gl_init(void) {
 #ifdef _WIN32
     PIXELFORMATDESCRIPTOR pfd;
 #else
@@ -3078,7 +3078,7 @@ void rb_gl_init(void) {
     nvn_c4_gl_selftest_hook();                  /* SSBU_NVN_GLTEST: OpenGL self-test of nvn_c4.c, then exit */
 }
 /* The nvn_gl: lines of the exit report (nvn_gl_report, nvn_front.c; printed in Vulkan mode too, as before). */
-void rb_gl_report(FILE *out) {
+static void rb_gl_report(FILE *out) {
     fprintf(out, "\nnvn_gl: %lld frames, %lld batches, %lld command lists (%lld unknown handles), %lld draws (+%lld skipped), %lld clears, %lld copies\n", (long long)g_st.frames,
             (long long)g_st.submits, (long long)g_st.lists, (long long)g_st.stale, (long long)g_st.draws, (long long)g_st.draws_skipped, (long long)g_st.clears, (long long)g_st.copies);
     fprintf(out, "nvn_gl: textures %lld (uploads %lld, %lld MB, views %lld, bindless handles %lld, unmapped formats %lld), framebuffers %lld (%lld incomplete)\n", (long long)g_st.tex_created,
@@ -3158,7 +3158,7 @@ static int pw_queue_prog(Prog *p) {
     return 1;
 }
 /* nvnProgramSetShaders in OpenGL mode (prog_set_shaders_, nvn_front.c), guest thread. */
-void rb_gl_program_set(Prog *p) {
+static void rb_gl_program_set(Prog *p) {
     if (!pw_queue_prog(p))
     for (int s = 0; s < 2; s++) {              /* P3: have the driver's binary ready before the first draw */
         Stage *st = &p->st[s];
@@ -3260,4 +3260,5 @@ static void job_read_texels(void *arg) {
 /* Seam step S2: the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
 static void rb_gl_idle(void) { gl_housekeeping(); }
 const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_present_movie, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,
-                        job_write_texels, job_read_texels, job_housekeeping, job_reset_status, job_grid, rb_gl_idle};
+                        job_write_texels, job_read_texels, job_housekeeping, job_reset_status, job_grid, rb_gl_idle,
+                        rb_gl_init, rb_gl_report, rb_gl_frame_stats, rb_gl_program_set};

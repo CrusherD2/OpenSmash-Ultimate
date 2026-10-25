@@ -4035,8 +4035,10 @@ void nvn_vk_shot_job(void *arg) {
     VTex *vt = t && !t->dead ? t->vk : NULL;
     if (j->shot_fight && vt) { char path[300]; const char *dir = getenv("SSBU_SHOT_DIR"); snprintf(path, sizeof path, "%s%sfight_%05d.bmp", dir ? dir : "", dir ? "/" : "", j->shot_fight); save_bmp_vk(path, vt); printf("shot: fight frame %d saved from window texture %d (pipe, not presented again)%c", j->shot_fight, j->index, 10); }
 }
+/* RBackend init: the device for the window (nvn_vk.c), then the hitch log learns the render thread. */
+static void vk_init(void) { void hitch_set_render(void); nvn_vk_init(nvn_front_hwnd()); hitch_set_render(); }
 const RBackend rb_vk = {"vk", vk_submit, vk_submit_async, vk_present, vk_present_movie, vk_fence, vk_sync_wait, vk_server_wait, vk_sync_drop, vk_flush, vk_finish, vk_write_texels, vk_read_texels, vk_housekeeping,
-                        vk_reset_status, vk_no_grid, vk_idle};
+                        vk_reset_status, vk_no_grid, vk_idle, vk_init, nvn_vk_report, NULL, nvn_vk_program_set};
 
 /* ---------------------------------------------------------------- start and end */
 static VTex *dummy_image(VkImageType type, uint32_t layers, VkFlags flags) {
