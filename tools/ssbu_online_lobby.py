@@ -102,7 +102,7 @@ class OnlineLobby(relay.Lobby):
         c = self.by_ip.get(ip_int(ip))
         if c is not None:
             src = ip_int(src_ip) if src_ip else GATEWAY
-            self.to(c, relay.header(relay.DATA) + struct.pack(">IIHH", src, c.ip, sport, port) + data)
+            self.to(c, self.data_header(c) + struct.pack(">IIHH", src, c.ip, sport, port) + data)   # (in its version)
 
     def new_ip(self):
         ip = super().new_ip()

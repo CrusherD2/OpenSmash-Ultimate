@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Tests for protocol SN version 3 (tools/ssbu_relay.py): version 2's messages on the same port, and
+the room browser, mod sets, matchmaking and rollback relay, for players parted by build,
+simulation version, mod set and lobby code. Fake players on loopback, no game; waits are for
+conditions, not for fixed times.
+
+    python -I tests/test_ssbu_relay_v3.py [-v]"""
+import os
+import secrets
+import socket
+import struct
+import sys
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "tools"))
+import ssbu_relay as R   # noqa: E402
+from test_ssbu_relay import BUILD, OTHER_BUILD, Player, Server, info_of   # noqa: E402
+
+BCAST = R.BROADCASTS[0]
+GAME_PORT = 12345
+SIM = 7   # (a made-up simulation version)
+
+
+def until(cond, wait=3.0):
+    """Whether cond() comes true within wait seconds (looked at every 20 ms)."""
+    end = time.monotonic() + wait
+    while not cond():
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def mods(*entries):
+    """A mod set: (name, hash), ..."""
+    return bytes((len(entries),)) + b"".join(struct.pack(">IB", h, len(n)) + n for n, h in entries)
+
+
+NO_MODS = mods()
+
+
+class V3Player:
+    """A game of protocol SN version 3: what it sends, and an inbox of what came and was not looked at
+    yet. Every packet the lobby sends it must be of version 3."""
+    def __init__(self, server, room="v3test", build=BUILD, name="P", sim=SIM, mod_set=NO_MODS, ext=True, direct=True,
+                 lan=(0, 0), bind="127.0.0.1"):
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.s.bind((bind, 0))
+        except OSError:
+            self.s.close()
+            raise
+        self.addr = ("127.0.0.1", server.port)
+        self.nonce = secrets.token_bytes(8)
+        self.room, self.build, self.name, self.sim, self.mod_set = room, build, name, sim, mod_set
+        self.ext, self.direct, self.lan = ext, direct, lan
+        self.ip = self.cookie = self.flags = None
+        self.inbox = []
+        self.have = 0   # the version of the newest PEERS seen (what its PINGs say)
+
+    def close(self):
+        self.s.close()
+
+    def send(self, kind, body=b""):
+        self.s.sendto(R.header(kind, R.V3) + body, self.addr)
+
+    def read(self, end):
+        """One more packet into the inbox, waiting until end (monotonic time) at most (past it: one that
+        is there already): False if none came."""
+        self.s.settimeout(max(end - time.monotonic(), 0))
+        try:
+            data, _ = self.s.recvfrom(65536)
+        except (socket.timeout, BlockingIOError, ConnectionResetError):
+            return False
+        assert data[:3] == b"SN\x03", ("not version 3", data[:4])
+        self.inbox.append(data)
+        return True
+
+    def first(self, kind, wait=1.0):
+        """The first packet of this kind, from the inbox or within wait seconds (None: none came)."""
+        end, i = time.monotonic() + wait, 0
+        while True:
+            while i < len(self.inbox):
+                if self.inbox[i][3] == kind:
+                    return self.inbox.pop(i)
+                i += 1
+            if not self.read(end):
+                return None
+
+    def all(self, kind, wait=0.4):
+        """Every packet of this kind in the inbox and coming within wait seconds."""
+        end = time.monotonic() + wait
+        while self.read(end):
+            pass
+        out = [p for p in self.inbox if p[3] == kind]
+        self.inbox = [p for p in self.inbox if p[3] != kind]
+        return out
+
+    def join_packet(self):
+        return (R.header(R.JOIN, R.V3) + self.nonce + self.room.encode().ljust(32, b"\0") + self.name.encode().ljust(32, b"\0") +
+                self.build.encode().ljust(40, b"\0") + struct.pack(">I", self.sim) + self.mod_set)
+
+    def join(self, verify=True):
+        self.s.sendto(self.join_packet(), self.addr)
+        w = self.first(R.WELCOME)
+        assert w is not None, "no WELCOME"
+        assert len(w) == 26 and w[4:12] == self.nonce and w[25] == 0, w.hex()
+        self.ip, self.cookie, self.flags = struct.unpack_from(">IQB", w, 12)
+        if verify:
+            assert self.ping() is not None, "no PONG"
+        return self
+
+    def ping(self, have=None):
+        """A PING (with direct connections' part when ext); the PONG: (players, rooms, flags,
+        searching, players of the lobby code), or None."""
+        p = R.header(R.PING, R.V3) + self.nonce + struct.pack(">QQH", 1234, self.cookie, 20)
+        if self.ext:
+            p += struct.pack(">IIHBB", self.have if have is None else have, *self.lan, 1 if self.direct else 0, 0)
+        self.s.sendto(p, self.addr)
+        pong = self.first(R.PONG)
+        if pong is None:
+            return None
+        assert len(pong) == 21 and pong[4:12] == struct.pack(">Q", 1234), pong.hex()
+        return struct.unpack_from(">HHBHH", pong, 12)
+
+    def leave(self):
+        self.send(R.LEAVE, self.nonce)
+
+    def list(self, seq=7, every=None):
+        """The rooms of a LIST (every: with that flags byte): [(host, NetworkInfo, what follows it)]."""
+        self.send(R.LIST, struct.pack(">QI", self.cookie, seq) + (b"" if every is None else bytes((every,))))
+        end = self.first(R.LIST_END)
+        assert end is not None, "no LIST_END"
+        assert struct.unpack_from(">I", end, 4)[0] == seq and len(end) == 9
+        rooms = []
+        for p in self.all(R.LISTING, 0):
+            if struct.unpack_from(">I", p, 4)[0] == seq:
+                rooms.append((struct.unpack_from(">I", p, 8)[0], p[12:12 + R.NI_SIZE], p[12 + R.NI_SIZE:]))
+        assert end[8] == len(rooms), (end[8], len(rooms))
+        return rooms
+
+    def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
+        self.send(R.DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
+
+    def ldn(self, dst, kind, payload):
+        self.data(dst, b"L" + bytes((kind, 0, 0)) + payload, R.LDN_PORT, R.LDN_PORT)
+
+    def advertise(self, session, stations=(), **kw):
+        self.ldn(BCAST, R.LM_ADVERTISE, info_of(session, self.ip, stations, **kw))
+
+    def bcast(self, skip, payload, dst=BCAST):
+        self.send(R.BCAST, bytes((len(skip),)) + b"".join(struct.pack(">I", ip) for ip in skip) +
+                  struct.pack(">IIHH", self.ip, dst, GAME_PORT, GAME_PORT) + payload)
+
+    def datas(self, wait=0.4):
+        """The DATA packets that came: (source, destination, source port, payload)."""
+        return [(*struct.unpack_from(">IIH", p, 4), p[16:]) for p in self.all(R.DATA, wait)]
+
+    def peers(self, wait=0.4):
+        """The newest PEERS that came (within wait seconds): (version, [(address, name, flags, public
+        address and port, LAN address and port, secret)]), or None."""
+        lists = self.all(R.PEERS, wait)
+        if not lists:
+            return None
+        p = lists[-1]
+        cookie, version, count = struct.unpack_from(">QIB", p, 4)
+        assert cookie == self.cookie and len(p) == 17 + count * R.PEER.size, (len(p), count)
+        self.have = version
+        out = []
+        for i in range(count):
+            ip, name, flags, pip, pport, lip, lport, secret = R.PEER.unpack_from(p, 17 + i * R.PEER.size)
+            out.append((ip, name.rstrip(b"\0"), flags, (pip, pport), (lip, lport), secret))
+        return version, out
+
+
+class V3Test(unittest.TestCase):
+    server_options = {}
+
+    def setUp(self):
+        self.server = Server(**self.server_options)
+        self.players = []
+
+    def tearDown(self):
+        for p in self.players:
+            p.close()
+        self.server.stop()
+
+    def player(self, join=True, **kw):
+        p = V3Player(self.server, **kw)
+        self.players.append(p)
+        return p.join() if join else p
+
+    def v2(self, **kw):
+        p = Player(self.server, **kw)
+        self.players.append(p)
+        return p.join()
+
+    def listed(self, session):
+        """Whether the lobby has the room of that session (within a few seconds)."""
+        return until(lambda: session in self.server.lobby.listings)
+
+    def room(self, stations=0, **kw):
+        """A host with a room, and stations that joined it (asked and were accepted)."""
+        host = self.player(name="Host", **kw)
+        session = secrets.token_bytes(16)
+        host.advertise(session)
+        self.assertTrue(self.listed(session))
+        joined = []
+        for _ in range(stations):
+            s = self.player(name="Guest", **kw)
+            s.ldn(host.ip, R.LM_JOIN, session + b"Guest".ljust(32, b"\0") + b"\0\0")
+            self.assertTrue(any(src == s.ip for src, *_ in host.datas()), "the JOIN did not reach the host")
+            joined.append(s)
+            host.advertise(session, [j.ip for j in joined])
+            host.ldn(s.ip, R.LM_ACCEPT, info_of(session, host.ip, [j.ip for j in joined]))
+        for p in [host, *joined]:
+            p.all(R.DATA, 0.2)
+        return host, session, joined
+
+
+class Joining(V3Test):
+    def test_welcome_and_pong(self):
+        p = self.player(join=False)
+        p.join(verify=False)
+        self.assertTrue(p.ip & 0xFFFF0000 == R.SUBNET)
+        self.assertEqual(p.flags & (R.LOBBY | R.INTRODUCES), R.LOBBY | R.INTRODUCES)
+        self.assertEqual(p.ping(), (1, 0, 1, 0, 1))   # (players, rooms, flags, searching, players of the code)
+        c = self.server.lobby.by_ip[p.ip]
+        self.assertTrue(c.verified)
+        self.assertIs(c.wire, self.server.lobby.sn3)
+        self.assertEqual(c.part, ("SN3", BUILD.encode(), SIM, (), "v3test"))
+
+    def test_version_2_as_before(self):
+        """A game of version 2 in the same lobby hears version 2, in its own layouts."""
+        self.player()
+        old = self.v2()
+        old.send(old.ping_packet())
+        pong = old.first(R.PONG)
+        self.assertEqual((pong[:3], len(pong)), (b"SN\x02", 17))
+        old.send(old.join_packet())
+        w = old.first(R.WELCOME)
+        self.assertEqual((w[:3], len(w), w[24]), (b"SN\x02", 26, R.LOBBY | R.INTRODUCES))
+
+    def test_other_versions_told(self):
+        p = self.player(join=False)
+        p.s.sendto(b"SN\x04" + p.join_packet()[3:], p.addr)
+        p.s.settimeout(1.0)
+        r, _ = p.s.recvfrom(4096)
+        self.assertEqual((r[:4], r[12]), (b"SN\x04" + bytes((R.REJECT,)), 2))
+        self.assertIn(b"lobby 2 or 3, you 4", r)
+
+    def test_short_join_ignored(self):
+        p = self.player(join=False)
+        p.s.sendto(p.join_packet()[:R.JOIN_SIZE + 4], p.addr)   # (no mod set)
+        self.assertIsNone(p.first(R.WELCOME, 0.3))
+        self.assertEqual(len(self.server.lobby.by_addr), 0)
+
+    def test_bad_mod_set_refused(self):
+        for bad in (bytes((R.MODS_MAX + 1,)) + bytes(5 * (R.MODS_MAX + 1)),   # (too many)
+                    mods((b"x" * (R.MOD_NAME + 1), 1)),                         # (a name too long)
+                    mods((b"Mod", 1))[:-1]):                                     # (cut short)
+            p = self.player(join=False, mod_set=bad)
+            p.s.sendto(p.join_packet(), p.addr)
+            r = p.first(R.REJECT)
+            self.assertIsNotNone(r, bad.hex())
+            self.assertEqual(r[12], 5)
+        self.assertEqual(len(self.server.lobby.by_addr), 0)
+
+    def test_any_build(self):
+        """Version 3 lets in every build (its players meet only their own); version 2, 13.0.5's only."""
+        self.assertIsNotNone(self.player(build=OTHER_BUILD).ip)
+        old = Player(self.server, build=OTHER_BUILD)
+        self.players.append(old)
+        old.send(old.join_packet())
+        self.assertEqual(old.first(R.REJECT)[12], 4)
+
+    def test_another_version_from_the_same_place(self):
+        """A game that falls back to version 2 (or goes to 3) with the same nonce starts anew."""
+        p = self.player()
+        first = p.ip
+        old = Player(self.server)
+        old.s.close()
+        old.s, old.nonce = p.s, p.nonce
+        old.send(old.join_packet())
+        w = old.first(R.WELCOME)
+        self.assertEqual(w[:3], b"SN\x02")
+        old.ip, old.cookie = struct.unpack_from(">IQ", w, 12)
+        self.assertNotEqual(old.ip, first)
+        self.assertEqual([c.wire for c in self.server.lobby.by_addr.values()], [self.server.lobby.sn])
+        p.send(R.PING, p.nonce + struct.pack(">QQH", 1, p.cookie, 20))   # (version 3's, with the old cookie)
+        old.s.settimeout(0.3)
+        self.assertRaises(socket.timeout, old.s.recvfrom, 4096)
+
+    def test_leave(self):
+        p = self.player()
+        p.leave()
+        self.assertTrue(until(lambda: len(self.server.lobby.by_addr) == 0))
+
+
+class Keys(V3Test):
+    """Players meet by build, simulation version, mod set and lobby code; never by OS or CPU (no
+    field says them)."""
+    def test_same_key_meet(self):
+        host, session, _ = self.room(mod_set=mods((b"Alpha", 1), (b"Beta", 2)))
+        for kw in ({"mod_set": mods((b"Beta", 2), (b"Alpha", 1))},           # (listed in another order)
+                   {"mod_set": mods((b"alpha", 1), (b"Beta (2)", 2))},       # (named otherwise: the hashes count)
+                   {"mod_set": mods((b"Alpha", 1), (b"Beta", 2)), "build": BUILD.lower()}):
+            p = self.player(**kw)
+            self.assertEqual([h for h, *_ in p.list()], [host.ip], kw)
+
+    def test_apart(self):
+        host, session, _ = self.room(mod_set=mods((b"Alpha", 1)))
+        for kw in ({"sim": SIM + 1}, {"mod_set": NO_MODS}, {"mod_set": mods((b"Alpha", 2))},
+                   {"mod_set": mods((b"Alpha", 1), (b"Alpha", 1))}, {"build": OTHER_BUILD}, {"room": "other"}):
+            p = self.player(**{"mod_set": mods((b"Alpha", 1)), **kw})
+            self.assertEqual(p.list(), [], kw)
+            p.ldn(host.ip, R.LM_JOIN, session + bytes(34))
+            p.data(host.ip, b"hello")
+        self.assertEqual(host.datas(0.3), [])
+
+    def test_apart_from_version_2(self):
+        """Version 2's players are a pool of their own: their games say no simulation version or mods."""
+        old = self.v2(room="v3test")
+        session = secrets.token_bytes(16)
+        old.advertise(session)
+        self.assertTrue(self.listed(session))
+        p = self.player(mod_set=NO_MODS)
+        self.assertEqual(p.list(), [])
+        p.ldn(old.ip, R.LM_JOIN, session + bytes(34))
+        self.assertEqual(old.datas(0.3), [])
+        host, mine, _ = self.room()
+        self.assertEqual(old.list(), [])
+        self.assertEqual(self.server.lobby.listings[mine].owner.part[0], "SN3")
+
+
+class OnlineLobby(unittest.TestCase):
+    def test_game_server_answers_in_version_3(self):
+        """The online lobby's game server (NEX) writes to a game of version 3 in version 3."""
+        import tempfile
+        import ssbu_online_lobby as online
+        with tempfile.TemporaryDirectory() as tmp:
+            lobby = online.OnlineLobby(online.parse_args(["--state", tmp, "--nex-log", "0"]))
+            sent = []
+            lobby.send = lambda data, at, wire=None: sent.append((data, wire))
+            c = R.Client(("127.0.0.1", 5), b"n" * 8, R.SUBNET + 2, "Tester", ("SN3", b"b", SIM, (), "c"), time.monotonic(),
+                         lobby.o, lobby.sn3)
+            lobby.by_ip[c.ip] = c
+            lobby.nex_send((R.ip_text(c.ip), 1000), 60000, b"nex")
+            self.assertEqual(sent, [(R.header(R.DATA, R.V3) + struct.pack(">IIHH", online.GATEWAY, c.ip, 60000, 1000) + b"nex",
+                                     lobby.sn3)])
+
+
+if __name__ == "__main__":
+    unittest.main()
