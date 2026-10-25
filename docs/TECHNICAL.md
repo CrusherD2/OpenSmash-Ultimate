@@ -369,7 +369,7 @@ python tools/dev/difftest.py --synthetic --per-template 4 --states 32 --draws 80
 python tools/dev/difftest.py --synthetic --toolchain rosetta
 ```
 
-[`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one, else for CRC-32 tables made on first use) against the bitwise CRC and the standard check values.
+[`tests/test_recomp_helpers.py`](../tests/test_recomp_helpers.py) builds helpers of `runtime/recomp.h` the same ways (and on an Apple silicon Mac under Rosetta 2 too) and checks them against their definitions: frsqrte's estimate against the architecture's loop for every input, and the CRC-32 / CRC-32C helpers (the host's instruction where it has one, else for CRC-32 tables made on first use) against the bitwise CRC and the standard check values, and NaN results: the floating-point forms the lifter emits, with the x86 builds' NaN checks on every host, against Arm's NaN rules for made-up operands (on arm64 the instructions themselves too).
 
 [`tests/test_exclusive_pairs.py`](../tests/test_exclusive_pairs.py) builds lifted `ldxp`/`stxp` sequences the same ways. It checks each sequence's registers, status and memory. Threads counting on one 16-byte and one 8-byte counter must lose no update, and a 16-byte read while other threads store must never return half of one store and half of another. On an arm64 Mac the same instruction words also run on the CPU, and the results must match.
 
