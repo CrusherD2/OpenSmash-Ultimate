@@ -5,9 +5,9 @@
  * unmodified on host threads. Register conventions follow the SDK's wrappers: arguments in
  * x0-x7, the result code in w0, further outputs in x1 onwards.
  *
- * Blocking is deliberately simple for now: one lock guards all kernel state and one
- * condition variable is broadcast on every change, so each waiter re-checks its own
- * condition. Correct, not fast.
+ * One lock guards all kernel state. A blocked thread sleeps on its own condition variable, in
+ * the wait queue of what it waits for: only a signal of that, a cancel of its WaitSynchronization
+ * or its timeout wakes it (see "wait queues").
  *
  * Calls that would talk to a system service (IPC) are not implemented here: they stop the
  * run and say so, since services are replaced at the SDK function level instead. */
@@ -36,6 +36,11 @@ enum { OBJ_FREE, OBJ_THREAD, OBJ_EVENT, OBJ_SESSION, OBJ_MEMORY };
 #define HOST_STACK (256ull << 20)    /* guest call depth is host call depth */
 #define MAIN_STACK (1u << 20)     /* from the program's metadata */
 
+/* what a thread waits for in the kernel (KThread.wait; see "wait queues") */
+enum { WAIT_NONE, WAIT_OBJECTS, WAIT_MUTEX, WAIT_CONDITION, WAIT_ADDRESS };
+
+typedef struct KWaitNode KWaitNode;
+
 typedef struct KThread {
     u32 handle;
     HANDLE host;
@@ -43,27 +48,29 @@ typedef struct KThread {
     u64 entry, arg, stack_top, tlr, id;
     i32 priority, core;
     int started, exited, cancelled;
-    u64 mutex_addr;     /* userspace mutex this thread is queued on, or 0 */
-    u32 mutex_tag;      /* value to store in the mutex word when it is handed over */
-    u64 cv_key;         /* condition variable this thread waits on, or 0 */
-    u64 cv_mutex;       /* the mutex to re-acquire when that wait is signalled */
-    u64 arb_addr;       /* address-arbiter address this thread waits on, or 0 */
-    u64 order;          /* arrival order, so hand-over is first-come-first-served */
-    CONDITION_VARIABLE woken;   /* what this thread sleeps on (kwait): wakes go to the threads concerned */
-    u64 wait_handles;   /* while in WaitSynchronization: its handle array (guest) and count */
+    int wait;                   /* WAIT_NONE, or what the thread waits for now */
+    struct WaitQueue *queue;    /* (a mutex, a condition variable, an address) the queue it is in */
+    struct KThread *qprev, *qnext;   /* its neighbours there */
+    KWaitNode *nodes;           /* (WaitSynchronization) its place in each object's queue, one a handle */
     u32 wait_count;
+    u32 mutex_tag;      /* value to store in the mutex word when it is handed over */
+    u64 cv_mutex;       /* the mutex to re-acquire when a condition variable wait is signalled */
+    u64 wakes;          /* how often it was woken (kwake): the tests check a signal wakes only its own waiters */
+    CONDITION_VARIABLE woken;   /* what this thread sleeps on (kwait): wakes go to the threads concerned */
     struct KThread *next_dead;   /* (recycling) the next thread waiting for its host thread to end */
 } KThread;
 
 /* refs: handles open on it; waits: WaitSynchronization calls holding it; gen: how often its slot
- * was used, in the handle's upper bits (these three for recycling: see new_handle) */
-typedef struct KObject { int type, signaled; KThread *thread; void *session; u32 gen, refs, waits; } KObject;
+ * was used, in the handle's upper bits (these three for recycling: see new_handle); first, last:
+ * its queue of WaitSynchronization waiters */
+typedef struct KObject { int type, signaled; KThread *thread; void *session; u32 gen, refs, waits; KWaitNode *first, *last; } KObject;
+/* a WaitSynchronization's place in one object's queue (on the waiting thread's stack) */
+struct KWaitNode { KThread *thread; KObject *object; KWaitNode *prev, *next; u32 index; };
 typedef struct Region { u64 base, size; u32 state, perm; } Region;
 
 static CRITICAL_SECTION klock;
 /* The threads running or named by a handle (an exited one stays while its handle is open: it may
- * still be waited on), or without recycling every thread the kernel made. Waits and hand-overs
- * look through these rather than through every handle. */
+ * still be waited on), or without recycling every thread the kernel made. */
 static KThread *threads[1024];
 static u32 nthreads;
 static KObject objects[4096];
@@ -71,7 +78,7 @@ static KObject objects[4096];
 static Region regions[REGIONS];
 static u32 region_count;
 static struct { u64 dst, src, size; } maps[1024];
-static u64 heap_size, tlr_next = KERNEL_BASE, next_thread_id = 1, wait_order;
+static u64 heap_size, tlr_next = KERNEL_BASE, next_thread_id = 1;
 #define TLR_AREA 0x1000000ull                /* thread-local regions: a page each from KERNEL_BASE */
 static int recycle;                          /* SSBU_THREAD_RECYCLING=1 (see "thread lifetime") */
 static KThread *dead;                        /* (recycling) threads freed but for their host thread */
@@ -90,7 +97,7 @@ static u64 deadline_of(i64 timeout_ns) { return timeout_ns < 0 ? ~0ull : now_ns(
  * has passed. Each thread sleeps on its own condition variable: a mutex handed over, a
  * condition variable signalled, an event set wakes just the threads waiting for it (one shared
  * one, woken in full, sent every sleeping thread round the kernel lock at every change). The
- * callers look at their condition again either way. */
+ * callers look at their wait again either way (the host can wake a thread for nothing). */
 static int kwait(KThread *me, u64 deadline) {
     DWORD ms = INFINITE;
     if (deadline != ~0ull) {
@@ -102,14 +109,90 @@ static int kwait(KThread *me, u64 deadline) {
     return 1;
 }
 
-static void kwake(KThread *t) { WakeConditionVariable(&t->woken); }
+static void kwake(KThread *t) { t->wakes++; WakeConditionVariable(&t->woken); }
 
-/* Object `handle` became signalled: wake the threads waiting for it in WaitSynchronization. */
-static void kwake_handle(u32 handle) {
-    for (u32 i = 0; i < nthreads; i++) {
-        KThread *t = threads[i];
-        for (u32 k = 0; k < t->wait_count; k++)
-            if (ld32(t->wait_handles + 4ull * k) == handle) { kwake(t); break; }
+/* ---- wait queues -------------------------------------------------------------------
+ * A blocked thread is in the queue of what it waits for, and a signal wakes only the threads in
+ * that queue: a userspace mutex, a condition variable and an arbiter address have one each (by
+ * address, while a thread waits there), a kernel object has its own for WaitSynchronization (a
+ * wait on several objects is in each of their queues). First come, first served, as on the
+ * console among threads of one priority (priorities are not looked at here). Whoever wakes a
+ * thread takes it out of its queues first and sets its wait back to WAIT_NONE, so a thread's wait
+ * - what it waits for and where in the queue - is all in its KThread. (A woken WaitSynchronization
+ * looks at its objects again, as before: one cleared before it runs is waited on again, where on
+ * the console the signal would have ended the wait.) */
+#define QUEUES 1024   /* (a waiting thread is in one at most) */
+typedef struct WaitQueue { struct WaitQueue *next; KThread *first, *last; u64 key; u32 count; int kind; } WaitQueue;
+static WaitQueue queue_pool[QUEUES], *spare_queues, *queues[QUEUES];
+static u32 queues_made;
+
+static WaitQueue **queue_slot(int kind, u64 key) {
+    WaitQueue **p = &queues[((key ^ (u64)kind << 60) * 0x9E3779B97F4A7C15ull) >> 54];
+    while (*p && ((*p)->kind != kind || (*p)->key != key)) p = &(*p)->next;
+    return p;
+}
+
+/* The first thread waiting for (kind, key), and how many wait there; NULL if none. */
+static KThread *first_waiting(int kind, u64 key, u32 *count) {
+    WaitQueue *q = *queue_slot(kind, key);
+    *count = q ? q->count : 0;
+    return q ? q->first : NULL;
+}
+
+/* `t` waits for (kind, key) from now on, behind the threads waiting there already. */
+static void enqueue(KThread *t, int kind, u64 key) {
+    WaitQueue **p = queue_slot(kind, key), *q = *p;
+    if (!q) {
+        if (spare_queues) { q = spare_queues; spare_queues = q->next; }
+        else if (queues_made < QUEUES) q = &queue_pool[queues_made++];
+        else rt_fatal("kernel: out of wait queues");
+        *q = (WaitQueue){NULL, NULL, NULL, key, 0, kind};
+        *p = q;
+    }
+    t->wait = kind;
+    t->queue = q;
+    t->qprev = q->last;
+    t->qnext = NULL;
+    if (q->last) q->last->qnext = t; else q->first = t;
+    q->last = t;
+    q->count++;
+}
+
+/* `t`'s wait for a mutex, a condition variable or an address is over: out of its queue (a queue
+ * left empty goes back to the spares). */
+static void unqueue(KThread *t) {
+    WaitQueue *q = t->queue;
+    if (t->qprev) t->qprev->qnext = t->qnext; else q->first = t->qnext;
+    if (t->qnext) t->qnext->qprev = t->qprev; else q->last = t->qprev;
+    t->wait = WAIT_NONE;
+    t->queue = NULL;
+    t->qprev = t->qnext = NULL;
+    if (--q->count == 0) {
+        *queue_slot(q->kind, q->key) = q->next;
+        q->next = spare_queues;
+        spare_queues = q;
+    }
+}
+
+/* `t`, in WaitSynchronization, out of every object's queue. */
+static void unqueue_objects(KThread *t) {
+    for (u32 i = 0; i < t->wait_count; i++) {
+        KWaitNode *n = &t->nodes[i];
+        if (n->prev) n->prev->next = n->next; else n->object->first = n->next;
+        if (n->next) n->next->prev = n->prev; else n->object->last = n->prev;
+    }
+    t->wait = WAIT_NONE;
+    t->nodes = NULL;
+    t->wait_count = 0;
+}
+
+/* Object `o` became signalled: every thread waiting for it in WaitSynchronization is woken, first
+ * come first (and leaves its other objects' queues: one signal wakes it once). */
+static void notify(KObject *o) {
+    while (o->first) {
+        KThread *t = o->first->thread;
+        unqueue_objects(t);
+        kwake(t);
     }
 }
 
@@ -126,7 +209,9 @@ static u32 new_handle(int type, KThread *t) {
     for (u32 i = 1; i < 4096; i++)
         if (objects[i].type == OBJ_FREE) {
             u32 gen = objects[i].gen % 0x7FFF + 1;
-            objects[i] = (KObject){type, 0, t, NULL, gen, 1, 0};
+            /* (the queue stays: without recycling a wait on a handle closed meanwhile waits on the
+             * slot's next object, as when waits matched handle values) */
+            objects[i] = (KObject){type, 0, t, NULL, gen, 1, 0, objects[i].first, objects[i].last};
             if (recycle && i >= 2048 && !said_half_full) say_half_full();
             return recycle ? gen << 15 | i : 0xA000 + i;
         }
@@ -453,7 +538,7 @@ static _Noreturn void exit_thread(KThread *t) {
     EnterCriticalSection(&klock);
     t->exited = 1;
     objects[index_of(t->handle)].signaled = 1;
-    kwake_handle(t->handle);
+    notify(&objects[index_of(t->handle)]);
     if (recycle) release(index_of(t->handle));   /* (freed now if its handle was closed already) */
     LeaveCriticalSection(&klock);
 #ifndef _WIN32
@@ -498,39 +583,25 @@ Cpu *kernel_main_thread(u32 *handle) {
 /* ---- userspace mutexes (svcArbitrateLock / Unlock) --------------------------------
  * The mutex word holds the owner's thread handle, plus WAITERS when the kernel has queued
  * threads on it. Unlocking hands the mutex directly to the longest-waiting thread. */
-static KThread *threads_waiting(u64 KThread_field_offset, u64 addr, u32 *count) {
-    KThread *first = NULL;
-    *count = 0;
-    for (u32 i = 0; i < nthreads; i++) {
-        KThread *t = threads[i];
-        if (t->exited || *(u64 *)((u8 *)t + KThread_field_offset) != addr) continue;
-        ++*count;
-        if (!first || t->order < first->order) first = t;
-    }
-    return first;
-}
-#define WAITING(field, addr, count) threads_waiting(offsetof(KThread, field), addr, count)
-
 static void mutex_release(u64 addr) {
     u32 count;
-    KThread *next = WAITING(mutex_addr, addr, &count);
+    KThread *next = first_waiting(WAIT_MUTEX, addr, &count);
     if (!next) { st32(addr, 0); return; }
-    next->mutex_addr = 0;   /* this is what the waiter is watching for */
+    unqueue(next);   /* this is what the waiter is watching for */
     st32(addr, next->mutex_tag | (count > 1 ? WAITERS : 0));
     kwake(next);
 }
 
-/* Give `t` the mutex if it is free, otherwise queue it behind the current owner. */
-static void mutex_acquire_or_queue(KThread *t, u64 addr, u32 tag) {
+/* Give `t` the mutex if it is free (1), otherwise queue it behind the current owner (0). */
+static int mutex_acquire_or_queue(KThread *t, u64 addr, u32 tag) {
     for (;;) {
         u32 v = ld32(addr);
         if (v == 0) {
-            if (cas32(addr, 0, tag)) return;
+            if (cas32(addr, 0, tag)) return 1;
         } else if (cas32(addr, v, v | WAITERS)) {
             t->mutex_tag = tag;
-            t->order = ++wait_order;
-            t->mutex_addr = addr;
-            return;
+            enqueue(t, WAIT_MUTEX, addr);
+            return 0;
         }
     }
 }
@@ -574,29 +645,46 @@ static u32 get_info(Cpu *c, u32 id, u64 sub, u64 *out) {
     return R_OK;
 }
 
+/* An object signalled ends the call (the first in the handles), otherwise a cancel, otherwise a
+ * timeout of 0; else the thread waits in each object's queue until a signal of one of them
+ * (notify), a cancel or the deadline wakes it, and looks again. */
 static u32 wait_objects(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
     KThread *me = c->thread;
     u64 deadline = deadline_of(timeout);
-    for (;;) {
-        for (u32 i = 0; i < count; i++) {
+    KWaitNode local[64], *nodes = count <= 64 ? local : malloc(count * sizeof *nodes);
+    if (!nodes) rt_fatal("kernel: svcWaitSynchronization on %u handles", count);
+    u32 r = ~0u;
+    while (r == ~0u) {
+        for (u32 i = 0; i < count && r == ~0u; i++) {
             u32 h = ld32(handles + 4 * i), k = recycle ? index_of(h) : slot_of(h);   /* (recycling: held, closed or not) */
-            if (!k) return R_INVALID_HANDLE;
-            if (objects[k].signaled) { *index = i; return R_OK; }
+            if (!k) r = R_INVALID_HANDLE;
+            else if (objects[k].signaled) { *index = i; r = R_OK; }
+            else nodes[i] = (KWaitNode){me, &objects[k], NULL, NULL, i};
         }
-        if (me->cancelled) { me->cancelled = 0; return R_CANCELLED; }
-        if (timeout == 0) return R_TIMEOUT;
-        me->wait_handles = handles;
+        if (r != ~0u) break;
+        if (me->cancelled) { me->cancelled = 0; r = R_CANCELLED; break; }
+        if (timeout == 0) { r = R_TIMEOUT; break; }
+        for (u32 i = 0; i < count; i++) {   /* (at the end of each queue: first come first) */
+            KObject *o = nodes[i].object;
+            nodes[i].prev = o->last;
+            if (o->last) o->last->next = &nodes[i]; else o->first = &nodes[i];
+            o->last = &nodes[i];
+        }
+        me->wait = WAIT_OBJECTS;
+        me->nodes = nodes;
         me->wait_count = count;
         int more = kwait(me, deadline);
-        me->wait_count = 0;
-        if (!more) return R_TIMEOUT;
+        if (me->wait == WAIT_OBJECTS) unqueue_objects(me);   /* (woken by the deadline, or by the host for nothing) */
+        if (!more) r = R_TIMEOUT;
     }
+    if (nodes != local) free(nodes);
+    return r;
 }
 
 /* With recycling the wait holds its objects, as the console's does: one whose handle another
  * thread closes meanwhile is still waited on (an exiting thread whose handle was closed is still
  * seen signalled), and is freed when the wait ends. (The handle array is the waiting thread's
- * own: it does not change under the wait - kwake_handle reads it too.) */
+ * own: it does not change under the wait.) */
 static u32 wait_synchronization(Cpu *c, u64 handles, u32 count, i64 timeout, u32 *index) {
     if (!recycle) return wait_objects(c, handles, count, timeout, index);
     for (u32 i = 0; i < count; i++)
@@ -620,16 +708,15 @@ static u32 wait_for_address(Cpu *c, u64 addr, u32 type, i32 value, i64 timeout) 
     if (type == 1) st32(addr, (u32)(v - 1));
     if (timeout == 0) return R_TIMEOUT;
     u64 deadline = deadline_of(timeout);
-    me->order = ++wait_order;
-    me->arb_addr = addr;
-    while (me->arb_addr)
-        if (!kwait(me, deadline)) { me->arb_addr = 0; return R_TIMEOUT; }
+    enqueue(me, WAIT_ADDRESS, addr);
+    while (me->wait == WAIT_ADDRESS)
+        if (!kwait(me, deadline)) { unqueue(me); return R_TIMEOUT; }
     return R_OK;
 }
 
 static u32 signal_to_address(u64 addr, u32 type, i32 value, i32 count) {
     u32 waiting;
-    KThread *t = WAITING(arb_addr, addr, &waiting);
+    KThread *t = first_waiting(WAIT_ADDRESS, addr, &waiting);
     if (type == 1) {
         if ((i32)ld32(addr) != value) return R_INVALID_STATE;
         st32(addr, (u32)(value + 1));
@@ -640,9 +727,9 @@ static u32 signal_to_address(u64 addr, u32 type, i32 value, i32 count) {
         st32(addr, (u32)next);
     } else if (type != 0) return R_INVALID_ENUM;
     for (i32 n = 0; t && (count <= 0 || n < count); n++) {
-        t->arb_addr = 0;
+        unqueue(t);
         kwake(t);
-        t = WAITING(arb_addr, addr, &waiting);
+        t = first_waiting(WAIT_ADDRESS, addr, &waiting);
     }
     return R_OK;
 }
@@ -655,29 +742,27 @@ static u32 wait_condition(Cpu *c, u64 mutex, u64 key, u32 tag, i64 timeout) {
     st32(key, 1);
     me->mutex_tag = tag;
     me->cv_mutex = mutex;
-    me->order = ++wait_order;
-    me->cv_key = key;
-    while (me->cv_key)
+    enqueue(me, WAIT_CONDITION, key);
+    while (me->wait == WAIT_CONDITION)
         if (!kwait(me, deadline)) {
-            if (!me->cv_key) break;                 /* signalled just as the wait expired */
-            me->cv_key = 0;
-            WAITING(cv_key, key, &others);
+            unqueue(me);
+            first_waiting(WAIT_CONDITION, key, &others);
             if (!others) st32(key, 0);
             return R_TIMEOUT;                       /* the caller re-locks the mutex itself */
         }
-    while (me->mutex_addr) kwait(me, ~0ull);        /* the signaller queued us on the mutex */
+    while (me->wait == WAIT_MUTEX) kwait(me, ~0ull);   /* the signaller queued us on the mutex */
     return R_OK;
 }
 
 static void signal_condition(u64 key, i32 count) {
     u32 waiting;
-    KThread *t = WAITING(cv_key, key, &waiting);
+    KThread *t = first_waiting(WAIT_CONDITION, key, &waiting);
     for (i32 n = 0; t && (count <= 0 || n < count); n++) {
-        t->cv_key = 0;
-        /* the woken thread must own the mutex again before it returns */
-        mutex_acquire_or_queue(t, t->cv_mutex, t->mutex_tag);
-        kwake(t);   /* (queued on the mutex instead, it waits on there) */
-        t = WAITING(cv_key, key, &waiting);
+        unqueue(t);
+        /* the woken thread must own the mutex again before it returns: queued on it instead, it
+         * is woken when the mutex is handed to it */
+        if (mutex_acquire_or_queue(t, t->cv_mutex, t->mutex_tag)) kwake(t);
+        t = first_waiting(WAIT_CONDITION, key, &waiting);
     }
     if (!t) st32(key, 0);
 }
@@ -802,7 +887,7 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x11:     /* SignalEvent(handle) */
         if (!(o = object_of(c, (u32)x[0], OBJ_EVENT))) { x[0] = R_INVALID_HANDLE; break; }
         o->signaled = 1;
-        kwake_handle((u32)x[0]);
+        notify(o);
         x[0] = R_OK;
         break;
     case 0x12:     /* ClearEvent(handle) */
@@ -831,18 +916,20 @@ void rt_svc(Cpu *c, u32 n) {
         x[1] = index;
         break;
     }
-    case 0x19:     /* CancelSynchronization(thread) */
+    case 0x19:     /* CancelSynchronization(thread): its WaitSynchronization ends, now or the next */
         if (!(o = object_of(c, (u32)x[0], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
         o->thread->cancelled = 1;
-        kwake(o->thread);
+        if (o->thread->wait == WAIT_OBJECTS) {   /* (only that wait: a mutex, a condition variable, an address wait on) */
+            unqueue_objects(o->thread);
+            kwake(o->thread);
+        }
         x[0] = R_OK;
         break;
     case 0x1A:     /* ArbitrateLock(owner handle, mutex address, own handle) */
         if (ld32(x[1]) == ((u32)x[0] | WAITERS)) {
             me->mutex_tag = (u32)x[2];
-            me->order = ++wait_order;
-            me->mutex_addr = x[1];
-            while (me->mutex_addr) kwait(me, ~0ull);
+            enqueue(me, WAIT_MUTEX, x[1]);
+            while (me->wait == WAIT_MUTEX) kwait(me, ~0ull);
         }
         x[0] = R_OK;
         break;
@@ -895,6 +982,11 @@ void rt_svc(Cpu *c, u32 n) {
 /* For diagnosis: where is every guest thread right now? */
 DWORD kernel_lock_owner(void) { return (DWORD)(uintptr_t)klock.OwningThread; }
 
+static const char *wait_state(const KThread *t) {
+    return t->wait == WAIT_MUTEX ? "waiting for a mutex" : t->wait == WAIT_CONDITION ? "waiting on a condition" :
+           t->wait == WAIT_ADDRESS ? "waiting on an address" : "running or in a system call";
+}
+
 /* For a freeze report: every guest thread's state and host thread id (its stack is in the host
  * threads' part of the report). Without waiting for the kernel's lock: says so when it is held. */
 void kernel_thread_states(void (*line)(const char *text)) {
@@ -907,9 +999,7 @@ void kernel_thread_states(void (*line)(const char *text)) {
     for (u32 i = 1; i < 4096; i++) {
         KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
         if (!t || !t->started || t->exited || !t->host) continue;
-        const char *state = t->mutex_addr ? "waiting for a mutex" : t->cv_key ? "waiting on a condition" :
-                            t->arb_addr ? "waiting on an address" : "running or in a system call";
-        snprintf(text, sizeof text, "  guest thread %llu (host thread %lu, priority %d): %s\n", t->id, (unsigned long)GetThreadId(t->host), t->priority, state);
+        snprintf(text, sizeof text, "  guest thread %llu (host thread %lu, priority %d): %s\n", t->id, (unsigned long)GetThreadId(t->host), t->priority, wait_state(t));
         line(text);
     }
     LeaveCriticalSection(&klock);
@@ -920,9 +1010,7 @@ void kernel_dump_threads(void) {
     for (u32 i = 1; i < 4096; i++) {
         KThread *t = objects[i].type == OBJ_THREAD ? objects[i].thread : NULL;
         if (!t || !t->started || t->exited || !t->host) continue;
-        const char *state = t->mutex_addr ? "waiting for a mutex" : t->cv_key ? "waiting on a condition" :
-                            t->arb_addr ? "waiting on an address" : "running or in a system call";
-        fprintf(stderr, "  thread %llu (priority %d): %s\n", t->id, t->priority, state);
+        fprintf(stderr, "  thread %llu (priority %d): %s\n", t->id, t->priority, wait_state(t));
         rt_backtrace_thread(t->host, 6);
     }
     LeaveCriticalSection(&klock);
@@ -962,7 +1050,7 @@ u32 kernel_create_event(void) {
 void kernel_signal_event(u32 handle) {
     EnterCriticalSection(&klock);
     u32 k = slot_of(handle);
-    if (k && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; kwake_handle(handle); }
+    if (k && objects[k].type == OBJ_EVENT) { objects[k].signaled = 1; notify(&objects[k]); }
     LeaveCriticalSection(&klock);
 }
 
