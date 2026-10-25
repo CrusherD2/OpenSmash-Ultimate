@@ -142,6 +142,22 @@ class V3Player:
         assert end[8] == len(rooms), (end[8], len(rooms))
         return rooms
 
+    def rooms(self, seq=3, cookie=None):
+        """The room browser: [(host, players, most, flags, host name, build, simulation version, mods)]."""
+        self.send(R.ROOMS, struct.pack(">QI", self.cookie if cookie is None else cookie, seq))
+        end = self.first(R.ROOMS_END)
+        assert end is not None, "no ROOMS_END"
+        assert struct.unpack_from(">I", end, 4)[0] == seq and len(end) == 9
+        out = []
+        for p in self.all(R.ROOM_INFO, 0):
+            b = p[4:]
+            if struct.unpack_from(">I", b)[0] == seq:
+                host, players, most, flags = struct.unpack_from(">IBBB", b, 4)
+                out.append((host, players, most, flags, b[11:43].rstrip(b"\0"), b[43:83].rstrip(b"\0"),
+                            struct.unpack_from(">I", b, 83)[0], b[87:]))
+        assert end[8] == len(out), (end[8], len(out))
+        return out
+
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
@@ -334,6 +350,50 @@ class Keys(V3Test):
         host, mine, _ = self.room()
         self.assertEqual(old.list(), [])
         self.assertEqual(self.server.lobby.listings[mine].owner.part[0], "SN3")
+
+
+class RoomBrowser(V3Test):
+    """ROOMS: every room of the lobby code, of every key, with what the game needs to say why it can
+    or can't join one; LIST's flag 1 the same in the game's own Rooms List."""
+    def setUp(self):
+        super().setUp()
+        self.mine = mods((b"Alpha", 1))
+        self.a, self.sa, _ = self.room(mod_set=self.mine)                       # (of the asker's key)
+        self.b = self.player(name="Sim", mod_set=self.mine, sim=SIM + 1)         # (another simulation version)
+        self.c = self.player(name="Mods", mod_set=mods((b"Alpha", 2)))          # (another copy of the mod)
+        self.d = self.player(name="Code", mod_set=self.mine, room="elsewhere")   # (another lobby code)
+        self.old = self.v2(room="v3test", name="Old")                            # (version 2, the same code)
+        for h in (self.b, self.c, self.d, self.old):
+            h.session = secrets.token_bytes(16)
+            h.advertise(h.session)
+            self.assertTrue(self.listed(h.session))
+
+    def test_rooms(self):
+        p = self.player(name="Asker", mod_set=self.mine)
+        self.assertTrue(p.flags & R.HAS_ROOMS)
+        got = p.rooms()
+        self.assertEqual([r[0] for r in got], [self.a.ip, self.b.ip, self.c.ip])   # (its key's first, then the oldest)
+        by = {r[0]: r for r in got}
+        self.assertEqual(by[self.a.ip], (self.a.ip, 1, 8, 1 | 4 | 8, b"Host", BUILD.encode(), SIM, self.mine))
+        self.assertEqual(by[self.b.ip][3:7], (1 | 4, b"Sim", BUILD.encode(), SIM + 1))
+        self.assertEqual(by[self.c.ip][3:], (1 | 4, b"Mods", BUILD.encode(), SIM, mods((b"Alpha", 2))))
+        self.assertEqual(self.a.rooms()[0][3], 1 | 2 | 4 | 8)   # (its own)
+
+    def test_list_every_key(self):
+        p = self.player(name="Asker", mod_set=self.mine)
+        self.assertEqual([(h, tail) for h, _, tail in p.list()], [(self.a.ip, b"")])
+        got = p.list(every=1)
+        self.assertEqual(got[0][0], self.a.ip)   # (its own key's first)
+        self.assertEqual({h for h, _, _ in got}, {self.a.ip, self.b.ip, self.c.ip})
+        tails = {h: tail for h, _, tail in got}
+        self.assertEqual(tails[self.b.ip], BUILD.encode().ljust(40, b"\0") + struct.pack(">I", SIM + 1) + self.mine)
+        self.assertEqual(tails[self.c.ip], BUILD.encode().ljust(40, b"\0") + struct.pack(">I", SIM) + mods((b"Alpha", 2)))
+        self.assertEqual(self.old.list(), [])   # (and version 2's see none of them)
+
+    def test_wrong_cookie_unanswered(self):
+        p = self.player(mod_set=self.mine)
+        p.send(R.ROOMS, struct.pack(">QI", p.cookie ^ 1, 3))
+        self.assertIsNone(p.first(R.ROOMS_END, 0.3))
 
 
 class OnlineLobby(unittest.TestCase):

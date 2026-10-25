@@ -569,11 +569,36 @@ class Lobby:
             if not c.lists.take(now):
                 self.drops["list rate"] += 1
                 return
-            self.on_list(c, p[12:16], now)
+            self.on_list(c, p[12:16], now, wire is self.sn3 and len(p) > 16 and bool(p[16] & 1))   # (3: flags 1, every key's)
         elif kind == DATA:
             self.on_data(c, p, now)
         elif kind == BCAST:
             self.on_bcast(c, p, now)
+        elif wire is self.sn3 and kind == ROOMS:   # (version 3's own: they start with the cookie)
+            if len(p) < 12 or struct.unpack_from(">Q", p, 4)[0] != c.cookie:
+                return
+            self.verify(c)
+            c.seen = now
+            self.on_extra(c, kind, p, now)
+
+    def on_extra(self, c, kind, p, now):
+        """ROOMS, MATCH and RB, of SU and SN 3 (the same numbers and layouts; the cookie checked)."""
+        if kind == ROOMS:
+            if len(p) < 16:
+                return
+            if not c.lists.take(now):
+                self.drops["list rate"] += 1
+                return
+            self.on_rooms(c, p[12:16], now)
+        elif kind == MATCH:
+            if len(p) < 17:
+                return
+            if not c.match_asks.take(now):
+                self.drops["match rate"] += 1
+                return
+            self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
+        elif kind == RB:
+            self.on_rb(c, p, now)
 
     def on_data(self, c, p, now):
         if len(p) < 16 or not self.admit(c, p, 4, now):
@@ -622,6 +647,7 @@ class Lobby:
         flags = LOBBY | INTRODUCES
         if wire is self.sn3:
             c.sim, c.mods = sim, mods
+            flags |= HAS_ROOMS
         self.to(c, wire.header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, flags) + b"\0")
 
     def join(self, wire, at, c, nonce, room, name, build, now, part=None):
@@ -711,25 +737,15 @@ class Lobby:
                 self.sync(c, now, again=True)
         elif kind == SU_LEAVE:
             self.drop(c, "left")
-        elif kind in (SU_LIST, SU_ROOMS):
+        elif kind == SU_LIST:
             if len(p) < 16:
                 return
             if not c.lists.take(now):
                 self.drops["list rate"] += 1
                 return
-            if kind == SU_LIST:   # (flags 1: the rooms of every build of its lobby code)
-                self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))
-            else:
-                self.on_rooms(c, p[12:16], now)
-        elif kind == SU_MATCH:
-            if len(p) < 17:
-                return
-            if not c.match_asks.take(now):
-                self.drops["match rate"] += 1
-                return
-            self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
-        elif kind == SU_RB:
-            self.on_rb(c, p, now)
+            self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))   # (flags 1: the rooms of every build of its lobby code)
+        elif kind in (SU_ROOMS, SU_MATCH, SU_RB):
+            self.on_extra(c, kind, p, now)
 
     def su_join(self, p, at, c, now):
         """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections),
@@ -757,16 +773,20 @@ class Lobby:
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
         ones whose host is closest to the lobby (in 100 ms steps, taken when the room opened: the
         list must not reorder under the player's cursor from one scan to the next), then the oldest.
-        every (SU): the rooms of every build of its lobby code, its own build's first, each LISTING
-        ending with its host's build. A player matchmaking paired sees its host's room first."""
+        every (SU, SN 3): the rooms of every build (SN 3: every key) of its lobby code, its own first,
+        each LISTING ending with its host's build (SN 3: and simulation version and mod set). A player
+        matchmaking paired sees its host's room first."""
         pool = self.code_rooms.get(c.code_key, ()) if every else self.part_rooms.get(c.part, ())
         host = c.match.host if c.match is not None and c.match.guest is c else None   # (the host it was matched with first)
         rooms = sorted((r for r in pool if r.owner is not c and now - r.updated <= self.o.listed_for),
                        key=lambda r: (r.owner is not host, r.owner.part != c.part, *self.room_order(r)))[:LIST_MAX]
         su = c.wire is self.su
         for r in rooms:
+            tail = r.owner.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") if every else b""
+            if every and not su:
+                tail += struct.pack(">I", r.owner.sim) + r.owner.mods
             self.to(c, (su_header(SU_LISTING) if su else (c.wire or self.sn).header(LISTING)) + seq + struct.pack(">I", r.owner.ip) +
-                    r.info + (r.owner.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") if every else b""))
+                    r.info + tail)
         self.to(c, (su_header(SU_LIST_END) if su else (c.wire or self.sn).header(LIST_END)) + seq + bytes((len(rooms),)))
 
     @staticmethod
@@ -774,18 +794,22 @@ class Lobby:
         return not r.open, -r.count, 10 if r.distance is None else r.distance, r.created
 
     def on_rooms(self, c, seq, now):
-        """(SU) The room browser: every room of its lobby code, its own build's first, then as a
-        Rooms List; each with its host's address and name, players, build and mods, and flags
-        (1 open, 2 its own, 4 its host's game says its mods)."""
+        """(SU, SN 3) The room browser: every room of its lobby code, its own build's (key's) first,
+        then as a Rooms List; each with its host's address and name, players, build (SN 3: and
+        simulation version) and mods, and flags (1 open, 2 its own, 4 its host's game says its
+        mods; SN 3: 8 of its key, one it can join)."""
         rooms = sorted((r for r in self.code_rooms.get(c.code_key, ()) if now - r.updated <= self.o.listed_for),
                        key=lambda r: (r.owner.part != c.part, *self.room_order(r)))[:ROOMS_MAX]
+        su, wire = c.wire is self.su, c.wire or self.sn
         for r in rooms:
             h = r.owner
             flags = (1 if r.open else 0) | (2 if h is c else 0) | (4 if h.mods is not None else 0)
-            self.to(c, su_header(SU_ROOM_INFO) + seq + struct.pack(">IBBB", h.ip, r.count, r.info[NI_NODE_MAX], flags) +
+            if not su and h.part == c.part:
+                flags |= 8
+            self.to(c, wire.header(ROOM_INFO) + seq + struct.pack(">IBBB", h.ip, r.count, r.info[NI_NODE_MAX], flags) +
                     h.name.encode()[:NAME_LEN].ljust(NAME_LEN, b"\0") + h.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") +
-                    (h.mods or b"\0"))
-        self.to(c, su_header(SU_ROOMS_END) + seq + bytes((len(rooms),)))
+                    (b"" if su else struct.pack(">I", h.sim)) + (h.mods or b"\0"))
+        self.to(c, wire.header(ROOMS_END) + seq + bytes((len(rooms),)))
 
     def on_ldn(self, c, p, dst, sport, dport, now):
         """Local wireless's own messages: only the ones its protocol has, between the players they
