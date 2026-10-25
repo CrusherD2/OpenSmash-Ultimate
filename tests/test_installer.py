@@ -411,6 +411,18 @@ class InstallerDecisionTests(unittest.TestCase):
         for k, (_l, _o, _n, want) in cases.items():
             self.assertEqual(got[k].replace('\r\n', '\n'), want, k)
 
+    def test_config_path(self):
+        """online_name.txt where the game reads it (runtime/config.h): config\\ once the game has made it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            expr = (f"$r = '{tmp}'; @(foreach ($n in 'online_name.txt', 'online_server.txt') "
+                    "{ (Get-ConfigPath $r $n).Substring($r.Length) })")
+            self.assertEqual(ps(expr), ['\\online_name.txt', '\\online_server.txt'])
+            os.makedirs(os.path.join(tmp, 'config'))
+            Path(tmp, 'config', 'version.ini').write_text('version = 1\n')
+            self.assertEqual(ps(expr), ['\\config\\online_name.txt', '\\online_server.txt'])
+            Path(tmp, 'config', 'online_server.txt').write_text('off\n')
+            self.assertEqual(ps(expr), ['\\config\\online_name.txt', '\\config\\online_server.txt'])
+
     def test_command_line_round_trip(self):
         args = ['plain', 'with space', 'quote"inside', 'trailing\\', 'back\\"quote', 'C:\\My Dump\\', '']
         lit = ', '.join("'" + a.replace("'", "''") + "'" for a in args)
@@ -539,6 +551,18 @@ class InstallerPatternTests(unittest.TestCase):
         for name, want in InstallerDecisionTests.SSE42_BY_NAME.items():
             got = False if any(re.search(family, name, re.I) for family in families) else None
             self.assertEqual(got, want, name)
+
+
+    def test_config_path_as_the_launcher(self):
+        """The installer finds online_name.txt by the launcher's rule (tests/test_launcher_ini.py runs that one)."""
+        def rule(text):
+            body = text[text.index('function Get-ConfigPath'):]
+            body = body[body.index('$inFolder ='):]
+            return body[:body.index('\n}\n')].replace('\r', '')
+        text = SCRIPT.read_text(encoding='utf-8')
+        self.assertEqual(rule(text), rule((ROOT / 'tools/launcher.ps1').read_text(encoding='utf-8')))
+        self.assertIn("$nameFile = Get-ConfigPath $Root 'online_name.txt'", text)
+        self.assertNotRegex(text, r"Join-Path \$Root '(display\.ini|controllers\.ini|launcher\.ini|online_name\.txt|online_direct\.txt)'")
 
 
 if __name__ == '__main__':
