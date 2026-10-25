@@ -1109,7 +1109,7 @@ def build(a):
         extract_exefs(the_program()[2], keys)
         check_program(the_program()[2], game)
 
-    log(shown("\n[5/9] Take the fonts out of your firmware (dump\\fonts)"))
+    log(shown("\n[5/9] The fonts: your firmware's (dump\\fonts), or the open ones without it"))
     if fonts_from is None:
         log("  already done")
     elif fonts_from == "open":
