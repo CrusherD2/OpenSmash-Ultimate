@@ -13,8 +13,9 @@ for this machine) and under unicorn. All registers, flags, the next PC and memor
 --synthetic needs no game: the instruction words are made from the architecture's bit fields
 (difftest_words.py: D random words inside each encoding class, K per template kept, plus edge
 cases and exclusive-monitor sequences), placed in an image of their own, and the floating-point
-operands of the states are often special values (F32_BITS ...). tests/test_difftest_synthetic.py
-runs it in CI on Windows, Linux and macOS.
+operands of the states are often special values (F32_BITS ...), in some states all of them the
+ones of the NaN rules (F32_NAN ...). tests/test_difftest_synthetic.py runs it in CI on Windows,
+Linux and macOS.
 
 The native side is built with the game build's compiler and flags for this OS (--toolchain):
 clang-cl and tools/cc.py's flags on Windows, tools/linux/toolchain.py's on Linux (x86-64),
@@ -24,7 +25,9 @@ levels to build it at (the game's is O2; the synthetic mode also runs O0 by defa
 
 Floating-point results that differ only in NaN sign or payload (NaN on both sides, in the lanes
 of the result register at its lane width, both read from the disassembly) are "soft": reported,
-not counted as mismatches, unless --exact-nan. --report writes the results as JSON.
+not counted as mismatches, unless --exact-nan. That also builds the native side with
+RT_EXACT_NAN=1, the x86 builds' NaN checks (runtime/recomp.h), which arm64 builds leave out.
+--report writes the results as JSON.
 Exit code: 0 no mismatches, 1 mismatches, 3 no native toolchain on this machine.
 """
 import os, sys
@@ -91,6 +94,15 @@ F64_BITS = [0x0000000000000000, 0x8000000000000000, 0x3FF0000000000000, 0xBFF000
             0x41F0000000000000, 0x43E0000000000000, 0xC3E0000000000000, 0x43F0000000000000,   # 2^32, 2^63, -2^63, 2^64
             0x47EFFFFFE0000000, 0x47EFFFFFF0000000, 0x36A0000000000000, 0x380FFFFFFFFFFFFF,   # f32: largest, to inf, ties, denormal
             0x40EFFC0000000000, 0x40EFFE0000000000, 0x3E60000000000000, 0x3E60000000000001]   # half: 65504, 65520, ties
+# The NaN rules' operands (synthetic mode, rand_v_nan): zeros, infinities and ones, which make the
+# invalid operations (0 / 0, inf - inf, 0 * inf, the square root of -1), and quiet and signalling
+# NaNs of both signs, with and without payloads: two NaN operands, a NaN with inf * 0, a NaN and a
+# negated one.
+F32_NAN = [0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x3F800000, 0xBF800000,
+           0x7FC00000, 0xFFC00000, 0x7FC12345, 0xFFD55555, 0x7F800001, 0xFFA00000, 0x7FBFFFFF]
+F64_NAN = [0x0000000000000000, 0x8000000000000000, 0x7FF0000000000000, 0xFFF0000000000000,
+           0x3FF0000000000000, 0xBFF0000000000000, 0x7FF8000000000000, 0xFFF8000000000000,
+           0x7FF8000000012345, 0xFFFAAAAAAAAAAAAA, 0x7FF0000000000001, 0xFFF4000000000000, 0x7FF7FFFFFFFFFFFF]
 F16_BITS = [0x0000, 0x8000, 0x3C00, 0xBC00, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7E01, 0x7C01, 0xFD55,   # zeros, ones, infs, NaNs
             0x0001, 0x03FF, 0x8200, 0x0400, 0x7BFF, 0x3555, 0xC123]                                   # denormals, normals
 
@@ -249,6 +261,17 @@ def rand_v_fp(rng):
     return v & 0xFFFFFFFFFFFFFFFF, v >> 64
 
 
+def rand_v_nan(rng, width):
+    """Lanes of one width (32 or 64 bits), mostly the NaN rules' operands."""
+    table = F32_NAN if width == 32 else F64_NAN
+    plain = (lambda: struct.unpack("<I", struct.pack("<f", round(rng.uniform(-64, 64), 2)))[0]) if width == 32 else \
+        (lambda: struct.unpack("<Q", struct.pack("<d", round(rng.uniform(-64, 64), 2)))[0])
+    v = 0
+    for i in range(128 // width):
+        v |= (rng.choice(table) if rng.random() < 0.85 else plain()) << (i * width)
+    return v & 0xFFFFFFFFFFFFFFFF, v >> 64
+
+
 NAN = {16: (0x7C00, 0x3FF), 32: (0x7F800000, 0x7FFFFF), 64: (0x7FF0000000000000, 0xFFFFFFFFFFFFF)}   # exponent, fraction
 
 
@@ -396,7 +419,11 @@ def _run(args):
                 if i != 31:
                     xs[i] = rng.randrange(64)
             nzcv = rng.getrandbits(4)
-            vs = [vgen(rng) for _ in range(32)]
+            if opts.get("fp_special") and rng.random() < 0.25:   # every register of the NaN rules, one width
+                width = rng.choice((32, 64))
+                vs = [rand_v_nan(rng, width) for _ in range(32)]
+            else:
+                vs = [vgen(rng) for _ in range(32)]
             if rng.random() < 0.4:   # equal vectors, for compares / min / max
                 pivot = vgen(rng)
                 for _k in range(6):
@@ -536,14 +563,16 @@ def write_sources(tests, lifter, work):
     return sources + [table, os.path.join(cc.RUNTIME, "difftest.c")]
 
 
-def build(tc, sources, work, level, jobs):
+def build(tc, sources, work, level, jobs, defines=()):
     """Compile and link the native side at an optimisation level; returns the executable."""
     out = os.path.join(work, level)
     os.makedirs(out, exist_ok=True)
     objs = [os.path.join(out, os.path.splitext(os.path.basename(s))[0] + tc.obj) for s in sources]
 
     def one(job):
-        r = subprocess.run(tc.compile_cmd(job[0], job[1], tc.opts[level]), capture_output=True, text=True)
+        cmd = tc.compile_cmd(job[0], job[1], tc.opts[level])
+        cmd[1:1] = defines
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             raise RuntimeError(f"compile failed: {job[0]}\n{(r.stdout + r.stderr)[:4000]}")
 
@@ -647,7 +676,8 @@ def native_side(tests, lifter, work, jobs, default_levels):
     levels = arg("--opt", default_levels).split(",")
     t0 = time.monotonic()
     sources = write_sources(tests, lifter, work)
-    exes = [(level, build(tc, sources, work, level, jobs)) for level in levels]
+    defines = ["-DRT_EXACT_NAN=1"] if "--exact-nan" in sys.argv else []
+    exes = [(level, build(tc, sources, work, level, jobs, defines)) for level in levels]
     print(f"native side: {tc.name}, at {', '.join(levels)}: built in {time.monotonic() - t0:.0f} s")
     return tc, exes
 
