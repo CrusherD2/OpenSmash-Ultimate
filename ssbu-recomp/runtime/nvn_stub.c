@@ -135,12 +135,12 @@ static void pool_flags(Ctx *c) { RET(nobj(A0)->flags); }
  *     NvRmGpuAddressSpaceAllocationRemap: the GPU address range of the virtual pool then shows the physical pool's pages
  *     (a request without a pool unmaps). 1 when every batch succeeded.
  * NOT IMPLEMENTED for a virtual pool: here a pool is the game's own host memory and every texture reads its texels through one
- * contiguous pointer (nvn_gl.c Tex.mem); a virtual pool has no memory of its own (its builder must pass none [0x42b208]) and its
+ * contiguous pointer (nvn_front.c Tex.mem); a virtual pool has no memory of its own (its builder must pass none [0x42b208]) and its
  * pages alias pages of other pools, which needs either operating-system aliasing of memory the game allocated (not possible
  * for memory that was not created as a section) or a page table consulted by every texture read / write-back in nvn_gl.c.
  * So the name stays without a handler (MISSING: a call stops with the function's name), also for ordinary pools, where the
  * answer would be 0. */
-/* For nvn_gl.c: where a memory pool's storage is. */
+/* For nvn_front.c: where a memory pool's storage is. */
 int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
     NvnObj *p = nobj(pool);
     *mem = p->memory; *size = p->size;
