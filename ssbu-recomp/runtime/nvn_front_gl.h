@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <windows.h>
-#include <GL/gl.h>
 #include "nvn_front.h"
 #include "tex_decode.h"
 
@@ -32,27 +31,6 @@ void display_before_present(void);
 void display_clock_sample(uint64_t index_ptr);                        /* SSBU_CLOCKSTAT */
 void display_set_interval(int n);
 
-enum {
-    GL_VERTEX_PROGRAM_ARB_ = 0x8620, GL_FRAGMENT_PROGRAM_ARB_ = 0x8804, GL_GEOMETRY_PROGRAM_NV_ = 0x8C26,
-    GL_TESS_CONTROL_PROGRAM_NV_ = 0x891E, GL_TESS_EVALUATION_PROGRAM_NV_ = 0x891F, GL_COMPUTE_PROGRAM_NV_ = 0x90FB,
-    GL_PROGRAM_FORMAT_ASCII_ARB_ = 0x8875, GL_PROGRAM_ERROR_POSITION_ARB_ = 0x864B, GL_PROGRAM_ERROR_STRING_ARB_ = 0x8874,
-    GL_MAX_PROGRAM_PARAMETER_BUFFER_BINDINGS_NV_ = 0x8DA0,
-    GL_ARRAY_BUFFER_ = 0x8892, GL_ELEMENT_ARRAY_BUFFER_ = 0x8893, GL_STREAM_DRAW_ = 0x88E0, GL_SHADER_STORAGE_BUFFER_ = 0x90D2,
-    GL_FRAMEBUFFER_ = 0x8D40, GL_READ_FRAMEBUFFER_ = 0x8CA8, GL_DRAW_FRAMEBUFFER_ = 0x8CA9, GL_COLOR_ATTACHMENT0_ = 0x8CE0,
-    GL_DEPTH_ATTACHMENT_ = 0x8D00, GL_STENCIL_ATTACHMENT_ = 0x8D20, GL_DEPTH_STENCIL_ATTACHMENT_ = 0x821A,
-    GL_FRAMEBUFFER_COMPLETE_ = 0x8CD5, GL_FRAMEBUFFER_SRGB_ = 0x8DB9,
-    GL_TEXTURE_3D_ = 0x806F, GL_TEXTURE_1D_ARRAY_ = 0x8C18, GL_TEXTURE_2D_ARRAY_ = 0x8C1A, GL_TEXTURE_2D_MULTISAMPLE_ = 0x9100,
-    GL_TEXTURE_2D_MULTISAMPLE_ARRAY_ = 0x9102, GL_TEXTURE_RECTANGLE_ = 0x84F5, GL_TEXTURE_CUBE_MAP_ = 0x8513,
-    GL_TEXTURE_CUBE_MAP_POSITIVE_X_ = 0x8515, GL_TEXTURE_CUBE_MAP_ARRAY_ = 0x9009, GL_TEXTURE_BUFFER_ = 0x8C2A,
-    GL_TEXTURE_MAX_LEVEL_ = 0x813D, GL_TEXTURE_SWIZZLE_RGBA_ = 0x8E46, GL_DEPTH_STENCIL_TEXTURE_MODE_ = 0x90EA,
-    GL_TEXTURE_WRAP_R_ = 0x8072, GL_TEXTURE_MIN_LOD_ = 0x813A, GL_TEXTURE_MAX_LOD_ = 0x813B, GL_TEXTURE_LOD_BIAS_ = 0x8501,
-    GL_TEXTURE_COMPARE_MODE_ = 0x884C, GL_TEXTURE_COMPARE_FUNC_ = 0x884D, GL_COMPARE_REF_TO_TEXTURE_ = 0x884E,
-    GL_TEXTURE_MAX_ANISOTROPY_ = 0x84FE, GL_TEXTURE_CUBE_MAP_SEAMLESS_ = 0x884F,
-    GL_UPPER_LEFT_ = 0x8CA2, GL_LOWER_LEFT_ = 0x8CA1, GL_ZERO_TO_ONE_ = 0x935F, GL_NEGATIVE_ONE_TO_ONE_ = 0x935E,
-    GL_MULTISAMPLE_ = 0x809D, GL_SAMPLE_ALPHA_TO_COVERAGE_ = 0x809E, GL_PRIMITIVE_RESTART_ = 0x8F9D, GL_PATCH_VERTICES_ = 0x8E72,
-    GL_DEPTH_CLAMP_ = 0x864F, GL_RASTERIZER_DISCARD_ = 0x8C89, GL_DEBUG_OUTPUT_ = 0x92E0, GL_DEBUG_OUTPUT_SYNCHRONOUS_ = 0x8242,
-    GL_BGR_ = 0x80E0, GL_BGRA_ = 0x80E1, GL_UNPACK_ROW_LENGTH_ = 0x0CF2, GL_DEPTH_STENCIL_ = 0x84F9, GL_STENCIL_INDEX_ = 0x1901,
-};
 
 /* ---- the render thread (nvn_front.c) */
 extern DWORD g_render_tid;
@@ -92,7 +70,6 @@ extern LONG64 g_prev_frame_draws, g_frame_dispatch;
 
 /* ---- formats, guest objects, texture memory (nvn_front.c) */
 int fmt_get(int nf, Fmt *f);
-int vfmt_get(int nf, int *size, GLenum *type, int *norm, int *integer);
 extern SRWLOCK g_pool_lock;
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
@@ -117,13 +94,9 @@ uint8_t *list_lookup(uint64_t h, size_t *len);
 void list_collect(void);
 uint64_t now_ns(void);
 void event_signal_at(uint64_t a, int mode, uint32_t value);
+extern LONG g_bufhist[6][32], g_storhist[32];     /* program.buffer[n] / program.storage[n] uses in NV assembly text (prog_add_stage) */
+extern const char *const k_stage_name[6];        /* "vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute" */
 extern int g_draw_tag, g_dt_idx;                 /* render thread (nvn_dt.h, SSBU_DRAWTAG) */
 void nvn_front_draw_tag_clear(void);
 
-/* ---- the OpenGL back end (nvn_gl.c) as the front end calls it, besides rb_gl */
-void rb_gl_init(void);                           /* render thread, at start: the context; then the front end runs the job loop */
-void rb_gl_report(FILE *out);                    /* the nvn_gl: lines of the exit report */
-void rb_gl_frame_stats(void);                    /* SSBU_GLSTATS=1, every 300 frames */
-void rb_gl_program_set(Prog *p);                 /* guest thread, nvnProgramSetShaders: the stages go to the shader workers */
-void prog_add_stage(Prog *p, const char *text, int len, int serial);       /* nvnProgramSetShaders: a stage with NV assembly text */
 #endif

@@ -1565,7 +1565,7 @@ static void stage_copy(Stage *st, int s) {
     st->code = blk + (st->code - lo);
     g_scopy_n++; g_scopy_bytes += (LONG64)n;
 }
-void nvn_vk_program_set(void *prog) {
+void nvn_vk_program_set(Prog *prog) {
     Prog *p = prog;
     SSrc s[3];
     if (!g_m4_on || p->st[2].state || p->st[3].state || p->st[4].state) return;

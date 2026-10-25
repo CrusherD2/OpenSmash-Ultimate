@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-#include <GL/gl.h>
 #include "runtime.h"
 #include "hostrt.h"
 #include "mx_translate.h"
@@ -20,12 +19,10 @@
 static void *volatile g_window_sync;                                  /* the sync object of the last nvnWindowAcquireTexture */
 /* V1 (plan\phases\V1_vulkan.md, seam step S0): SSBU_RENDERER=vk. The render thread then starts nvn_vk.c instead of an
  * OpenGL context and its jobs go through vk_route (end of this file); nothing else in this file changes behaviour. */
-int nvn_vk_init(void *hwnd);
 void nvn_vk_present_black(void);
 void nvn_vk_flush(int finish);
 void nvn_vk_shutdown(void);
 void nvn_vk_missing(const char *what);
-void nvn_vk_report(FILE *out);
 static int g_vk;
 const RBackend *g_rb = &rb_gl;                 /* seam step S2: chosen once in nvn_gl_start (SSBU_RENDERER) */
 static void vk_shutdown_at_exit(void);
@@ -114,92 +111,65 @@ void logf_limited(int *counter, int limit, const char *fmt, ...) {
     fflush(stdout);
 }
 
-/* ---------------------------------------------------------------- formats */
-static const uint16_t k_int12[4][12] = {
-    {0x8229, 0x8F94, 0x8232, 0x8231, 0x822D, 0x822A, 0x8F98, 0x8234, 0x8233, 0x822E, 0x8236, 0x8235},
-    {0x822B, 0x8F95, 0x8238, 0x8237, 0x822F, 0x822C, 0x8F99, 0x823A, 0x8239, 0x8230, 0x823C, 0x823B},
-    {0x8051, 0x8F96, 0x8D7D, 0x8D8F, 0x881B, 0x8054, 0x8F9A, 0x8D77, 0x8D89, 0x8815, 0x8D71, 0x8D83},
-    {0x8058, 0x8F97, 0x8D7C, 0x8D8E, 0x881A, 0x805B, 0x8F9B, 0x8D76, 0x8D88, 0x8814, 0x8D70, 0x8D82}};
-static const uint16_t k_type12[12] = {0x1401, 0x1400, 0x1401, 0x1400, 0x140B, 0x1403, 0x1402, 0x1403, 0x1402, 0x1406, 0x1405, 0x1404};
+/* ---------------------------------------------------------------- formats
+ * What the front end and every back end need of an NVN texture format: bytes per block, block size, kind. The formats
+ * of the APIs are the back ends' (OpenGL: gl_fmt in nvn_gl.c; Vulkan: tex_vkfmt in nvn_vk_draw.c), for the formats listed here. */
 static const uint8_t k_size12[12] = {1, 1, 1, 1, 2, 2, 2, 2, 2, 4, 4, 4};
-static const uint8_t k_isint12[12] = {0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1};
-static const uint8_t k_norm12[12] = {1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
-static const uint16_t k_pix[4] = {0x1903, 0x8227, 0x1907, 0x1908}, k_pixint[4] = {0x8D94, 0x8228, 0x8D98, 0x8D99};
 static const uint8_t k_astc[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6}, {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
 
 int fmt_get(int nf, Fmt *f) {
     memset(f, 0, sizeof *f);
     f->bw = f->bh = 1;
-#define SET(i, fo, ty, b, k) (f->internal = (i), f->format = (fo), f->type = (ty), f->bpb = (b), f->kind = (k), 1)
-#define BC(i, b) (f->bw = f->bh = 4, SET(i, 0, 0, b, 4))
+#define SET(b, k) (f->bpb = (b), f->kind = (k), 1)
+#define BC(b) (f->bw = f->bh = 4, SET(b, 4))
     if ((nf >= 0x01 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) {
         int comps = nf >= 0x6D ? 4 : (nf - 1) / 12 + 1, i = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
-        return SET(k_int12[comps - 1][i], k_isint12[i] ? k_pixint[comps - 1] : k_pix[comps - 1], k_type12[i], comps * k_size12[i], 0);
+        return SET(comps * k_size12[i], 0);
     }
     if (nf >= 0x79 && nf <= 0x94) {
         int i = (nf - 0x79) % 14;
         f->bw = k_astc[i][0]; f->bh = k_astc[i][1];
-        return SET((nf >= 0x87 ? 0x93D0 : 0x93B0) + i, 0, 0, 16, 4);
+        return SET(16, 4);
     }
     switch (nf) {
-    case 0x31: return SET(0x8D48, GL_STENCIL_INDEX_, 0x1401, 1, 2);
-    case 0x32: return SET(0x81A5, 0x1902, 0x1403, 2, 1);
-    case 0x33: return SET(0x81A6, 0x1902, 0x1405, 4, 1);
-    case 0x34: return SET(0x8CAC, 0x1902, 0x1406, 4, 1);
-    case 0x35: return SET(0x88F0, GL_DEPTH_STENCIL_, 0x84FA, 4, 3);
-    case 0x36: return SET(0x8CAD, GL_DEPTH_STENCIL_, 0x8DAD, 8, 3);
-    case 0x37: case 0x38: return SET(0x8C43, 0x1908, 0x1401, 4, 0);
-    case 0x39: return SET(0x8056, 0x1908, 0x8033, 2, 0);
-    case 0x3A: return SET(0x8050, 0x1908, 0x8034, 2, 0);
-    case 0x3B: return SET(0x8057, 0x1908, 0x8034, 2, 0);
-    case 0x3C: return SET(0x8D62, 0x1907, 0x8363, 2, 0);
-    case 0x3D: return SET(0x8059, 0x1908, 0x8368, 4, 0);
-    case 0x3E: return SET(0x906F, 0x8D99, 0x8368, 4, 0);
-    case 0x3F: return SET(0x8C3A, 0x1907, 0x8C3B, 4, 0);
-    case 0x40: return SET(0x8C3D, 0x1907, 0x8C3E, 4, 0);
-    case 0x41: return BC(0x83F0, 8);
-    case 0x42: return BC(0x83F1, 8);
-    case 0x43: return BC(0x83F2, 16);
-    case 0x44: return BC(0x83F3, 16);
-    case 0x45: return BC(0x8C4C, 8);
-    case 0x46: return BC(0x8C4D, 8);
-    case 0x47: return BC(0x8C4E, 16);
-    case 0x48: return BC(0x8C4F, 16);
-    case 0x49: return BC(0x8DBB, 8);
-    case 0x4A: return BC(0x8DBC, 8);
-    case 0x4B: return BC(0x8DBD, 16);
-    case 0x4C: return BC(0x8DBE, 16);
-    case 0x4D: return BC(0x8E8C, 16);
-    case 0x4E: return BC(0x8E8D, 16);
-    case 0x4F: return BC(0x8E8E, 16);
-    case 0x50: return BC(0x8E8F, 16);
-    case 0x95: return SET(0x8D62, GL_BGR_, 0x8363, 2, 0);
-    case 0x99: case 0x9A: return SET(0x8058, GL_BGRA_, 0x1401, 4, 0);
-    case 0x9B: case 0x9C: return SET(0x8C43, GL_BGRA_, 0x1401, 4, 0);
+    case 0x31: return SET(1, 2);
+    case 0x32: return SET(2, 1);
+    case 0x33: return SET(4, 1);
+    case 0x34: return SET(4, 1);
+    case 0x35: return SET(4, 3);
+    case 0x36: return SET(8, 3);
+    case 0x37: case 0x38: return SET(4, 0);
+    case 0x39: return SET(2, 0);
+    case 0x3A: return SET(2, 0);
+    case 0x3B: return SET(2, 0);
+    case 0x3C: return SET(2, 0);
+    case 0x3D: return SET(4, 0);
+    case 0x3E: return SET(4, 0);
+    case 0x3F: return SET(4, 0);
+    case 0x40: return SET(4, 0);
+    case 0x41: return BC(8);
+    case 0x42: return BC(8);
+    case 0x43: return BC(16);
+    case 0x44: return BC(16);
+    case 0x45: return BC(8);
+    case 0x46: return BC(8);
+    case 0x47: return BC(16);
+    case 0x48: return BC(16);
+    case 0x49: return BC(8);
+    case 0x4A: return BC(8);
+    case 0x4B: return BC(16);
+    case 0x4C: return BC(16);
+    case 0x4D: return BC(16);
+    case 0x4E: return BC(16);
+    case 0x4F: return BC(16);
+    case 0x50: return BC(16);
+    case 0x95: return SET(2, 0);
+    case 0x99: case 0x9A: return SET(4, 0);
+    case 0x9B: case 0x9C: return SET(4, 0);
     }
     return 0;
 #undef SET
 #undef BC
-}
-
-/* Vertex attribute format: component count, GL type, normalised, integer. */
-int vfmt_get(int nf, int *size, GLenum *type, int *norm, int *integer) {
-    static const uint16_t t6[6] = {0x1401, 0x1400, 0x1403, 0x1402, 0x1405, 0x1404};
-    if ((nf >= 0x01 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) {
-        int i = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
-        *size = nf >= 0x6D ? 4 : (nf - 1) / 12 + 1; *type = k_type12[i]; *norm = k_norm12[i]; *integer = k_isint12[i];
-        return 1;
-    }
-    if (nf >= 0x51 && nf <= 0x68) { *size = (nf - 0x51) / 6 + 1; *type = t6[(nf - 0x51) % 6]; *norm = 0; *integer = 0; return 1; }
-    switch (nf) {
-    case 0x3D: *size = 4; *type = 0x8368; *norm = 1; *integer = 0; return 1;
-    case 0x3E: *size = 4; *type = 0x8368; *norm = 0; *integer = 1; return 1;
-    case 0x69: *size = 4; *type = 0x8D9F; *norm = 1; *integer = 0; return 1;
-    case 0x6A: *size = 4; *type = 0x8D9F; *norm = 0; *integer = 1; return 1;
-    case 0x6B: *size = 4; *type = 0x8368; *norm = 0; *integer = 0; return 1;
-    case 0x6C: *size = 4; *type = 0x8D9F; *norm = 0; *integer = 0; return 1;
-    }
-    return 0;
 }
 
 /* ---------------------------------------------------------------- guest objects
@@ -661,7 +631,8 @@ void pf_frame_mark(LONG64 frame) {
     printf(" | MB/frame: streamed %.2f, read back %.2f, hashed %.2f\n", (double)(g_pf_arena_bytes - b0[0]) / 300.0 / 1048576.0, (double)(g_pf_cflush_bytes - b0[1]) / 300.0 / 1048576.0,
            (double)(g_pf_hash_bytes - b0[2]) / 300.0 / 1048576.0);
     b0[0] = g_pf_arena_bytes; b0[1] = g_pf_cflush_bytes; b0[2] = g_pf_hash_bytes;
-    rb_gl_frame_stats();                        /* SSBU_GLSTATS=1: nvn_gl.c */
+    rb_gl.frame_stats();                        /* SSBU_GLSTATS=1 (nvn_gl.c): with either renderer, as before */
+    if (g_rb != &rb_gl && g_rb->frame_stats) g_rb->frame_stats();
     {   /* P3 round 2: the snapshot of all threads (CreateToolhelp32Snapshot) took 30-70 ms on the render thread: one long
          * frame in every 300 (hitch log, "present" scope). It is taken by a helper thread now. */
         static HANDLE ev;
@@ -708,14 +679,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
         int p = e ? atoi(e) : 0;
         if (p > 0) { SetThreadPriority(GetCurrentThread(), p >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL); printf("nvn: render thread priority %s (SSBU_RENDER_PRIO)\n", p >= 2 ? "highest" : "above normal"); }
     }
-    if (g_vk) {                                 /* V1 step S0: no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
-        nvn_vk_init(g_hwnd);
-        hitch_set_render();
-        SetEvent(g_ready_event);
-        render_loop();
-        return 0;
-    }
-    rb_gl_init();                               /* nvn_gl.c: the OpenGL context; also the shader cache and the self-test hook */
+    g_rb->init();                               /* OpenGL: the context, the shader cache, the self-test hook (nvn_gl.c); Vulkan: the device (nvn_vk.c) */
     SetEvent(g_ready_event);
     render_loop();
     return 0;
@@ -745,9 +709,9 @@ void nvn_gl_start(void *hwnd) {
 }
 
 void nvn_gl_report(FILE *out) {
-    rb_gl_report(out);
+    rb_gl.report(out);                          /* the nvn_gl: lines with either renderer, as before: the first ones are the front end's counters */
     hitch_report(out);
-    if (g_vk) { nvn_vk_report(out); vk_shutdown_at_exit(); }
+    if (g_vk) { g_rb->report(out); vk_shutdown_at_exit(); }
 }
 
 /* ================================================================ the NVN entry points */
@@ -782,6 +746,70 @@ static void prog_finalize(Ctx *c) {
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
     defer_free(K_PROG, p);
+}
+/* NV assembly text of a stage (nvnProgramSetShaders): program.buffer[n] and program.storage[n] uses per stage, for the
+ * exit report of the OpenGL back end (rb_gl_report), and the stage names. */
+LONG g_bufhist[6][32], g_storhist[32];
+const char *const k_stage_name[6] = {"vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute"};
+static int stage_of(const char *text, int len) {
+    static const char *const tag[6] = {"!!NVvp", "!!NVfp", "!!NVgp", "!!NVtcp", "!!NVtep", "!!NVcp"};
+    for (int i = 0; i < 6; i++) if (len > 8 && !memcmp(text, tag[i], strlen(tag[i]))) return i;
+    return -1;
+}
+/* Keeps a copy of the program text with program.buffer[n] renumbered to slots 0,1,2.. in order of appearance.
+ * Runs with either renderer: the stage is then marked as given with text (state 1), which the caller relies on. */
+static void prog_add_stage(Prog *p, const char *text, int len, int serial) {
+    static int nlog;
+    len = (int)strnlen(text, (size_t)len);
+    int s = stage_of(text, len);
+    if (s < 0) { logf_limited(&nlog, 10, "nvn_gl: program #%d: shader text of unknown kind '%.12s'\n", serial, text); return; }
+    Stage *st = &p->st[s];
+    char *out = malloc((size_t)len + 64);
+    int o = 0;
+    st->nbuf = 0; st->storage = 0;
+    for (int i = 0; i < len;) {
+        if (len - i > 16 && !memcmp(text + i, "program.buffer[", 15)) {
+            int n = 0, slot;
+            i += 15;
+            while (i < len && text[i] >= '0' && text[i] <= '9') n = n * 10 + (text[i++] - '0');
+            for (slot = 0; slot < st->nbuf && st->map[slot] != n; slot++) {}
+            if (slot == st->nbuf && st->nbuf < 16) st->map[st->nbuf++] = (uint8_t)n;
+            o += sprintf(out + o, "program.buffer[%d", slot);
+            InterlockedIncrement(&g_bufhist[s][n & 31]);
+            continue;
+        }
+        if (len - i > 17 && !memcmp(text + i, "program.storage[", 16)) {
+            int n = atoi(text + i + 16);
+            st->storage |= 1u << (n & 31);
+            InterlockedIncrement(&g_storhist[n & 31]);
+        }
+        out[o++] = text[i++];
+    }
+    out[o] = 0;
+    st->storage_w = 0;
+    {   /* storage buffers the program writes: STB / ATOMB / CSWAPB lines name "sbo_bufK", declared as STORAGE sbo_bufK[] = { program.storage[n] } */
+        int8_t decl[32];
+        memset(decl, -1, sizeof decl);
+        for (const char *q = out; (q = strstr(q, "STORAGE sbo_buf")) != NULL; q += 15) {
+            int k = atoi(q + 15);
+            const char *r = strstr(q, "program.storage[");
+            if (r && k >= 0 && k < 32) decl[k] = (int8_t)(atoi(r + 16) & 31);
+        }
+        for (const char *q = out; q && *q; q = strchr(q, 10), q = q ? q + 1 : NULL) {
+            if (strncmp(q, "STB", 3) && strncmp(q, "ATOM", 4) && strncmp(q, "CSWAP", 5)) continue;
+            const char *eol = strchr(q, 10), *r = strstr(q, "sbo_buf");
+            if (r && (!eol || r < eol)) { int k = atoi(r + 7); if (k >= 0 && k < 32 && decl[k] >= 0) st->storage_w |= 1u << decl[k]; }
+        }
+    }
+    free(st->text);
+    st->text = out; st->len = o; st->state = 1;
+    const char *dir = getenv("SSBU_SHADERDUMP");
+    if (dir) {
+        char path[260];
+        snprintf(path, sizeof path, "%s/p%05d_%s.txt", dir, serial, k_stage_name[s]);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(text, 1, (size_t)len, f); fclose(f); }
+    }
 }
 /* Debug aid SSBU_SHADERDUMP_ALL=<dir>: every shader stage handed to nvnProgramSetShaders, whole, as <dir>/s<program>_<i>.mxd for the
  * offline harness (mxtest.exe). File: "MXD1", u32 program serial, u32 index in the call, u32 control bytes, u32 data bytes, then the
@@ -904,8 +932,7 @@ static void prog_set_shaders_(Ctx *c) {
         if (s < 0 || len <= 0 || len > (4 << 20)) { logf_limited(&nlog2, 10, "nvn_gl: program #%d shader %d: unexpected program header %08x, code size %d\n", p->serial, i, rd32(data + 0x30), len); continue; }
         p->st[s].code = P(data + 0x30); p->st[s].code_len = len; p->st[s].state = 4; p->st[s].dumped = 0; p->st[s].glsl_state = 0; memcpy(p->st[s].ctl, P(control + 0x6f0), 32);
     }
-    if (g_rb == &rb_vk) { LONG64 tb = pf_now(); nvn_vk_program_set(p); nvn_setsh_part[4] += pf_now() - tb; RET(1); return; }       /* V1 M4: the stages go to the Vulkan workers at once (nvn_vk_m4.c) */
-    rb_gl_program_set(p);                       /* OpenGL (Vulkan returned above): nvn_gl.c */
+    { LONG64 tb = pf_now(); g_rb->program_set(p); nvn_setsh_part[4] += pf_now() - tb; }      /* the stages go to the back end's workers at once (V1 M4: nvn_vk_m4.c; OpenGL: nvn_gl.c) */
     RET(1);
 }
 
@@ -1813,7 +1840,7 @@ static void ms_get_grid_on(Ctx *c) { RET((rd8(A0 + 3) >> 2) & 1); }
 static void ms_get_covmod(Ctx *c) { RET((rd8(A0 + 3) >> 3) & 3); }
 static void ms_get_c2c_output(Ctx *c) { RET(rd8(A0 + 3) >> 5); }
 static void ms_get_grid(Ctx *c) {                       /* (state, int *width, int *height): the grid this GPU repeats sample locations over */
-    GLint wh[2] = {1, 1};
+    int wh[2] = {1, 1};
     if ((rd8(A0 + 3) >> 2) & 1) gl_run(g_rb->sample_grid, wh);
     if (A1) wr32(A1, (uint32_t)wh[0]);
     if (A2) wr32(A2, (uint32_t)wh[1]);
