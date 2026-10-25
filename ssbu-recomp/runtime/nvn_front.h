@@ -1,7 +1,7 @@
 /* NVN front end: the types both render back ends share (plan\phases\V1_vulkan.md, section 1, seam steps S1 and S2).
  * Moved here from nvn_gl.c without renames. The front end itself (entry points, command recording, the job queue, the
- * texture source logic) still lives in nvn_gl.c until step S3; what the Vulkan back end needs of it is declared at the
- * end of this file (the nvn_front_* functions, defined at the end of nvn_gl.c). */
+ * texture source logic) is nvn_front.c since step S3; what the Vulkan back end needs of it is declared at the end of
+ * this file (the nvn_front_* functions, defined at the end of nvn_front.c). */
 #ifndef NVN_FRONT_H
 #define NVN_FRONT_H
 #include <stdio.h>
@@ -119,7 +119,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog);      /* Vulkan, GUE
 extern __declspec(thread) long long nvn_setsh_part[8];
 void nvn_vk_program_set(void *prog);        /* Vulkan, GUEST thread, from nvnProgramSetShaders: the program's stages go to the workers (nvn_vk_m4.c) */
 
-/* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_gl.c) */
+/* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_front.c) */
 int nvn_front_fmt(int nvn_format, Fmt *f);                                  /* fmt_get */
 uint8_t *nvn_front_list(uint64_t handle, size_t *len);                      /* list_lookup */
 void nvn_front_batch_begin(void);                                           /* a new submitted batch: texture memory is looked at again once */
