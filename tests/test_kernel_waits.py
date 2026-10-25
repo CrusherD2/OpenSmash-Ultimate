@@ -3,8 +3,12 @@ threads and no game: WaitSynchronization (events, threads ending), userspace mut
 variables and the address arbiter - a signal before the wait, timeouts, cancels, many waiters and
 one signal (first come first served, only the waiters of what was signalled woken, each once), a
 wait on several objects, an event set and cleared before its waiters run, waiters that exit, the
-result codes, the freeze report's states - and a stress run of each for lost wake-ups; with
-SSBU_THREAD_RECYCLING=1 and without. Built with the platform's compiler: clang-cl on Windows (as
+result codes, the freeze report's states - and a stress run of each for lost wake-ups; thread
+priorities and core masks (as before by default, kept and checked as on the console with
+SSBU_CORE_MASKS=1), the queues' order with SSBU_PRIORITY_QUEUES=1 and without, and with
+SSBU_HOST_PRIORITIES=1 the host priority calls the kernel makes and what the host thread then has;
+with SSBU_THREAD_RECYCLING=1 and without, and both again with the three priority switches set in
+the environment. Built with the platform's compiler: clang-cl on Windows (as
 tests/test_clock.py builds clocktest.c), clang with the platform layer elsewhere
 (runtime/linux/win32.c, with runtime/macos/'s memory and platform parts on macOS; the Windows types
 from runtime/macos/include on both). Skipped where there is no such compiler, and on hosts the
@@ -61,20 +65,44 @@ class KernelWaitTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.dir, ignore_errors=True)
 
-    def waittest(self, switch=None):
-        env = {k: v for k, v in os.environ.items() if k != 'SSBU_THREAD_RECYCLING'}
+    SWITCHES = ('SSBU_THREAD_RECYCLING', 'SSBU_PRIORITY_QUEUES', 'SSBU_HOST_PRIORITIES', 'SSBU_CORE_MASKS')
+
+    def waittest(self, switch=None, **more):
+        env = {k: v for k, v in os.environ.items() if k not in self.SWITCHES}
         if switch is not None:
             env['SSBU_THREAD_RECYCLING'] = switch
+        env.update(more)
         r = subprocess.run([self.exe], capture_output=True, text=True, env=env, timeout=600)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertRegex(r.stdout, r'\d+ checks, 0 failed')
-        return r.stdout
+        return r
 
     def test_with_recycling(self):
-        self.assertIn('thread recycling on', self.waittest('1'))
+        out = self.waittest('1').stdout
+        self.assertIn('thread recycling on', out)
+        self.assertIn('queues by priority off, host priorities off, core masks as before', out)
 
     def test_without_recycling(self):
-        self.assertIn('thread recycling off', self.waittest())
+        self.assertIn('thread recycling off', self.waittest().stdout)
+
+    def test_with_the_priority_switches(self):
+        for recycling in ('1', None):
+            with self.subTest(recycling=recycling):
+                r = self.waittest(recycling, SSBU_PRIORITY_QUEUES='1', SSBU_HOST_PRIORITIES='1', SSBU_CORE_MASKS='1')
+                self.assertIn('queues by priority on', r.stdout)
+                self.assertIn("core masks the console's", r.stdout)
+                self.assertIn('(SSBU_PRIORITY_QUEUES=1)', r.stderr)
+                self.assertIn('(SSBU_CORE_MASKS=1)', r.stderr)
+                if 'SSBU_HOST_PRIORITIES=1 left off' in r.stderr:   # (Linux without RLIMIT_NICE of 20 or root)
+                    self.assertTrue(sys.platform.startswith('linux'), r.stderr)
+                    self.assertIn('host priorities off', r.stdout)
+                else:
+                    self.assertIn('host priorities on', r.stdout)
+                    self.assertIn('(SSBU_HOST_PRIORITIES=1)', r.stderr)
+
+    def test_other_values_keep_the_old_answers(self):
+        self.assertIn('core masks as before', self.waittest(SSBU_CORE_MASKS='0').stdout)
+        self.assertIn('core masks as before', self.waittest(SSBU_CORE_MASKS='yes').stdout)
 
 
 if __name__ == '__main__':

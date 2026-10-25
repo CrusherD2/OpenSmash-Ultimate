@@ -7,7 +7,8 @@
  *
  * One lock guards all kernel state. A blocked thread sleeps on its own condition variable, in
  * the wait queue of what it waits for: only a signal of that, a cancel of its WaitSynchronization
- * or its timeout wakes it (see "wait queues").
+ * or its timeout wakes it (see "wait queues"). Host threads are not pinned to processors (see
+ * "priorities and cores").
  *
  * Calls that would talk to a system service (IPC) are not implemented here: they stop the
  * run and say so, since services are replaced at the SDK function level instead. */
@@ -21,12 +22,19 @@
 #include "fight_test.h"   /* (SSBU_FIXED_SEED) */
 #include "sleep.h"   /* (svcSleepThread) */
 
+#ifdef __linux__
+#include <sys/resource.h>   /* (RLIMIT_NICE: see "priorities and cores") */
+#include <unistd.h>         /* (geteuid) */
+#endif
+#undef R_OK   /* (unistd.h's access() flag: here R_OK is the kernel's result code, below) */
+
 #ifdef __APPLE__
 void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
 #endif
 
 enum { R_OK = 0, R_TIMEOUT = 0xEA01, R_CANCELLED = 0xEC01, R_INVALID_HANDLE = 0xE401, R_INVALID_STATE = 0xFA01,
-       R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001 };
+       R_INVALID_ADDRESS = 0xCC01, R_INVALID_ENUM = 0xF001, R_OUT_OF_MEMORY = 0xD001, R_INVALID_PRIORITY = 0xE001,
+       R_INVALID_CORE = 0xE201, R_INVALID_COMBINATION = 0xE801 };
 enum { GM_FREE = 0, GM_CODE = 3, GM_CODE_DATA = 4, GM_HEAP = 5, GM_STACK = 0xB, GM_TLS = 0xC, GM_INACCESSIBLE = 0x10 };
 enum { OBJ_FREE, OBJ_THREAD, OBJ_EVENT, OBJ_SESSION, OBJ_MEMORY };
 
@@ -35,6 +43,8 @@ enum { OBJ_FREE, OBJ_THREAD, OBJ_EVENT, OBJ_SESSION, OBJ_MEMORY };
 #define CUR_PROCESS 0xFFFF8001u
 #define HOST_STACK (256ull << 20)    /* guest call depth is host call depth */
 #define MAIN_STACK (1u << 20)     /* from the program's metadata */
+#define CORES 0x7ull                        /* the cores an application may use (GetInfo 0) */
+#define PRIORITIES 0x0FFFFFFFF0000000ull    /* ... and its priorities, 28 to 59 (GetInfo 1) */
 
 /* what a thread waits for in the kernel (KThread.wait; see "wait queues") */
 enum { WAIT_NONE, WAIT_OBJECTS, WAIT_MUTEX, WAIT_CONDITION, WAIT_ADDRESS };
@@ -46,7 +56,11 @@ typedef struct KThread {
     HANDLE host;
     Cpu *cpu;
     u64 entry, arg, stack_top, tlr, id;
-    i32 priority, core;
+    i32 priority;       /* (written under the lock, read by the thread itself outside it: atomic) */
+    i32 core;           /* its ideal core, -1 for none (see "priorities and cores") */
+    u64 mask;           /* its core mask */
+    i32 processor;      /* what GetCurrentProcessorNumber answers on it (atomic, as priority) */
+    int band;           /* (SSBU_HOST_PRIORITIES) the host priority it has set itself */
     int started, exited, cancelled;
     int wait;                   /* WAIT_NONE, or what the thread waits for now */
     struct WaitQueue *queue;    /* (a mutex, a condition variable, an address) the queue it is in */
@@ -85,6 +99,9 @@ static KThread *dead;                        /* (recycling) threads freed but fo
 static u64 spare_tlrs[TLR_AREA / 0x1000];    /* (recycling) regions of freed threads, for the next ones */
 static u32 nspare_tlrs;
 static int said_half_full;                   /* (recycling) see say_half_full */
+static int priority_queues;                  /* SSBU_PRIORITY_QUEUES=1 (see "wait queues") */
+static int host_priorities;                  /* SSBU_HOST_PRIORITIES=1 (see "priorities and cores") */
+static int core_masks;                       /* SSBU_CORE_MASKS=1 (likewise) */
 
 /* ---- time ------------------------------------------------------------------------ */
 static u64 now_ns(void) { return rt_clock_ns(); }
@@ -116,11 +133,19 @@ static void kwake(KThread *t) { t->wakes++; WakeConditionVariable(&t->woken); }
  * that queue: a userspace mutex, a condition variable and an arbiter address have one each (by
  * address, while a thread waits there), a kernel object has its own for WaitSynchronization (a
  * wait on several objects is in each of their queues). First come, first served, as on the
- * console among threads of one priority (priorities are not looked at here). Whoever wakes a
- * thread takes it out of its queues first and sets its wait back to WAIT_NONE, so a thread's wait
- * - what it waits for and where in the queue - is all in its KThread. (A woken WaitSynchronization
- * looks at its objects again, as before: one cleared before it runs is waited on again, where on
- * the console the signal would have ended the wait.) */
+ * console among threads of one priority. Whoever wakes a thread takes it out of its queues first
+ * and sets its wait back to WAIT_NONE, so a thread's wait - what it waits for and where in the
+ * queue - is all in its KThread. (A woken WaitSynchronization looks at its objects again, as
+ * before: one cleared before it runs is waited on again, where on the console the signal would
+ * have ended the wait.)
+ *
+ * SSBU_PRIORITY_QUEUES=1 orders a mutex's, a condition variable's and an address's queue as the
+ * console does, by priority and then arrival (mesosphere: a mutex owner's waiter list and the
+ * condition variable and arbiter trees), and a thread whose priority changes while it waits moves
+ * behind the threads of its new priority. (An object's queue stays as it is: a signal wakes all
+ * of it.) Off by default: on the console the higher thread is also the one that runs, while here
+ * every thread runs at once whatever its priority, and only first come first served is sure never
+ * to leave a waiter behind for good. */
 #define QUEUES 1024   /* (a waiting thread is in one at most) */
 typedef struct WaitQueue { struct WaitQueue *next; KThread *first, *last; u64 key; u32 count; int kind; } WaitQueue;
 static WaitQueue queue_pool[QUEUES], *spare_queues, *queues[QUEUES];
@@ -139,6 +164,23 @@ static KThread *first_waiting(int kind, u64 key, u32 *count) {
     return q ? q->first : NULL;
 }
 
+/* `t` into queue q: behind the threads there, or with SSBU_PRIORITY_QUEUES behind those of its
+ * priority and higher only. */
+static void place(WaitQueue *q, KThread *t) {
+    KThread *ahead = q->last;
+    if (priority_queues)
+        while (ahead && ahead->priority > t->priority) ahead = ahead->qprev;
+    t->qprev = ahead;
+    t->qnext = ahead ? ahead->qnext : q->first;
+    if (t->qnext) t->qnext->qprev = t; else q->last = t;
+    if (ahead) ahead->qnext = t; else q->first = t;
+}
+
+static void unlink_thread(WaitQueue *q, KThread *t) {
+    if (t->qprev) t->qprev->qnext = t->qnext; else q->first = t->qnext;
+    if (t->qnext) t->qnext->qprev = t->qprev; else q->last = t->qprev;
+}
+
 /* `t` waits for (kind, key) from now on, behind the threads waiting there already. */
 static void enqueue(KThread *t, int kind, u64 key) {
     WaitQueue **p = queue_slot(kind, key), *q = *p;
@@ -151,10 +193,7 @@ static void enqueue(KThread *t, int kind, u64 key) {
     }
     t->wait = kind;
     t->queue = q;
-    t->qprev = q->last;
-    t->qnext = NULL;
-    if (q->last) q->last->qnext = t; else q->first = t;
-    q->last = t;
+    place(q, t);
     q->count++;
 }
 
@@ -162,8 +201,7 @@ static void enqueue(KThread *t, int kind, u64 key) {
  * left empty goes back to the spares). */
 static void unqueue(KThread *t) {
     WaitQueue *q = t->queue;
-    if (t->qprev) t->qprev->qnext = t->qnext; else q->first = t->qnext;
-    if (t->qnext) t->qnext->qprev = t->qprev; else q->last = t->qprev;
+    unlink_thread(q, t);
     t->wait = WAIT_NONE;
     t->queue = NULL;
     t->qprev = t->qnext = NULL;
@@ -172,6 +210,14 @@ static void unqueue(KThread *t) {
         q->next = spare_queues;
         spare_queues = q;
     }
+}
+
+/* (SSBU_PRIORITY_QUEUES) `t`'s priority changed while it waits for a mutex, a condition variable
+ * or an address: behind the threads of its new priority there. */
+static void requeue(KThread *t) {
+    if (!priority_queues || !t->queue) return;
+    unlink_thread(t->queue, t);
+    place(t->queue, t);
 }
 
 /* `t`, in WaitSynchronization, out of every object's queue. */
@@ -498,6 +544,72 @@ static void drop_thread(KThread *t) {
     reap();
 }
 
+/* ---- priorities and cores ------------------------------------------------------------
+ * A thread's priority (0 highest to 63 lowest; an application's 28 to 59, which are nn::os's 0 to
+ * 31 plus 28, its default 16 being 44 here) is kept as given and answered back, and its core as
+ * given to CreateThread; SetThreadCoreMask is kept nowhere, GetThreadCoreMask's mask is 0x7 and
+ * GetCurrentProcessorNumber 0, whatever the thread. The host is not told about cores either: host
+ * threads run on any processor (in ssbu-recomp, whose SSBU_OS_CONSOLE_CORES pins three, that cost
+ * frame rate on a busy PC).
+ *
+ * SSBU_CORE_MASKS=1 gives the console's answers instead, with its checks, as Atmosphere's
+ * open-source kernel has them (mesosphere's kern_svc_thread.cpp and kern_k_thread.cpp): priorities
+ * 28 to 59 and cores 0 to 2 only, a new thread's mask its core alone, -2 for the core the
+ * process's (0, from the program's metadata), -1 for no ideal core and -3 to keep it in
+ * SetThreadCoreMask, and GetCurrentProcessorNumber the thread's ideal core, or the first of its
+ * mask without one - where the console's scheduler mostly keeps it, not where it is right now. Off
+ * by default until a play session has been run with it: a value the console refuses was taken
+ * before, and the game may keep data by processor number.
+ *
+ * With SSBU_HOST_PRIORITIES=1 the host thread's priority follows the guest's, in four bands: above
+ * normal (28 to 43, nn::os's 0 to 15), normal (44), below normal (45 to 55) and lowest (56 to 59,
+ * nn::os's 28 to 31; ssbu-recomp's bands, less its highest for 0 to 4) - never above the
+ * renderer's and input's own threads (above normal) or audio's (time critical). The platform
+ * layer (linux/win32.c) makes them quality-of-service classes on macOS (user-interactive, which
+ * every thread starts in, for the top two; user-initiated; utility, which Apple silicon may run on
+ * its efficiency cores) and nice values on Linux (0, 0, 2, 5: nothing real-time, nothing above
+ * where threads start). macOS sets only the calling thread's class, so each thread sets its own:
+ * at its start, and as it leaves a system call after its priority changed. Off by default: the
+ * console lends a waiting thread's priority to the owner of the mutex it waits for and this does
+ * not, so while every processor is busy a low thread holding what a high one waits for runs low;
+ * and on Linux a thread lowered cannot be raised again without RLIMIT_NICE of 20 or more (or
+ * root), so there the switch is left off without it. */
+static int valid_priority(i32 priority) { return priority >= 0 && priority <= 63 && PRIORITIES >> priority & 1; }
+
+static int host_band(i32 priority) {
+    return priority < 44 ? THREAD_PRIORITY_ABOVE_NORMAL : priority == 44 ? THREAD_PRIORITY_NORMAL :
+           priority < 56 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST;
+}
+
+/* (SSBU_HOST_PRIORITIES) On the thread itself: its host priority after its guest one. A thread
+ * starts in the normal band (KThread.band 0). */
+static void follow_priority(KThread *t) {
+    int band = host_band(__atomic_load_n(&t->priority, __ATOMIC_RELAXED));
+    if (band == t->band) return;
+    t->band = band;
+    SetThreadPriority(GetCurrentThread(), band);
+}
+
+#ifdef __linux__
+static int nice_reversible(void) {
+    struct rlimit r;
+    return geteuid() == 0 || (getrlimit(RLIMIT_NICE, &r) == 0 && (r.rlim_cur == RLIM_INFINITY || r.rlim_cur >= 20));
+}
+#else
+static int nice_reversible(void) { return 1; }
+#endif
+
+/* SetThreadCoreMask's arguments, checked in mesosphere's order; -2 becomes the process's core. */
+static u32 check_core_mask(i32 *core, u64 *mask) {
+    if (*core == -2) { *core = 0; *mask = 1; return R_OK; }   /* (the mask is not looked at) */
+    if (*mask & ~CORES) return R_INVALID_CORE;
+    if (!*mask) return R_INVALID_COMBINATION;
+    if (*core >= 0 && *core <= 3) return *mask >> *core & 1 ? R_OK : R_INVALID_COMBINATION;
+    return *core == -1 || *core == -3 ? R_OK : R_INVALID_CORE;
+}
+
+static i32 processor_of(i32 core, u64 mask) { return core >= 0 ? core : __builtin_ctzll(mask); }
+
 /* ---- threads --------------------------------------------------------------------- */
 static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 core) {
     KThread *t = calloc(1, sizeof *t);
@@ -505,6 +617,8 @@ static KThread *new_thread(u64 entry, u64 arg, u64 stack_top, i32 priority, i32 
     threads[nthreads++] = t;
     InitializeConditionVariable(&t->woken);
     t->entry = entry; t->arg = arg; t->stack_top = stack_top; t->priority = priority; t->core = core;
+    t->mask = (u32)core < 3 ? 1ull << core : CORES;   /* (any core without SSBU_CORE_MASKS) */
+    t->processor = (u32)core < 3 ? core : 0;
     t->id = next_thread_id++;
     if (recycle) reap();
     if (nspare_tlrs) {
@@ -551,13 +665,15 @@ static DWORD WINAPI thread_main(LPVOID param) {
     KThread *t = param;
     char where[96];
     WCHAR desc[128];   /* for the profiler and debuggers */
+    i32 priority = __atomic_load_n(&t->priority, __ATOMIC_RELAXED);
 #ifdef _WIN32
-    _snwprintf(desc, 127, L"guest thread %llu (%hs, priority %d)", t->id, rt_describe(t->entry, where, sizeof where), t->priority);
+    _snwprintf(desc, 127, L"guest thread %llu (%hs, priority %d)", t->id, rt_describe(t->entry, where, sizeof where), priority);
 #else
-    swprintf(desc, 127, L"guest thread %llu (%s, priority %d)", (unsigned long long)t->id, rt_describe(t->entry, where, sizeof where), t->priority);
+    swprintf(desc, 127, L"guest thread %llu (%s, priority %d)", (unsigned long long)t->id, rt_describe(t->entry, where, sizeof where), priority);
 #endif
     desc[127] = 0;
     SetThreadDescription(GetCurrentThread(), desc);
+    if (host_priorities) follow_priority(t);
 #ifndef _WIN32
     jmp_buf out;
     exit_point = &out;
@@ -576,6 +692,7 @@ Cpu *kernel_main_thread(u32 *handle) {
     t->started = 1;
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host, 0, FALSE, DUPLICATE_SAME_ACCESS);
     LeaveCriticalSection(&klock);
+    if (host_priorities) follow_priority(t);
     *handle = t->handle;
     return t->cpu;
 }
@@ -767,7 +884,7 @@ static void signal_condition(u64 key, i32 count) {
     if (!t) st32(key, 0);
 }
 
-void rt_svc(Cpu *c, u32 n) {
+static void system_call(Cpu *c, u32 n) {
     KThread *me = c->thread;
     KObject *o;
     u64 *x = c->x;
@@ -778,7 +895,9 @@ void rt_svc(Cpu *c, u32 n) {
     case 0x0B:   /* SleepThread(ns): non-positive values are yield requests */
         if ((i64)x[0] > 0) sleep_ns(x[0]); else SwitchToThread();
         return;
-    case 0x10: x[0] = 0; return;                         /* GetCurrentProcessorNumber */
+    case 0x10:                                           /* GetCurrentProcessorNumber (see "priorities and cores") */
+        x[0] = core_masks ? (u32)__atomic_load_n(&me->processor, __ATOMIC_RELAXED) : 0;
+        return;
     case 0x1E: x[0] = rt_ticks(); return;                /* GetSystemTick */
     case 0x27:                                           /* OutputDebugString(ptr, len) */
         fprintf(stderr, "[guest] %.*s%s", (int)x[1], P(const char, x[0]), x[1] && P(const char, x[0])[x[1] - 1] == '\n' ? "" : "\n");
@@ -857,7 +976,13 @@ void rt_svc(Cpu *c, u32 n) {
     }
     case 0x06: query_memory(x[0], x[2]); x[0] = R_OK; x[1] = 0; break;
     case 0x08: {   /* CreateThread(entry, arg, stack top, priority, core) -> handle */
-        KThread *t = new_thread(x[1], x[2], x[3], (i32)x[4], (i32)x[5]);
+        i32 priority = (i32)x[4], core = (i32)x[5];
+        if (core_masks) {
+            if (core == -2) core = 0;   /* the process's core */
+            if ((u32)core > 2) { x[0] = R_INVALID_CORE; break; }
+            if (!valid_priority(priority)) { x[0] = R_INVALID_PRIORITY; break; }
+        }
+        KThread *t = new_thread(x[1], x[2], x[3], priority, core);
         x[0] = R_OK; x[1] = t->handle;
         break;
     }
@@ -872,18 +997,35 @@ void rt_svc(Cpu *c, u32 n) {
         if (!(o = object_of(c, (u32)x[1], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
         x[0] = R_OK; x[1] = (u32)o->thread->priority;
         break;
-    case 0x0D:     /* SetThreadPriority(handle, priority) */
+    case 0x0D:     /* SetThreadPriority(handle, priority): the host's follows as the thread leaves its system call */
+        if (core_masks && !valid_priority((i32)x[1])) { x[0] = R_INVALID_PRIORITY; break; }
         if (!(o = object_of(c, (u32)x[0], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
-        o->thread->priority = (i32)x[1];
+        __atomic_store_n(&o->thread->priority, (i32)x[1], __ATOMIC_RELAXED);
+        requeue(o->thread);
         x[0] = R_OK;
         break;
-    case 0x0E:     /* GetThreadCoreMask(handle) -> core, mask */
+    case 0x0E:     /* GetThreadCoreMask(handle) -> ideal core, mask */
         if (!(o = object_of(c, (u32)x[2], OBJ_THREAD))) { x[0] = R_INVALID_HANDLE; break; }
-        x[0] = R_OK; x[1] = (u32)o->thread->core; x[2] = 0x7;
+        x[0] = R_OK; x[1] = (u32)o->thread->core; x[2] = core_masks ? o->thread->mask : CORES;
         break;
-    case 0x0F:     /* SetThreadCoreMask(handle, core, mask): not kept - host threads run on any core */
-        x[0] = recycle && !object_of(c, (u32)x[0], OBJ_THREAD) ? R_INVALID_HANDLE : R_OK;   /* (without recycling any handle, as before) */
+    case 0x0F: {   /* SetThreadCoreMask(handle, ideal core, mask): with SSBU_CORE_MASKS kept, never given to the host thread (see "priorities and cores") */
+        i32 core = (i32)x[1];
+        u64 mask = x[2];
+        u32 r = core_masks ? check_core_mask(&core, &mask) : R_OK;
+        if (r) { x[0] = r; break; }
+        if (!(o = object_of(c, (u32)x[0], OBJ_THREAD))) { x[0] = recycle ? R_INVALID_HANDLE : R_OK; break; }   /* (without recycling any handle, as before) */
+        if (!core_masks) { x[0] = R_OK; break; }
+        KThread *t = o->thread;
+        if (core == -3) {   /* (a kept ideal core must be in the new mask) */
+            if (t->core >= 0 && !(mask >> t->core & 1)) { x[0] = R_INVALID_COMBINATION; break; }
+            core = t->core;
+        }
+        t->core = core;
+        t->mask = mask;
+        __atomic_store_n(&t->processor, processor_of(core, mask), __ATOMIC_RELAXED);
+        x[0] = R_OK;
         break;
+    }
     case 0x11:     /* SignalEvent(handle) */
         if (!(o = object_of(c, (u32)x[0], OBJ_EVENT))) { x[0] = R_INVALID_HANDLE; break; }
         o->signaled = 1;
@@ -977,6 +1119,11 @@ void rt_svc(Cpu *c, u32 n) {
     }
     LeaveCriticalSection(&klock);
     if (rt_trace) fprintf(stderr, "[svc %#04x] -> %#llx (x1=%#llx)\n", n, x[0], x[1]);
+}
+
+void rt_svc(Cpu *c, u32 n) {
+    system_call(c, n);
+    if (host_priorities) follow_priority(c->thread);   /* (a priority changed during the call, its own or by another thread) */
 }
 
 /* For diagnosis: where is every guest thread right now? */
@@ -1079,4 +1226,14 @@ void kernel_init(void) {
             rt_fatal("kernel: cannot reserve the %s area at %#llx", areas[i].what, areas[i].base);
     map_guard = getenv("SSBU_MAP_GUARD") && !strcmp(getenv("SSBU_MAP_GUARD"), "1");
     if (map_guard) fprintf(stderr, "[kernel] a memory mapping's source is inaccessible while it is mapped (SSBU_MAP_GUARD=1)\n");
+    priority_queues = getenv("SSBU_PRIORITY_QUEUES") && !strcmp(getenv("SSBU_PRIORITY_QUEUES"), "1");
+    if (priority_queues) fprintf(stderr, "[kernel] mutex, condition variable and address waiters queued by priority, then arrival (SSBU_PRIORITY_QUEUES=1)\n");
+    core_masks = getenv("SSBU_CORE_MASKS") && !strcmp(getenv("SSBU_CORE_MASKS"), "1");
+    if (core_masks) fprintf(stderr, "[kernel] thread priorities and core masks checked and kept as on the console (SSBU_CORE_MASKS=1)\n");
+    host_priorities = getenv("SSBU_HOST_PRIORITIES") && !strcmp(getenv("SSBU_HOST_PRIORITIES"), "1");
+    if (host_priorities && !nice_reversible()) {
+        host_priorities = 0;
+        fprintf(stderr, "[kernel] SSBU_HOST_PRIORITIES=1 left off: a thread lowered could not be raised again (RLIMIT_NICE below 20)\n");
+    }
+    if (host_priorities) fprintf(stderr, "[kernel] host thread priorities follow the guest's, in four bands (SSBU_HOST_PRIORITIES=1)\n");
 }
