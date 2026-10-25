@@ -1245,14 +1245,19 @@ async def serve(o, make=None):
     return transport, lobby
 
 
-async def main(o):
-    transport, lobby = await serve(o)
-    Lobby.say(f"SSBU netplay lobby on UDP {o.bind}:{transport.get_extra_info('sockname')[1]} (protocol {PROTOCOL})")
+def say_more(o, lobby):
+    """The start-up lines for SU's port and the status page, when they are served."""
     if lobby.su.transport is not None:
         Lobby.say(f"and for ssbu-recomp's games on UDP {o.bind}:{lobby.su.transport.get_extra_info('sockname')[1]} "
                   f"(protocol SU {SU_PROTOCOL})")
     if lobby.status_server is not None:
         Lobby.say("status page on http://%s:%d/status" % lobby.status_server.sockets[0].getsockname()[:2])
+
+
+async def main(o):
+    transport, lobby = await serve(o)
+    Lobby.say(f"SSBU netplay lobby on UDP {o.bind}:{transport.get_extra_info('sockname')[1]} (protocol {PROTOCOL})")
+    say_more(o, lobby)
     task = asyncio.ensure_future(lobby.run())
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

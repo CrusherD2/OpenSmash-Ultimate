@@ -273,6 +273,7 @@ async def main(o):
     streams = await asyncio.start_server(lobby.stream, o.bind, port)   # NEX's TCP, on the same port number
     relay.Lobby.say(f"SSBU netplay lobby with Online on UDP and TCP {o.bind}:{port} "
                     f"(protocol {relay.PROTOCOL}; NEX at 10.13.0.1)")
+    relay.say_more(o, lobby)
     task = asyncio.ensure_future(lobby.run())
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
