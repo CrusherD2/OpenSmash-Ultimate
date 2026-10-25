@@ -99,7 +99,7 @@ class OnlineLobby(relay.Lobby):
         c = self.by_ip.get(ip_int(ip))
         if c is not None:
             src = ip_int(src_ip) if src_ip else GATEWAY
-            self.send(relay.header(relay.DATA) + struct.pack(">IIHH", src, c.ip, sport, port) + data, c.at)
+            self.to(c, relay.header(relay.DATA) + struct.pack(">IIHH", src, c.ip, sport, port) + data)
 
     def new_ip(self):
         ip = super().new_ip()
@@ -114,7 +114,7 @@ class OnlineLobby(relay.Lobby):
         if dst not in relay.BROADCASTS:
             m = self.by_ip.get(dst)
             if m is not None and m is not c and self.nex.may_talk(relay.ip_text(c.ip), relay.ip_text(dst)):
-                self.send(p, m.at)
+                self.to(m, p)
                 return
         super().on_game(c, p, dst)
 
@@ -262,7 +262,7 @@ class OnlineLobby(relay.Lobby):
 
 async def main(o):
     loop = asyncio.get_running_loop()
-    transport, lobby = await loop.create_datagram_endpoint(lambda: OnlineLobby(o), local_addr=(o.bind, o.port))
+    transport, lobby = await relay.serve(o, OnlineLobby)
     port = transport.get_extra_info('sockname')[1]
     streams = await asyncio.start_server(lobby.stream, o.bind, port)   # NEX's TCP, on the same port number
     relay.Lobby.say(f"SSBU netplay lobby with Online on UDP and TCP {o.bind}:{port} "
@@ -280,7 +280,7 @@ async def main(o):
     finally:
         lobby.nex.flush(time.monotonic(), force=True)   # (accounts and ratings not written yet)
         streams.close()
-        transport.close()
+        lobby.close_ports()
         relay.Lobby.say("stopped")
 
 

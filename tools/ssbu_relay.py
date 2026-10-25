@@ -67,6 +67,32 @@ def header(kind, version=PROTOCOL):
     return b"SN" + bytes((version, kind))
 
 
+class Wire:
+    """A protocol the lobby speaks, on a UDP port of its own."""
+    def __init__(self, name, version, data, bcast):
+        self.name, self.magic, self.version = name, name.encode(), version
+        self.data, self.bcast = data, bcast   # (its DATA and BCAST types)
+        self.transport = None
+
+    def header(self, kind, version=None):
+        return self.magic + bytes((self.version if version is None else version, kind))
+
+
+class Endpoint(asyncio.DatagramProtocol):
+    """A wire's UDP port: what comes in goes to the lobby."""
+    def __init__(self, lobby, wire):
+        self.lobby, self.wire = lobby, wire
+
+    def connection_made(self, transport):
+        self.wire.transport = transport
+
+    def error_received(self, exc):
+        self.lobby.drops["socket error"] += 1
+
+    def datagram_received(self, p, at):
+        self.lobby.received(self.wire, p, at)
+
+
 def text(raw):
     return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
 
@@ -83,9 +109,9 @@ def address_number(host):
     return struct.unpack(">I", socket.inet_aton(host))[0]
 
 
-def ldn_packet(src, dst, kind, payload):
-    """A local wireless message as a player's game would send it."""
-    return (header(DATA) + struct.pack(">IIHH", src, dst, LDN_PORT, LDN_PORT) +
+def ldn_packet(src, dst, kind, payload, head=None):
+    """A local wireless message as a player's game would send it (head: the DATA header of its wire)."""
+    return ((head or header(DATA)) + struct.pack(">IIHH", src, dst, LDN_PORT, LDN_PORT) +
             bytes((ord("L"), kind, 0, 0)) + payload)
 
 
@@ -131,8 +157,10 @@ class Bucket:
 
 
 class Client:
-    def __init__(self, at, nonce, ip, name, part, now, o):
+    def __init__(self, at, nonce, ip, name, part, now, o, wire=None):
         self.at, self.nonce, self.ip, self.name, self.part = at, nonce, ip, name, part
+        self.wire = wire       # the protocol it speaks (None: SN)
+        self.build, self.code = b"", ""   # (its part: wire, build and lobby code)
         self.cookie = secrets.randbits(64)   # proves the address is real (it came back in a PING)
         self.verified = False
         self.seen = now
@@ -186,13 +214,14 @@ def options(**overrides):
     return o
 
 
-class Lobby(asyncio.DatagramProtocol):
+class Lobby:
     def __init__(self, o):
         self.o = o
-        self.by_addr = {}       # (host, port) -> Client
+        self.sn = Wire("SN", PROTOCOL, DATA, BCAST)
+        self.by_addr = {}       # (wire, (host, port)) -> Client
         self.by_ip = {}         # virtual address -> Client
-        self.parts = {}         # (build, lobby code) -> set of Client
-        self.part_rooms = {}    # (build, lobby code) -> set of Listing
+        self.parts = {}         # (wire name, build, lobby code) -> set of Client
+        self.part_rooms = {}    # (wire name, build, lobby code) -> set of Listing
         self.listings = {}      # session id -> Listing
         self.per_ip = collections.Counter()   # host -> verified players from there
         self.pending = 0        # players not verified yet
@@ -204,14 +233,12 @@ class Lobby(asyncio.DatagramProtocol):
         self.counts = collections.Counter()
         self.drops = collections.Counter()
         self.max_data = 0
-        self.transport = None
 
     # ---- plumbing ---------------------------------------------------------------------
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def error_received(self, exc):
-        self.drops["socket error"] += 1
+    def close_ports(self):
+        for wire in (self.sn,):
+            if wire.transport is not None:
+                wire.transport.close()
 
     def log(self, *what):
         if self.o.verbose:
@@ -221,13 +248,22 @@ class Lobby(asyncio.DatagramProtocol):
     def say(*what):
         print(time.strftime("%Y-%m-%d %H:%M:%S"), *what, flush=True)
 
-    def send(self, data, at):
+    def send(self, data, at, wire=None):
+        """data to the address at, from the port of wire (SN's by default)."""
         self.counts["out packets"] += 1
         self.counts["out bytes"] += len(data)
-        self.transport.sendto(data, at)
+        (wire or self.sn).transport.sendto(data, at)
 
-    def reject(self, at, nonce, reason, why, version=PROTOCOL):
-        self.send(header(REJECT, version) + nonce + bytes((reason,)) + why.encode()[:63].ljust(64, b"\0"), at)
+    def to(self, c, data):
+        self.send(data, c.at, c.wire)
+
+    def data_header(self, c):
+        """The header of a DATA to c."""
+        wire = c.wire or self.sn
+        return wire.header(wire.data)
+
+    def reject(self, wire, at, nonce, reason, why, version=None):
+        self.send(wire.header(REJECT, version) + nonce + bytes((reason,)) + why.encode()[:63].ljust(64, b"\0"), at, wire)
 
     def gate(self, at, now):
         """Whether a stranger at this address may get an answer now (rate-limited: a lobby must not
@@ -301,12 +337,12 @@ class Lobby(asyncio.DatagramProtocol):
     def close(self, listing, packet=None):
         """A network is gone: tell its players (with the host's own LM_GONE if there is one)."""
         if packet is None:
-            packet = ldn_packet(listing.owner.ip, BROADCASTS[0], LM_GONE, listing.session)
+            packet = ldn_packet(listing.owner.ip, BROADCASTS[0], LM_GONE, listing.session, self.data_header(listing.owner))
         self.dirty_clients.update(self.members(listing), listing.introduced)
         self.dirty.discard(listing)
         for m in self.members(listing):
             if m is not listing.owner:
-                self.send(packet, m.at)
+                self.to(m, packet)
                 m.claim = None
         self.listings.pop(listing.session, None)
         rooms = self.part_rooms.get(listing.owner.part)
@@ -324,10 +360,10 @@ class Lobby(asyncio.DatagramProtocol):
         if c.claim:   # tell its host at once rather than after the host's timeout
             listing = self.listings.get(c.claim)
             if listing is not None and c.ip in listing.nodes:
-                self.send(ldn_packet(c.ip, listing.owner.ip, LM_LEAVE, c.claim), listing.owner.at)
+                self.to(listing.owner, ldn_packet(c.ip, listing.owner.ip, LM_LEAVE, c.claim, self.data_header(listing.owner)))
                 self.dirty.add(listing)
         self.dirty_clients.discard(c)
-        self.by_addr.pop(c.at, None)
+        self.by_addr.pop((c.wire, c.at), None)
         self.by_ip.pop(c.ip, None)
         players = self.parts.get(c.part)
         if players is not None:
@@ -349,10 +385,10 @@ class Lobby(asyncio.DatagramProtocol):
             self.per_ip[c.at[0]] += 1
 
     # ---- packets ------------------------------------------------------------------------
-    def datagram_received(self, p, at):
+    def received(self, wire, p, at):
         self.counts["in packets"] += 1
         self.counts["in bytes"] += len(p)
-        if len(p) < 4 or p[:2] != b"SN":
+        if len(p) < 4 or p[:2] != wire.magic:
             return
         try:
             now = time.monotonic()
@@ -364,12 +400,13 @@ class Lobby(asyncio.DatagramProtocol):
             self.say(f"error on a packet from {at[0]}: {e!r}")
 
     def packet(self, p, at, now):
+        """A packet of WindowSmash's games (SN)."""
         kind = p[3]
         if p[2] != PROTOCOL:   # another version of the game's netplay: say so
             if kind == JOIN and len(p) >= V1_JOIN_SIZE and self.gate(at, now):
-                self.reject(at, p[4:12], 2, f"different netplay version (lobby {PROTOCOL}, you {p[2]})", p[2])
+                self.reject(self.sn, at, p[4:12], 2, f"different netplay version (lobby {PROTOCOL}, you {p[2]})", p[2])
             return
-        c = self.by_addr.get(at)
+        c = self.by_addr.get((self.sn, at))
         if kind == JOIN:
             self.on_join(p, at, c, now)
         elif c is None:
@@ -382,8 +419,8 @@ class Lobby(asyncio.DatagramProtocol):
             c.ping = struct.unpack_from(">H", p, 28)[0]
             if len(p) >= PING_EXT_SIZE:
                 self.on_ping_ext(c, p, now)
-            self.send(header(PONG) + p[12:20] + struct.pack(">HHB", min(len(self.parts.get(c.part, ())), 0xFFFF),
-                                                            min(len(self.part_rooms.get(c.part, ())), 0xFFFF), 1), at)
+            self.to(c, header(PONG) + p[12:20] + struct.pack(">HHB", min(len(self.parts.get(c.part, ())), 0xFFFF),
+                                                             min(len(self.part_rooms.get(c.part, ())), 0xFFFF), 1))
         elif kind == LEAVE:
             if len(p) >= 12 and p[4:12] == c.nonce:
                 self.drop(c, "left")
@@ -397,17 +434,20 @@ class Lobby(asyncio.DatagramProtocol):
                 return
             self.on_list(c, p[12:16], now)
         elif kind == DATA:
-            if len(p) < 16 or not self.admit(c, p, 4, now):
-                return
-            src, dst, sport, dport = struct.unpack_from(">IIHH", p, 4)
-            if src != c.ip:
-                self.drops["not its address"] += 1
-            elif sport == LDN_PORT or dport == LDN_PORT:
-                self.on_ldn(c, p, dst, sport, dport, now)
-            else:
-                self.on_game(c, p, dst)
+            self.on_data(c, p, now)
         elif kind == BCAST:
             self.on_bcast(c, p, now)
+
+    def on_data(self, c, p, now):
+        if len(p) < 16 or not self.admit(c, p, 4, now):
+            return
+        src, dst, sport, dport = struct.unpack_from(">IIHH", p, 4)
+        if src != c.ip:
+            self.drops["not its address"] += 1
+        elif sport == LDN_PORT or dport == LDN_PORT:
+            self.on_ldn(c, p, dst, sport, dport, now)
+        else:
+            self.on_game(c, p, dst)
 
     def admit(self, c, p, at, now):
         """Whether a verified player's datagram (its DATA body at offset at) may be carried."""
@@ -430,50 +470,58 @@ class Lobby(asyncio.DatagramProtocol):
         nonce = p[4:12]
         room, name = text(p[12:12 + NAME_LEN]), text(p[12 + NAME_LEN:12 + 2 * NAME_LEN])
         build = p[12 + 2 * NAME_LEN:JOIN_SIZE].rstrip(b"\0")
+        c = self.join(self.sn, at, c, nonce, room, name, build, now)
+        if c is not None:
+            self.to(c, header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, 1 | 2) + b"\0")   # (2: introduces peers)
+
+    def join(self, wire, at, c, nonce, room, name, build, now):
+        """The player a JOIN comes from (c: the one at its address, if any): a new one, one back
+        from a new port, or the same again; None when it is turned away."""
         if self.is_banned(at[0]):
             self.drops["banned"] += 1
-            return
+            return None
         if c is not None and c.nonce != nonce:   # a new game from the same place
             self.drop(c, "restarted")
             c = None
-        part = (build, room)
+        part = (wire.name, build, room)
         if c is None:   # a player back from a new place (its router changed its port)?
             for other in self.parts.get(part, ()):
                 if other.nonce == nonce and other.verified:
-                    del self.by_addr[other.at]
+                    del self.by_addr[wire, other.at]
                     self.per_ip[other.at[0]] -= 1
                     if self.per_ip[other.at[0]] <= 0:
                         del self.per_ip[other.at[0]]
                     self.per_ip[at[0]] += 1
                     other.at = at
-                    self.by_addr[at] = c = other
+                    self.by_addr[wire, at] = c = other
                     self.mark(c)   # (the players it was introduced to need its new port)
                     break
         if c is None:   # a new player
             if not self.gate(at, now):
                 self.drops["join rate"] += 1
-                return
-            if build.upper() != REQUIRED_BUILD:   # (another game version: refused, saying why)
+                return None
+            if wire is self.sn and build.upper() != REQUIRED_BUILD:   # (another game version: refused, saying why)
                 self.drops["game version"] += 1
                 self.log(f"refused {printable(name)} from {at[0]}:{at[1]}: build {build[:8].decode('ascii', 'replace')}, "
                          "not 13.0.5's")
-                self.reject(at, nonce, 4, NOT_13)
-                return
+                self.reject(wire, at, nonce, 4, NOT_13)
+                return None
             why = ("the lobby is full" if len(self.by_addr) >= self.o.max_clients or self.pending >= self.o.max_pending
                    else f"too many players from your address ({self.o.per_ip})" if self.per_ip[at[0]] >= self.o.per_ip
                    else None)
             ip = self.new_ip() if why is None else None
             if ip is None:
-                self.reject(at, nonce, 1, why or "the lobby is full")
-                return
-            c = Client(at, nonce, ip, name, part, now, self.o)
-            self.by_addr[at], self.by_ip[ip] = c, c
+                self.reject(wire, at, nonce, 1, why or "the lobby is full")
+                return None
+            c = Client(at, nonce, ip, name, part, now, self.o, wire)
+            c.build, c.code = build, room
+            self.by_addr[wire, at], self.by_ip[ip] = c, c
             self.parts.setdefault(part, set()).add(c)
             self.pending += 1
-            self.log(f"{printable(name)} joined lobby {printable(room)!r} (build {build[:8].decode('ascii', 'replace')}) "
-                     f"as {ip_text(ip)} from {at[0]}:{at[1]}")
+            self.log(f"{printable(name)} joined lobby {printable(room)!r} ({wire.name}, build "
+                     f"{build[:8].decode('ascii', 'replace')}) as {ip_text(ip)} from {at[0]}:{at[1]}")
         c.seen = now
-        self.send(header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, 1 | 2) + b"\0", at)   # (2: introduces peers)
+        return c
 
     def on_list(self, c, seq, now):
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
@@ -482,8 +530,8 @@ class Lobby(asyncio.DatagramProtocol):
         rooms = sorted((r for r in self.part_rooms.get(c.part, ()) if r.owner is not c and now - r.updated <= self.o.listed_for),
                        key=lambda r: (not r.open, -r.count, 10 if r.distance is None else r.distance, r.created))[:LIST_MAX]
         for r in rooms:
-            self.send(header(LISTING) + seq + struct.pack(">I", r.owner.ip) + r.info, c.at)
-        self.send(header(LIST_END) + seq + bytes((len(rooms),)), c.at)
+            self.to(c, header(LISTING) + seq + struct.pack(">I", r.owner.ip) + r.info)
+        self.to(c, header(LIST_END) + seq + bytes((len(rooms),)))
 
     def on_ldn(self, c, p, dst, sport, dport, now):
         """Local wireless's own messages: only the ones its protocol has, between the players they
@@ -526,7 +574,7 @@ class Lobby(asyncio.DatagramProtocol):
                 self.drops["ldn"] += 1
                 return
             if kind == LM_LEAVE:
-                self.send(p, b.at)
+                self.to(b, p)
                 c.claim = None
                 self.dirty.add(b.listing)
                 self.dirty_clients.add(c)
@@ -534,7 +582,7 @@ class Lobby(asyncio.DatagramProtocol):
         else:
             self.drops["ldn"] += 1
             return
-        self.send(p, b.at)
+        self.to(b, p)
 
     def on_advertise(self, c, p, body, now):
         if len(body) < NI_SIZE:
@@ -567,7 +615,7 @@ class Lobby(asyncio.DatagramProtocol):
         # (to whoever is in it, and whoever just left it, so they learn it at once)
         for m in {*before, *self.members(listing)}:
             if m is not c:
-                self.send(p, m.at)
+                self.to(m, p)
 
     def on_game(self, c, p, dst):
         """The game's own traffic: only within a network, between its players."""
@@ -579,14 +627,14 @@ class Lobby(asyncio.DatagramProtocol):
         if dst in BROADCASTS:
             for m in members:
                 if m is not c:
-                    self.send(p, m.at)
+                    self.to(m, p)
                     self.counts["game relayed"] += 1
             return
         m = self.by_ip.get(dst)
         if m is None or m is c or m not in members:
             self.drops["not in the room"] += 1
             return
-        self.send(p, m.at)
+        self.to(m, p)
         self.counts["game relayed"] += 1
         if (c, m) not in listing.talked:   # (both ways: their games really play together - introduce them)
             listing.talked.add((c, m))
@@ -617,10 +665,10 @@ class Lobby(asyncio.DatagramProtocol):
         if listing is None:
             self.drops["not in a room"] += 1
             return
-        out = header(DATA) + p[at:]
+        out = self.data_header(c) + p[at:]
         for m in self.members(listing):
             if m is not c and m.ip not in skip:
-                self.send(out, m.at)
+                self.to(m, out)
                 self.counts["game relayed"] += 1
 
     # ---- direct connections -------------------------------------------------------------
@@ -686,7 +734,7 @@ class Lobby(asyncio.DatagramProtocol):
 
     def sync(self, c, now, again=False):
         """Send c the players of its room (none: an empty list), when they changed (or again)."""
-        if not c.ext or self.by_addr.get(c.at) is not c:
+        if not c.ext or self.by_addr.get((c.wire, c.at)) is not c:
             return
         listing = self.network_of(c)
         peers = sorted((m for m in self.members(listing) if m is not c), key=lambda m: m.ip) if listing else []
@@ -712,7 +760,7 @@ class Lobby(asyncio.DatagramProtocol):
             c.peers_sent = entries
         c.peers_at = now
         c.introduced_count = introduced
-        self.send(header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries, c.at)
+        self.to(c, header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
 
     # ---- housekeeping -------------------------------------------------------------------
     def sweep(self, now):
@@ -756,9 +804,16 @@ class Lobby(asyncio.DatagramProtocol):
                 last_report = now
 
 
-async def serve(o):
+async def serve(o, make=None):
+    """A lobby (make(o): Lobby's own by default) on its ports: (SN's transport, the lobby)."""
     loop = asyncio.get_running_loop()
-    return await loop.create_datagram_endpoint(lambda: Lobby(o), local_addr=(o.bind, o.port))
+    lobby = (make or Lobby)(o)
+    try:
+        transport, _ = await loop.create_datagram_endpoint(lambda: Endpoint(lobby, lobby.sn), local_addr=(o.bind, o.port))
+    except BaseException:
+        lobby.close_ports()
+        raise
+    return transport, lobby
 
 
 async def main(o):
@@ -776,7 +831,7 @@ async def main(o):
     except asyncio.CancelledError:
         pass
     finally:
-        transport.close()
+        lobby.close_ports()
         Lobby.say("stopped")
 
 
