@@ -1,10 +1,11 @@
 # Open-source replacement system fonts
 
-The game asks the system for 7 shared fonts. A console has them in its firmware; with a firmware dump the build
-uses those (`tools/extract/fw_fonts.py`, `<dump>/sysdata/fonts`). Without one, the runtime uses the files in this
-folder: open-source fonts the yuzu project put together for the same purpose, taken unmodified from the suyu
-repository and saved under the file names the runtime asks for. `scripts/setup.py` copies this folder beside the
-game's exe (`build/work/fonts_open`), where `nnpl.c` looks when no firmware font is found.
+The game asks the system for 7 shared fonts. A console has them in its firmware; with a firmware dump
+ssbu-recomp's build uses those (`ssbu-recomp/tools/extract/fw_fonts.py`, `<dump>/sysdata/fonts`). Without one, its
+runtime uses the files in this folder: open-source fonts the yuzu project put together for the same purpose, taken
+unmodified from the suyu repository and saved under the file names the runtime asks for. `ssbu-recomp/scripts/setup.py`
+copies this folder beside the game's exe (`build/work/fonts_open`), where `ssbu-recomp/runtime/nnpl.c` looks when no
+firmware font is found.
 
 What changes without your firmware's fonts: Latin text uses Open Sans and Source Sans Pro instead of the console's
 typefaces; Chinese, Japanese and Korean text and most symbols are missing (each missing character is drawn as an
@@ -12,7 +13,7 @@ empty box); the button icons come from yuzu's small icon font. Fights are not af
 
 ## Files
 
-All seven are made by `python tools/extract/open_fonts.py <folder>` from the suyu repository at commit
+All seven are made by `python ssbu-recomp/tools/extract/open_fonts.py <folder>` from the suyu repository at commit
 `c0dd2ff554327657f0c6318f29b740ac7e329ea0` (https://github.com/suyu-emu/suyu-v0.0.4), folder
 `src/core/file_sys/system_archive/data/`, where each font is a C++ array of the plain TrueType bytes. The script
 checks the SHA-256 of each source file, converts the array back into the .ttf and gives the same bytes as here.
