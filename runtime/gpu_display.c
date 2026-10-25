@@ -1,6 +1,5 @@
-/* Display options: display.ini (SSBU_DISPLAY=<file>, else in the current directory: the port
- * root, where every launcher starts the game), written with the defaults and their documentation
- * when it does not exist.
+/* Display options: display.ini (SSBU_DISPLAY=<file>, else config/display.ini: config.h), written
+ * with the defaults and their documentation when it does not exist.
  *
  * The window: windowed (resizable, kept 16:9 while dragged), borderless over its monitor, or
  * "fullscreen" (borderless and topmost: no display mode change). F11 or Alt+Enter switches
@@ -36,6 +35,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 
+#include "config.h"
 #include "display.h"
 #include "host.h"
 #include "testrun.h"
@@ -171,8 +171,10 @@ static char *trim(char *s) {
 
 const char *display_ini_path(void) {
     const char *env = getenv("SSBU_DISPLAY");
-    return env && *env ? env : "display.ini";
+    return env && *env ? env : config_path(CONFIG_DISPLAY);
 }
+
+const char *display_default_ini(void) { return DEFAULT_INI; }
 
 static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     (void)once; (void)param; (void)ctx;
