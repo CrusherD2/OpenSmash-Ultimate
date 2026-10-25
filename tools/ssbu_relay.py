@@ -9,7 +9,9 @@ lobby, so nobody needs port forwarding; the lobby's machine needs its UDP port o
 the same room whose games can do it are also introduced to each other, so their games can send the
 room's traffic straight to each other (UDP hole punching) and use the lobby only when that fails.
 The protocol is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay
-of its own for a private room (launchers\\Host SSBU Netplay.bat).
+of its own for a private room (launchers\\Host SSBU Netplay.bat). Version 3, on the same port, is
+version 2 with a room browser, mod sets, matchmaking and a rollback relay, for games that say
+their simulation version and mods: "Protocol SN" below has both, message by message.
 
 ssbu-recomp's games join the same lobby on a port of their own (--su-port, 39500): their protocol
 is "SU" version 1 (ssbu-recomp/runtime/net_relay.c), with its own numbers and layouts, and the
@@ -23,6 +25,83 @@ room browser, matchmaking and a rollback relay here. --status-port serves GET /s
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)
 
 Python 3.8+, standard library only."""
+
+# ---- Protocol SN, versions 2 and 3 ---------------------------------------------------------------
+# UDP, every field big-endian; each packet starts 'S' 'N' version type. Version 2 is runtime/net_relay.c's
+# (its comment says it too). Version 3 is version 2 and more, on the same port: the lobby answers a
+# game in the version of its JOIN, and two games of version 3 talk to each other in version 3 (a game
+# of version 2 drops packets of another version, but a REJECT). "3:" marks what version 3 adds.
+#
+#  1 JOIN        game:  nonce u64, lobby code[32], name[32], build[40]         (repeated until answered)
+#                       3: then sim u32, mod set: count u8 (32 at most), count x (hash u32, length u8 (31 at
+#                       most), name[length]): 121 bytes at least; bytes after the mod set are ignored (room
+#                       for later additions)
+#  2 WELCOME     lobby: nonce u64, address u32, cookie u64, flags u8, members u8 (0: a lobby lists none)
+#                       flags 1 a lobby, 2 it introduces players; 3: 4 ROOMS, 8 MATCH, 16 RB (it has them)
+#  3 REJECT      lobby: nonce u64, reason u8, text[64]                         (in the JOIN's version)
+#                       reasons 1 full or too many from that address, 2 another netplay version, 4 not
+#                       13.0.5 (version 2 only); 3: 5 the mod set is not one (too many, a name too long, cut short)
+#  4 PING        game:  nonce u64, time u64, cookie u64, ping u16              (every second)
+#                       then, from a game that can connect directly: peers version u32, LAN address u32,
+#                       port u16, flags u8 (1 direct connections allowed), direct peers u8
+#  5 PONG        lobby: time u64, players u16, rooms u16 (of its key), flags u8 (1)
+#                       3: then players searching u16 (of its key), players u16 (of its lobby code, every key)
+#  6 DATA        both:  source u32, destination u32, source port u16, destination port u16, payload
+#                       (payload 1500 bytes at most: --max-data)
+#  7 MEMBERS     a player's relay only: count u8, count x (address u32, name[32])
+#  8 LEAVE       game:  nonce u64
+#  9 LIST        game:  cookie u64, seq u32                                    (nn::ldn's Scan)
+#                       3: then flags u8 (1: every key's rooms of the lobby code, its own key's first)
+# 10 LISTING     lobby: seq u32, host address u32, NetworkInfo[0x480]          (24 at most, best first)
+#                       3, LIST flag 1: then the host's build[40], sim u32, mod set
+# 11 LIST_END    lobby: seq u32, count u8
+# 12 PEERS       lobby: cookie u64, version u32, count u8, count x (address u32, name[32], flags u8, public
+#                       address u32, port u16, LAN address u32, port u16, secret u64)   (its room's players;
+#                       flags 1 introduced, 2 that player turned direct connections off, 4 its game can't)
+# 13 BCAST       game:  count u8, count x address u32 (players it reaches directly), then as DATA
+# 14 PUNCH       game to game: secret u64, from u32, to u32, ack u8, nonce u64
+# 15 DIRECT      game to game: secret u64, then as DATA
+# Version 3 only, in SU's numbers and layouts (ssbu-recomp/runtime/net_relay.c); a lobby or game of
+# version 2 never sends them, and the lobby ignores them from one:
+# 16 RB          game:  cookie u64, destination u32 (0: every player of its key, not on the public code),
+#                       message                                                (16 < packet length <= 1500)
+#                lobby: source u32, message
+#                       (on the public code "smash", only to its rollback opponent or a player of its room)
+# 17 ROOMS       game:  cookie u64, seq u32                                    (the room browser)
+# 18 ROOM_INFO   lobby: seq u32, host address u32, players u8, most u8, flags u8 (1 open, 2 yours, 4 mods
+#                       known, 8 of your key: you can join it), host name[32], build[40], sim u32, mod set
+#                       (every key's rooms of the lobby code, yours first; 32 at most)
+# 19 ROOMS_END   lobby: seq u32, count u8
+# 20 MATCH       game:  cookie u64, op u8 (1 a search for a room, 2 for a rollback match, 0 cancel), search
+#                       id u32                                (again every 2 s while it searches or is matched)
+# 21 MATCH_STATE lobby: search id u32, state u8 (0 idle, 1 searching, 2 matched, 3 none found in time, 4 the
+#                       other cancelled or left, 5 together, 6 expired), role u8 (1 you host or are player 1, 2 you join),
+#                       flags u8 (1 the host's room is open), the other's address u32, its name[32],
+#                       players searching u16, players u16 (both of your key), seconds waited u16
+#
+# Version 3's key: two games meet (rooms, matchmaking, rollback messages) when all four are the same.
+#   build  the game's main module build id, as version 2's (13.0.5's for WindowSmash; the lobby lets any in)
+#   sim    the simulation version: a number in the game's source, bumped whenever the lifter or the runtime
+#          changes what the game computes (anything that can make two games' matches differ); never a
+#          per-OS or per-CPU number, so Windows, Linux and macOS, avx2 and x86-64-v2 builds meet
+#   mods   the mods' hashes, in any order (names are shown, not compared); each the same on every OS
+#   code   the lobby code ("smash", the default, is the public lobby)
+# Players of version 2 are a pool of their own (their games say no sim or mods), SU's another (their port).
+#
+# For the C client (runtime/net_relay.c), from ssbu-recomp/runtime/net_relay.c (SU), message by message:
+#   JOIN         send_join's tail: the mod set is mods_scan's g_mods_wire, the hashes mod_add's; after
+#                build put sim. tree_hash is Win32 (FindFirstFile, '\\'): its rule (lower-case path with '/',
+#                FNV-1a 64 of path then size) ports, but a mod's native code (a .dll, .so, .dylib) differs
+#                per OS: hash what is the same on every OS, or two OSes never meet
+#   WELCOME      its flags, in place of SU's guesses (mm_tick's 6.5 s "older lobby")
+#   REJECT 2     from a lobby or a player's relay of version 2: JOIN again in version 2 (no ROOMS, MATCH, RB)
+#   PONG         SU's T_PONG tail (n >= 20), 1 byte later (after flags)
+#   LIST         net_list_rooms with flags 1; LISTING's tail: listing_build, then sim and the mod set
+#   ROOMS..      rooms_ask, rooms_info (sim at body offset 83, the mod set at 87; flag 8), rooms_end,
+#                net_rooms_get, room_why (build, then sim, then mods), net_room_refusal; mods_read as is
+#   MATCH..      mm_find, mm_send, mm_tick, mm_state, net_match_*: as they are, in this header
+#   RB           net_rb_send and its T_RB case: as they are; the public code is "smash", not "public"
+#   the rest     WindowSmash's own, as now; PUNCH and DIRECT between two games of version 3 in version 3
 import argparse
 import asyncio
 import collections
