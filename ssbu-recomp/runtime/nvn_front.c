@@ -783,6 +783,70 @@ static void prog_finalize(Ctx *c) {
     nvn_label_drop(A0);
     defer_free(K_PROG, p);
 }
+/* NV assembly text of a stage (nvnProgramSetShaders): program.buffer[n] and program.storage[n] uses per stage, for the
+ * exit report of the OpenGL back end (rb_gl_report), and the stage names. */
+LONG g_bufhist[6][32], g_storhist[32];
+const char *const k_stage_name[6] = {"vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute"};
+static int stage_of(const char *text, int len) {
+    static const char *const tag[6] = {"!!NVvp", "!!NVfp", "!!NVgp", "!!NVtcp", "!!NVtep", "!!NVcp"};
+    for (int i = 0; i < 6; i++) if (len > 8 && !memcmp(text, tag[i], strlen(tag[i]))) return i;
+    return -1;
+}
+/* Keeps a copy of the program text with program.buffer[n] renumbered to slots 0,1,2.. in order of appearance.
+ * Runs with either renderer: the stage is then marked as given with text (state 1), which the caller relies on. */
+static void prog_add_stage(Prog *p, const char *text, int len, int serial) {
+    static int nlog;
+    len = (int)strnlen(text, (size_t)len);
+    int s = stage_of(text, len);
+    if (s < 0) { logf_limited(&nlog, 10, "nvn_gl: program #%d: shader text of unknown kind '%.12s'\n", serial, text); return; }
+    Stage *st = &p->st[s];
+    char *out = malloc((size_t)len + 64);
+    int o = 0;
+    st->nbuf = 0; st->storage = 0;
+    for (int i = 0; i < len;) {
+        if (len - i > 16 && !memcmp(text + i, "program.buffer[", 15)) {
+            int n = 0, slot;
+            i += 15;
+            while (i < len && text[i] >= '0' && text[i] <= '9') n = n * 10 + (text[i++] - '0');
+            for (slot = 0; slot < st->nbuf && st->map[slot] != n; slot++) {}
+            if (slot == st->nbuf && st->nbuf < 16) st->map[st->nbuf++] = (uint8_t)n;
+            o += sprintf(out + o, "program.buffer[%d", slot);
+            InterlockedIncrement(&g_bufhist[s][n & 31]);
+            continue;
+        }
+        if (len - i > 17 && !memcmp(text + i, "program.storage[", 16)) {
+            int n = atoi(text + i + 16);
+            st->storage |= 1u << (n & 31);
+            InterlockedIncrement(&g_storhist[n & 31]);
+        }
+        out[o++] = text[i++];
+    }
+    out[o] = 0;
+    st->storage_w = 0;
+    {   /* storage buffers the program writes: STB / ATOMB / CSWAPB lines name "sbo_bufK", declared as STORAGE sbo_bufK[] = { program.storage[n] } */
+        int8_t decl[32];
+        memset(decl, -1, sizeof decl);
+        for (const char *q = out; (q = strstr(q, "STORAGE sbo_buf")) != NULL; q += 15) {
+            int k = atoi(q + 15);
+            const char *r = strstr(q, "program.storage[");
+            if (r && k >= 0 && k < 32) decl[k] = (int8_t)(atoi(r + 16) & 31);
+        }
+        for (const char *q = out; q && *q; q = strchr(q, 10), q = q ? q + 1 : NULL) {
+            if (strncmp(q, "STB", 3) && strncmp(q, "ATOM", 4) && strncmp(q, "CSWAP", 5)) continue;
+            const char *eol = strchr(q, 10), *r = strstr(q, "sbo_buf");
+            if (r && (!eol || r < eol)) { int k = atoi(r + 7); if (k >= 0 && k < 32 && decl[k] >= 0) st->storage_w |= 1u << decl[k]; }
+        }
+    }
+    free(st->text);
+    st->text = out; st->len = o; st->state = 1;
+    const char *dir = getenv("SSBU_SHADERDUMP");
+    if (dir) {
+        char path[260];
+        snprintf(path, sizeof path, "%s/p%05d_%s.txt", dir, serial, k_stage_name[s]);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(text, 1, (size_t)len, f); fclose(f); }
+    }
+}
 /* Debug aid SSBU_SHADERDUMP_ALL=<dir>: every shader stage handed to nvnProgramSetShaders, whole, as <dir>/s<program>_<i>.mxd for the
  * offline harness (mxtest.exe). File: "MXD1", u32 program serial, u32 index in the call, u32 control bytes, u32 data bytes, then the
  * control section (at least up to +0x720, plus the assembly text if any) and the code section (header + code + constants). */

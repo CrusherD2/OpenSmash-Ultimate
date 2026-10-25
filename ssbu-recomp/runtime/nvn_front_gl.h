@@ -117,6 +117,8 @@ uint8_t *list_lookup(uint64_t h, size_t *len);
 void list_collect(void);
 uint64_t now_ns(void);
 void event_signal_at(uint64_t a, int mode, uint32_t value);
+extern LONG g_bufhist[6][32], g_storhist[32];     /* program.buffer[n] / program.storage[n] uses in NV assembly text (prog_add_stage) */
+extern const char *const k_stage_name[6];        /* "vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute" */
 extern int g_draw_tag, g_dt_idx;                 /* render thread (nvn_dt.h, SSBU_DRAWTAG) */
 void nvn_front_draw_tag_clear(void);
 
@@ -125,5 +127,4 @@ void rb_gl_init(void);                           /* render thread, at start: the
 void rb_gl_report(FILE *out);                    /* the nvn_gl: lines of the exit report */
 void rb_gl_frame_stats(void);                    /* SSBU_GLSTATS=1, every 300 frames */
 void rb_gl_program_set(Prog *p);                 /* guest thread, nvnProgramSetShaders: the stages go to the shader workers */
-void prog_add_stage(Prog *p, const char *text, int len, int serial);       /* nvnProgramSetShaders: a stage with NV assembly text */
 #endif

@@ -193,7 +193,6 @@ static void gl_housekeeping(void);
 static LONG64 g_frame_draws, g_frame_skipped, g_frame_clears;
 static int g_debug;
 static const char *g_cur_op = "";
-static LONG g_bufhist[6][32], g_storhist[32];
 
 /* SSBU_GLSTATS=1: one more line every 300 frames with per-frame counts (render-thread waits of guest threads, compute
  * read-backs, objects created, shader work, and how many per-draw GL settings repeat the value of the previous draw). */
@@ -636,69 +635,9 @@ static size_t arena_put(uint64_t addr, uint64_t size) {
 /* ---------------------------------------------------------------- programs */
 static const GLenum k_prog_target[6] = {GL_VERTEX_PROGRAM_ARB_, GL_FRAGMENT_PROGRAM_ARB_, GL_GEOMETRY_PROGRAM_NV_, GL_TESS_CONTROL_PROGRAM_NV_, GL_TESS_EVALUATION_PROGRAM_NV_, GL_COMPUTE_PROGRAM_NV_};
 static const GLenum k_pbuf_target[6] = {0x8DA2, 0x8DA4, 0x8DA3, 0x8C74, 0x8C75, 0x90FC};
-static const char *const k_stage_name[6] = {"vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute"};
 #define TEXTURE_HANDLE_BUFFER 14           /* program.buffer[14] of a stage holds the 64-bit handles set with BindTexture, 8 bytes per unit */
 static int g_max_pbuf;
 
-static int stage_of(const char *text, int len) {
-    static const char *const tag[6] = {"!!NVvp", "!!NVfp", "!!NVgp", "!!NVtcp", "!!NVtep", "!!NVcp"};
-    for (int i = 0; i < 6; i++) if (len > 8 && !memcmp(text, tag[i], strlen(tag[i]))) return i;
-    return -1;
-}
-/* Keeps a copy of the program text with program.buffer[n] renumbered to slots 0,1,2.. in order of appearance. */
-void prog_add_stage(Prog *p, const char *text, int len, int serial) {
-    static int nlog;
-    len = (int)strnlen(text, (size_t)len);
-    int s = stage_of(text, len);
-    if (s < 0) { logf_limited(&nlog, 10, "nvn_gl: program #%d: shader text of unknown kind '%.12s'\n", serial, text); return; }
-    Stage *st = &p->st[s];
-    char *out = malloc((size_t)len + 64);
-    int o = 0;
-    st->nbuf = 0; st->storage = 0;
-    for (int i = 0; i < len;) {
-        if (len - i > 16 && !memcmp(text + i, "program.buffer[", 15)) {
-            int n = 0, slot;
-            i += 15;
-            while (i < len && text[i] >= '0' && text[i] <= '9') n = n * 10 + (text[i++] - '0');
-            for (slot = 0; slot < st->nbuf && st->map[slot] != n; slot++) {}
-            if (slot == st->nbuf && st->nbuf < 16) st->map[st->nbuf++] = (uint8_t)n;
-            o += sprintf(out + o, "program.buffer[%d", slot);
-            InterlockedIncrement(&g_bufhist[s][n & 31]);
-            continue;
-        }
-        if (len - i > 17 && !memcmp(text + i, "program.storage[", 16)) {
-            int n = atoi(text + i + 16);
-            st->storage |= 1u << (n & 31);
-            InterlockedIncrement(&g_storhist[n & 31]);
-        }
-        out[o++] = text[i++];
-    }
-    out[o] = 0;
-    st->storage_w = 0;
-    {   /* storage buffers the program writes: STB / ATOMB / CSWAPB lines name "sbo_bufK", declared as STORAGE sbo_bufK[] = { program.storage[n] } */
-        int8_t decl[32];
-        memset(decl, -1, sizeof decl);
-        for (const char *q = out; (q = strstr(q, "STORAGE sbo_buf")) != NULL; q += 15) {
-            int k = atoi(q + 15);
-            const char *r = strstr(q, "program.storage[");
-            if (r && k >= 0 && k < 32) decl[k] = (int8_t)(atoi(r + 16) & 31);
-        }
-        for (const char *q = out; q && *q; q = strchr(q, 10), q = q ? q + 1 : NULL) {
-            if (strncmp(q, "STB", 3) && strncmp(q, "ATOM", 4) && strncmp(q, "CSWAP", 5)) continue;
-            const char *eol = strchr(q, 10), *r = strstr(q, "sbo_buf");
-            if (r && (!eol || r < eol)) { int k = atoi(r + 7); if (k >= 0 && k < 32 && decl[k] >= 0) st->storage_w |= 1u << decl[k]; }
-        }
-    }
-    free(st->text);
-    st->text = out; st->len = o; st->state = 1;
-    const char *dir = getenv("SSBU_SHADERDUMP");
-    if (dir) {
-        char path[260];
-        snprintf(path, sizeof path, "%s/p%05d_%s.txt", dir, serial, k_stage_name[s]);
-        FILE *f = fopen(path, "wb");
-        if (f) { fwrite(text, 1, (size_t)len, f); fclose(f); }
-    }
-}
 static int stage_ready(Prog *p, int s) {
     static int nlog;
     Stage *st = &p->st[s];
