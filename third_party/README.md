@@ -63,6 +63,12 @@ configure run is needed:
 `tools/codec_libs.py` (`build_static`) compiles opus without the `x86` folders and the
 `OPUS_X86_*` defines, and libvpx with `config-arm64/` in place of `config/`.
 
+## fonts_open/
+
+Not a library: open fonts used in place of a firmware font that isn't there, taken unmodified
+(only renamed) from the suyu repository. [Its README](fonts_open/README.md) says which runtime
+reads them, and lists each file's source, checksum and licence.
+
 ## Local changes
 
 - `opus/silk/x86/NSQ_del_dec_avx2.c`: `#ifdef _MSC_VER` became
