@@ -116,7 +116,7 @@ class CheckTests(unittest.TestCase):
                 self.assertFalse(im.step_update(arguments(no_update=True, dry_run=True)))
         finally:
             im.il.step_update = real
-        self.assertEqual(seen, [im.BRANCH])   # (this branch's updates, while it is not merged)
+        self.assertEqual(seen, [im.BRANCH])   # (this installer's branch)
         self.assertEqual((im.il.BRANCH, im.il.step), (linux_branch, im.step))   # (and install_linux as it was)
         self.assertIn(f'[1/{im.STEPS}] Get the newest WindowSmash', out.getvalue())
         self.assertIn('not checking (--no-update)', out.getvalue())

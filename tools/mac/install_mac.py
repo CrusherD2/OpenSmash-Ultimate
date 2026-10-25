@@ -52,9 +52,9 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools", "linux"))
 import install_linux as il  # noqa: E402  (the update, download and folder helpers)
 
-# Updates come from this branch: the macOS port's own until it is merged into main (then: "main").
+# Updates come from this branch (the macOS port is in main).
 # SSBU_UPDATE_BRANCH names another, for testing one.
-BRANCH = os.environ.get("SSBU_UPDATE_BRANCH") or "macos-port"
+BRANCH = os.environ.get("SSBU_UPDATE_BRANCH") or "main"
 DEPS = il.DEPS
 VENV = il.VENV
 DOWNLOADS = os.path.join(DEPS, "downloads")

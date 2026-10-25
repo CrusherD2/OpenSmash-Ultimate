@@ -20,7 +20,7 @@ This first step changes nothing about how either project builds or runs. Later s
 
 ## Play today
 
-WindowSmash's install steps are the path that works today. Its installer still downloads its updates from the WindowSmash repository, so for now download it from **[github.com/OpenSmash-Ultimate/WindowSmash](https://github.com/OpenSmash-Ultimate/WindowSmash)** and follow its guides. The same guides are here in [`docs/`](docs/):
+WindowSmash's install steps are the path that works today. Until OpenSmash-Ultimate's first release, download WindowSmash from **[github.com/OpenSmash-Ultimate/WindowSmash](https://github.com/OpenSmash-Ultimate/WindowSmash)** and follow its guides. The same guides are here in [`docs/`](docs/):
 
 | Guide | Read it to |
 | :--- | :--- |
