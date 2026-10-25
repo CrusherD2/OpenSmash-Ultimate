@@ -1428,8 +1428,8 @@ static void analyze(Mx *e) {
                 if (ft == 0 || ft == 28) continue;
                 unsigned tgt = s.tgt[k];
                 s.n = k;
+                if (tgt >= e->words) { fail(e, mx_op_name[op], "target outside the code"); break; }      /* (before leader[tgt]: an SSY target is not checked) */
                 e->jt[pc] = tgt; e->leader[tgt] = 1; e->any_jump = 1;
-                if (tgt >= e->words) { fail(e, mx_op_name[op], "target outside the code"); break; }
                 if (nw >= cap) break;
                 wpc[nw] = tgt; wst[nw++] = (uint16_t)stk_id(e, &s);
                 if (always && ft == 15) break;
