@@ -137,6 +137,21 @@ class SuPlayer:
         assert end[8] == len(rooms), (end[8], len(rooms))
         return rooms
 
+    def rooms(self, seq=3):
+        """The room browser: [(host, players, most, flags, host name, build, mods)]."""
+        self.send(R.SU_ROOMS, struct.pack(">QI", self.cookie, seq))
+        end = self.first(R.SU_ROOMS_END)
+        assert end is not None, "no ROOMS_END"
+        assert struct.unpack_from(">I", end, 4)[0] == seq and len(end) == 9
+        out = []
+        for p in self.all(R.SU_ROOM_INFO, 0):
+            b = p[4:]
+            if struct.unpack_from(">I", b)[0] == seq:
+                host, players, most, flags = struct.unpack_from(">IBBB", b, 4)
+                out.append((host, players, most, flags, b[11:43].rstrip(b"\0"), b[43:83].rstrip(b"\0"), b[83:]))
+        assert end[8] == len(out), (end[8], len(out))
+        return out
+
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.SU_DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
@@ -169,6 +184,11 @@ class SuPlayer:
             ip, name, pip, pport, lip, lport, secret = R.SU_PEER.unpack_from(p, 9 + i * R.SU_PEER.size)
             out.append((ip, name.rstrip(b"\0"), (pip, pport), (lip, lport), secret))
         return version, out
+
+
+def mods(*entries):
+    """A mod set: (name, hash), ..."""
+    return bytes((len(entries),)) + b"".join(struct.pack(">IB", h, len(n)) + n for n, h in entries)
 
 
 def su_talk(*players):
@@ -503,6 +523,95 @@ class Peers(SuTest):
             self.assertEqual(host.peers(), (v, entries))   # (the same, again: its game takes a newer one only)
         finally:
             R.SU_PEERS_AGAIN = old
+
+
+class ModSets(unittest.TestCase):
+    def test_block(self):
+        good = mods((b"Alpha", 0x11), (b"B" * R.MOD_NAME, 0x22))
+        self.assertEqual(R.mods_block(good), good)
+        self.assertEqual(R.mods_block(good + b"more"), good)   # (cut to its own length)
+        self.assertEqual(R.mods_block(mods()), b"\0")
+        self.assertIsNone(R.mods_block(b""))
+        self.assertIsNone(R.mods_block(good[:-1]))                                  # (cut short)
+        self.assertIsNone(R.mods_block(mods((b"C" * (R.MOD_NAME + 1), 1))))        # (a name too long)
+        self.assertIsNone(R.mods_block(bytes((R.MODS_MAX + 1,)) + bytes(5) * 40))  # (too many)
+        self.assertIsNone(R.mods_block(bytes((3, 0, 0, 0, 1, 40)) + b"x" * 40))    # (ssbu-recomp's test's broken block)
+
+
+class RoomBrowser(SuTest):
+    """ssbu-recomp's room browser test: in the lobby code "test", games of two versions, of two mod
+    sets, and an older game that names no mods and sends LIST without flags."""
+    V4, V5M = b"ssbu-recomp-ldn1-13.0.4", b"ssbu-recomp-ldn1-13.0.5+m1234abcd"
+    MODS = mods((b"Alpha", 0x11), (b"Beta", 0x22))
+
+    def setUp(self):
+        super().setUp()
+        self.v4 = self.player(name="V4", build=self.V4, mods=mods())
+        self.v5m = self.player(name="V5m", build=self.V5M, mods=self.MODS)
+        self.old = self.player(name="Old")
+        self.v5 = self.player(name="V5", mods=mods())
+        self.s4, self.s5m = secrets.token_bytes(16), secrets.token_bytes(16)
+        self.v4.advertise(self.s4)
+        self.v5m.advertise(self.s5m)
+        self.assertTrue(self.listed(self.s4) and self.listed(self.s5m))
+
+    def test_older_game_sees_its_own_build_only(self):
+        self.assertEqual(self.old.list(1), [])
+        self.assertEqual(self.v5.list(2), [])   # (no flags: the same)
+
+    def test_list_every_build(self):
+        got = {host: build for host, info, build in self.v5.list(2, other=1)}
+        self.assertEqual(got, {self.v4.ip: self.V4.ljust(40, b"\0"), self.v5m.ip: self.V5M.ljust(40, b"\0")})
+
+    def test_own_build_first(self):
+        so = secrets.token_bytes(16)
+        self.old.advertise(so)
+        self.assertTrue(self.listed(so))
+        rooms = self.v5.list(3, other=1)
+        self.assertEqual((rooms[0][0], len(rooms)), (self.old.ip, 3))
+        self.assertEqual([h for h, *_ in self.v5.rooms(4)][0], self.old.ip)
+
+    def test_rooms(self):
+        info = {r[4]: r for r in self.v5.rooms(3)}
+        self.assertEqual(info[b"V4"], (self.v4.ip, 1, 8, 1 | 4, b"V4", self.V4, b"\0"))
+        self.assertEqual(info[b"V5m"], (self.v5m.ip, 1, 8, 1 | 4, b"V5m", self.V5M, self.MODS))
+        mine = {r[0]: r[3] for r in self.v4.rooms(4)}
+        self.assertEqual(mine, {self.v4.ip: 1 | 2 | 4, self.v5m.ip: 1 | 4})   # (2: its own)
+        self.assertEqual(self.player(code="friends").rooms(5), [])
+
+    def test_older_games_room(self):
+        so = secrets.token_bytes(16)
+        self.old.advertise(so)
+        self.assertTrue(self.listed(so))
+        flags = {r[4]: r[3] for r in self.v5.rooms(5)}
+        self.assertEqual(flags[b"Old"], 1)   # (open; its mods not known)
+
+    def test_order(self):
+        full, free = self.player(name="Full", mods=mods()), self.player(name="Free", mods=mods())
+        sf, so = secrets.token_bytes(16), secrets.token_bytes(16)
+        full.advertise(sf, most=1)
+        free.advertise(so)
+        self.assertTrue(self.listed(sf) and self.listed(so))
+        rooms = [(r[4], r[3]) for r in self.v5.rooms(6)]
+        self.assertEqual(rooms[:2], [(b"Free", 1 | 4), (b"Full", 4)])   # (its own build's first, open before full)
+        self.assertEqual({r for r, _ in rooms[2:]}, {b"V4", b"V5m"})
+
+    def test_join_across_builds_never_reaches_the_host(self):
+        self.v5.ldn(self.v4.ip, R.LM_JOIN, self.s4 + b"V5".ljust(32, b"\0") + b"\0\0")
+        self.assertEqual(self.v4.datas(0.3), [])
+        so = secrets.token_bytes(16)
+        self.old.advertise(so)
+        self.assertTrue(self.listed(so))
+        self.v5.ldn(self.old.ip, R.LM_JOIN, so + b"V5".ljust(32, b"\0") + b"\0\0")   # (the same build: an older game's room)
+        self.assertEqual([p[:2] for s, d, sp, p in self.old.datas()], [b"L" + bytes((R.LM_JOIN,))])
+
+    def test_broken_mod_block(self):
+        bad = self.player(name="Bad", build=b"ssbu-recomp-ldn1-13.0.5+m0", mods=bytes((3, 0, 0, 0, 1, 40)) + b"x" * 40)
+        sb = secrets.token_bytes(16)
+        bad.advertise(sb)
+        self.assertTrue(self.listed(sb))
+        flags = {r[4]: (r[3], r[6]) for r in self.v5.rooms(6)}
+        self.assertEqual(flags[b"Bad"], (1, b"\0"))   # (in the lobby, its mods not known)
 
 
 class BothProtocols(SuTest):

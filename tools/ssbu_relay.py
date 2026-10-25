@@ -76,6 +76,14 @@ SU_JOIN_SIZE = 4 + 8 + 2 * NAME_LEN + BUILD_LEN + 4 + 2 + 1
 SU_PING_SIZE = 4 + 8 + 8 + 1
 SU_PEER = struct.Struct(">I32sIHIHQ")   # a PEERS entry (only the players introduced)
 SU_PEERS_AGAIN = 5.0   # seconds: its PINGs don't say which PEERS came last, so the last is sent again this often
+# The room browser: every room of the lobby code, whatever its game's version or mods. A game's build
+# id has its version and a hash of its mods, so players of another version or mod set never share a
+# room; their rooms are listed all the same, with the host's build and mods, and the game says why
+# it can't join one (ssbu-recomp/runtime/net_relay.c room_why).
+SU_ROOMS, SU_ROOM_INFO, SU_ROOMS_END = 17, 18, 19
+ROOMS_MAX = 32        # rooms in a ROOMS answer, at most
+MODS_MAX = 32         # a game's mod set (its JOIN ends with "MS" and it): mods at most...
+MOD_NAME = 31         # ...and a mod's name, bytes at most
 
 
 def header(kind, version=PROTOCOL):
@@ -84,6 +92,19 @@ def header(kind, version=PROTOCOL):
 
 def su_header(kind):
     return b"SU" + bytes((SU_PROTOCOL, kind))
+
+
+def mods_block(raw):
+    """A game's mod set (count u8, count x (hash u32, name length u8, name)) cut to its own length,
+    or None when it is not one."""
+    if not raw or raw[0] > MODS_MAX:
+        return None
+    o = 1
+    for _ in range(raw[0]):
+        if o + 5 > len(raw) or raw[o + 4] > MOD_NAME or o + 5 + raw[o + 4] > len(raw):
+            return None
+        o += 5 + raw[o + 4]
+    return bytes(raw[:o])
 
 
 class Wire:
@@ -180,6 +201,8 @@ class Client:
         self.at, self.nonce, self.ip, self.name, self.part = at, nonce, ip, name, part
         self.wire = wire       # the protocol it speaks (None: SN)
         self.build, self.code = b"", ""   # (its part: wire, build and lobby code)
+        self.code_key = None   # (wire, lobby code): its part and the parts of other builds with that code
+        self.mods = None       # (SU) its mod set (None: its game does not say)
         self.cookie = secrets.randbits(64)   # proves the address is real (it came back in a PING)
         self.verified = False
         self.seen = now
@@ -243,6 +266,7 @@ class Lobby:
         self.by_ip = {}         # virtual address -> Client
         self.parts = {}         # (wire name, build, lobby code) -> set of Client
         self.part_rooms = {}    # (wire name, build, lobby code) -> set of Listing
+        self.code_rooms = {}    # (wire name, lobby code) -> set of Listing, every build's
         self.listings = {}      # session id -> Listing
         self.per_ip = collections.Counter()   # host -> verified players from there
         self.pending = 0        # players not verified yet
@@ -368,11 +392,12 @@ class Lobby:
                 self.to(m, packet)
                 m.claim = None
         self.listings.pop(listing.session, None)
-        rooms = self.part_rooms.get(listing.owner.part)
-        if rooms is not None:
-            rooms.discard(listing)
-            if not rooms:
-                del self.part_rooms[listing.owner.part]
+        for index, key in ((self.part_rooms, listing.owner.part), (self.code_rooms, listing.owner.code_key)):
+            rooms = index.get(key)
+            if rooms is not None:
+                rooms.discard(listing)
+                if not rooms:
+                    del index[key]
         if listing.owner.listing is listing:
             listing.owner.listing = None
         self.log(f"room of {printable(listing.owner.name)} closed")
@@ -537,7 +562,7 @@ class Lobby:
                 self.reject(wire, at, nonce, 1, why or "the lobby is full")
                 return None
             c = Client(at, nonce, ip, name, part, now, self.o, wire)
-            c.build, c.code = build, room
+            c.build, c.code, c.code_key = build, room, (wire.name, room)
             self.by_addr[wire, at], self.by_ip[ip] = c, c
             self.parts.setdefault(part, set()).add(c)
             self.pending += 1
@@ -581,16 +606,20 @@ class Lobby:
                 self.sync(c, now, again=True)
         elif kind == SU_LEAVE:
             self.drop(c, "left")
-        elif kind == SU_LIST:
+        elif kind in (SU_LIST, SU_ROOMS):
             if len(p) < 16:
                 return
             if not c.lists.take(now):
                 self.drops["list rate"] += 1
                 return
-            self.on_list(c, p[12:16], now)
+            if kind == SU_LIST:   # (flags 1: the rooms of every build of its lobby code)
+                self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))
+            else:
+                self.on_rooms(c, p[12:16], now)
 
     def su_join(self, p, at, c, now):
-        """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections)."""
+        """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections),
+        and from a newer game "MS" and its mod set."""
         if len(p) < SU_JOIN_SIZE:
             return
         nonce = p[4:12]
@@ -601,6 +630,8 @@ class Lobby:
         c = self.join(self.su, at, c, nonce, code, name, build, now)
         if c is None:
             return
+        if p[SU_JOIN_SIZE:SU_JOIN_SIZE + 2] == b"MS":   # (an older game sends no mods)
+            c.mods = mods_block(p[SU_JOIN_SIZE + 2:])
         direct_ok, lan = bool(p[o + 6] & 1), ((lan_ip, lan_port) if lan_ip and lan_port else None)
         if not c.ext or direct_ok != c.direct_ok or lan != c.lan:   # (every SU game can connect directly)
             c.ext, c.direct_ok, c.lan = True, direct_ok, lan
@@ -608,16 +639,38 @@ class Lobby:
         self.to(c, su_header(SU_WELCOME) + nonce + struct.pack(">IQ", c.ip, c.cookie))
 
     # ---- rooms ----------------------------------------------------------------------------
-    def on_list(self, c, seq, now):
+    def on_list(self, c, seq, now, every=False):
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
         ones whose host is closest to the lobby (in 100 ms steps, taken when the room opened: the
-        list must not reorder under the player's cursor from one scan to the next), then the oldest."""
-        rooms = sorted((r for r in self.part_rooms.get(c.part, ()) if r.owner is not c and now - r.updated <= self.o.listed_for),
-                       key=lambda r: (not r.open, -r.count, 10 if r.distance is None else r.distance, r.created))[:LIST_MAX]
+        list must not reorder under the player's cursor from one scan to the next), then the oldest.
+        every (SU): the rooms of every build of its lobby code, its own build's first, each LISTING
+        ending with its host's build."""
+        pool = self.code_rooms.get(c.code_key, ()) if every else self.part_rooms.get(c.part, ())
+        rooms = sorted((r for r in pool if r.owner is not c and now - r.updated <= self.o.listed_for),
+                       key=lambda r: (r.owner.part != c.part, *self.room_order(r)))[:LIST_MAX]
         su = c.wire is self.su
         for r in rooms:
-            self.to(c, (su_header(SU_LISTING) if su else header(LISTING)) + seq + struct.pack(">I", r.owner.ip) + r.info)
+            self.to(c, (su_header(SU_LISTING) if su else header(LISTING)) + seq + struct.pack(">I", r.owner.ip) + r.info +
+                    (r.owner.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") if every else b""))
         self.to(c, (su_header(SU_LIST_END) if su else header(LIST_END)) + seq + bytes((len(rooms),)))
+
+    @staticmethod
+    def room_order(r):
+        return not r.open, -r.count, 10 if r.distance is None else r.distance, r.created
+
+    def on_rooms(self, c, seq, now):
+        """(SU) The room browser: every room of its lobby code, its own build's first, then as a
+        Rooms List; each with its host's address and name, players, build and mods, and flags
+        (1 open, 2 its own, 4 its host's game says its mods)."""
+        rooms = sorted((r for r in self.code_rooms.get(c.code_key, ()) if now - r.updated <= self.o.listed_for),
+                       key=lambda r: (r.owner.part != c.part, *self.room_order(r)))[:ROOMS_MAX]
+        for r in rooms:
+            h = r.owner
+            flags = (1 if r.open else 0) | (2 if h is c else 0) | (4 if h.mods is not None else 0)
+            self.to(c, su_header(SU_ROOM_INFO) + seq + struct.pack(">IBBB", h.ip, r.count, r.info[NI_NODE_MAX], flags) +
+                    h.name.encode()[:NAME_LEN].ljust(NAME_LEN, b"\0") + h.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") +
+                    (h.mods or b"\0"))
+        self.to(c, su_header(SU_ROOMS_END) + seq + bytes((len(rooms),)))
 
     def on_ldn(self, c, p, dst, sport, dport, now):
         """Local wireless's own messages: only the ones its protocol has, between the players they
@@ -691,6 +744,7 @@ class Lobby:
             c.claim = None
             listing = c.listing = self.listings[session] = Listing(c, session, now)
             self.part_rooms.setdefault(c.part, set()).add(listing)
+            self.code_rooms.setdefault(c.code_key, set()).add(listing)
             self.log(f"{printable(c.name)} opened a room ({info[NI_NODE_MAX]} players at most)")
         if listing.distance is None and c.ping != 0xFFFF:
             listing.distance = min(c.ping, 1000) // 100
