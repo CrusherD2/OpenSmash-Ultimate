@@ -1125,7 +1125,8 @@ def build(a):
         if missing:
             raise Failed(f"These fonts were not in {firmware}: {', '.join(missing)}. Check that it holds all of "
                          "your firmware's .nca files, and that your keys are from after your Switch's latest "
-                         "system update.")
+                         "system update. Or leave the firmware out (in the installer, or --no-firmware here): the game "
+                         "then uses the open fonts of third_party/fonts_open, without Chinese, Japanese or Korean text.")
     if fonts_from in ("game", "firmware") and os.path.exists(FONTS + ".none"):   # (the firmware's now, not the open ones)
         os.remove(FONTS + ".none")
 

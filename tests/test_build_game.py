@@ -419,6 +419,7 @@ class BuildStepsTests(unittest.TestCase):
         with self.assertRaises(self.ns['Failed']) as e:
             self.ns['build'](self.args)
         self.assertIn(f"These fonts were not in {folders['firmware']}: nintendo_udsg-r_std_003.bfttf", str(e.exception))
+        self.assertIn('Or leave the firmware out (in the installer, or --no-firmware here)', str(e.exception))
         self.assertFalse(self.marker.exists())
         self.assertFalse(self.ns['fonts_done']())
 
