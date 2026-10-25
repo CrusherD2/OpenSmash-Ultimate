@@ -5,6 +5,8 @@ lobby, here against this one, and the rules WindowSmash's side has (limits, play
 anything of theirs is carried, introductions only once their games talk) on this side too.
 
     python -I tests/test_ssbu_relay_su.py [-v]"""
+import http.client
+import json
 import os
 import secrets
 import socket
@@ -840,6 +842,120 @@ class BothProtocols(SuTest):
         self.assertEqual(sn.datas(0.3), [])
         self.assertEqual(struct.unpack_from(">HH", sn.ping(), 12), (1, 1))   # (one player and one room here)
         self.assertEqual(struct.unpack_from(">HH", su.ping(), 12), (1, 0))
+
+
+class Status(SuTest):
+    """The status page (--status-port): counts only, for a web page."""
+    server_options = {"status_port": 0, "search_for": 30.0}
+
+    def setUp(self):
+        super().setUp()
+        self.port = self.server.lobby.status_server.sockets[0].getsockname()[1]
+
+    def ask(self, method="GET", path="/status"):
+        """(status, headers, body) of one request."""
+        h = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        try:
+            h.request(method, path)
+            r = h.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        finally:
+            h.close()
+
+    def counts(self):
+        code, headers, body = self.ask()
+        self.assertEqual(code, 200)
+        return json.loads(body)
+
+    def closed(self, s):
+        """Whether the lobby closes this connection (within a few seconds) without an answer."""
+        s.settimeout(3)
+        try:
+            return s.recv(4096) == b""
+        except ConnectionResetError:
+            return True
+
+    def test_counts(self):
+        """Players (verified ones, either protocol), rooms, players searching; nothing about them."""
+        doc = self.counts()
+        self.assertEqual(set(doc), {"up", "players", "rooms", "searching", "version", "uptime_s"})
+        self.assertEqual((doc["up"], doc["players"], doc["rooms"], doc["searching"]), (True, 0, 0, 0))
+        self.assertIn(f"SU {R.SU_PROTOCOL}", doc["version"])
+        host, session, _ = self.room(1, code="hidden-code")
+        seeker = self.player(name="Seeker", code="hidden-code")
+        seeker.match(1, 55)
+        self.assertTrue(until(lambda: self.server.lobby.searching))
+        sn = Player(self.server, name="Sneaky").join()
+        self.addCleanup(sn.close)
+        self.player(join=False, name="Waiting").join(verify=False)   # (not verified: not counted)
+        code, headers, body = self.ask()
+        doc = json.loads(body)
+        self.assertEqual((doc["players"], doc["rooms"], doc["searching"]), (4, 1, 1))
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(headers["access-control-allow-origin"], "*")
+        self.assertEqual(headers["cache-control"], "no-store")
+        self.assertEqual(int(headers["content-length"]), len(body))
+        for leak in (b"127.0.0.1", b"10.13.", b"Host", b"Guest", b"Seeker", b"Sneaky", b"Waiting", b"hidden", BUILD,
+                     R.REQUIRED_BUILD):
+            self.assertNotIn(leak, body)
+        host.ldn(BCAST, R.LM_GONE, session)
+        self.assertTrue(until(lambda: self.counts()["rooms"] == 0))
+
+    def test_other_requests(self):
+        self.assertEqual(self.ask(path="/status/?x=1")[0], 200)
+        code, _, body = self.ask(path="/players")
+        self.assertEqual((code, json.loads(body)), (404, {"error": "not found"}))
+        code, headers, body = self.ask("HEAD")
+        self.assertEqual((code, body), (200, b""))
+        self.assertGreater(int(headers["content-length"]), 0)
+        code, headers, body = self.ask("OPTIONS")
+        self.assertEqual((code, body), (204, b""))
+        self.assertEqual(headers["access-control-allow-methods"], "GET, OPTIONS")
+        code, headers, _ = self.ask("POST")
+        self.assertEqual(code, 405)
+        self.assertIn("GET", headers["allow"])
+
+    def test_slow_and_large(self):
+        """A request that does not come in time, or that is too large, is closed unanswered."""
+        old = R.STATUS_TIME
+        R.STATUS_TIME = 0.3
+        self.addCleanup(setattr, R, "STATUS_TIME", old)
+        slow = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(slow.close)
+        slow.sendall(b"GET /sta")
+        self.assertTrue(self.closed(slow))
+        large = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(large.close)
+        try:
+            large.sendall(b"GET /status HTTP/1.0\r\nX: " + b"a" * (R.STATUS_REQUEST + 100) + b"\r\n\r\n")
+        except OSError:
+            pass   # (closed while it sent)
+        self.assertTrue(self.closed(large))
+        self.assertTrue(until(lambda: self.server.lobby.status_open == 0))
+        self.assertTrue(self.counts()["up"])
+
+    def test_at_once(self):
+        """Past STATUS_OPEN requests at once, more are closed; once those end, it answers again."""
+        old = R.STATUS_OPEN
+        R.STATUS_OPEN = 2
+        self.addCleanup(setattr, R, "STATUS_OPEN", old)
+        waiting = [socket.create_connection(("127.0.0.1", self.port)) for _ in range(2)]
+        for w in waiting:
+            self.addCleanup(w.close)
+        self.assertTrue(until(lambda: self.server.lobby.status_open == 2))
+        more = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(more.close)
+        self.assertTrue(self.closed(more))
+        for w in waiting:
+            w.close()
+        self.assertTrue(until(lambda: self.server.lobby.status_open == 0))
+        self.assertTrue(self.counts()["up"])
+
+    def test_off(self):
+        """No status page unless asked for."""
+        self.assertIsNone(SuTest.server_options.get("status_port"))
+        self.assertIsNone(R.parse_args([]).status_port)
+        self.assertEqual(R.parse_args(["--status-port", "8080"]).status_bind, "127.0.0.1")
 
 
 if __name__ == "__main__":

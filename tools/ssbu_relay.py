@@ -13,16 +13,21 @@ of its own for a private room (launchers\\Host SSBU Netplay.bat).
 
 ssbu-recomp's games join the same lobby on a port of their own (--su-port, 39500): their protocol
 is "SU" version 1 (ssbu-recomp/runtime/net_relay.c), with its own numbers and layouts, and the
-same rooms, limits, rates and timeouts. Players of the two protocols never share a room.
+same rooms, limits, rates and timeouts. Players of the two protocols never share a room. Theirs
+also have a room browser, matchmaking and a rollback relay here. --status-port serves GET /status
+(counts only: players, rooms, players searching) for the project's site.
 
     python3 ssbu_relay.py [--port 39420] [--su-port 39500] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
+                          [--status-port 8080 [--status-bind 127.0.0.1]]
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)
 
 Python 3.8+, standard library only."""
 import argparse
 import asyncio
 import collections
+import email.utils
 import ipaddress
+import json
 import os
 import secrets
 import signal
@@ -99,6 +104,11 @@ KIND_ROOM, KIND_ROLLBACK = 1, 2   # MATCH's op: a search for a Local Wireless ro
 SU_RB = 16
 SU_PUBLIC = "public"   # ssbu-recomp's public lobby code: rollback messages go only to an opponent or a player of one's room
 RB_MAX = 1500          # largest rollback packet
+# The status page (--status-port): GET /status, counts only, for ssbu-recomp's site.
+LOBBY_VERSION = "1.4"   # ssbu-recomp's lobby's version, which /status reports
+STATUS_REQUEST = 8192   # bytes of a request (its line and headers), at most
+STATUS_TIME = 5.0       # seconds a request has to come, and its answer to go
+STATUS_OPEN = 32        # requests at once, at most
 
 
 def header(kind, version=PROTOCOL):
@@ -279,13 +289,14 @@ class Listing:
 
 
 def options(**overrides):
-    """The lobby's settings (main's command line; tests override some). su_port: SU's port (None: SU
-    not served, 0: any free port)."""
+    """The lobby's settings (main's command line; tests override some). su_port, status_port: SU's
+    port, the status page's (None: not served, 0: any free port)."""
     o = argparse.Namespace(port=DEFAULT_PORT, su_port=None, bind="0.0.0.0", verbose=False, banlist=None,
                            max_clients=2000, max_pending=1000, per_ip=8, gate_rate=5.0, gate_burst=20,
                            packet_rate=600.0, byte_rate=400_000.0, max_data=1500,
                            client_timeout=10.0, pending_timeout=3.0, listed_for=3.5, listing_timeout=10.0,
-                           search_for=120.0, match_for=180.0, tick=1.0, stats=60.0)
+                           search_for=120.0, match_for=180.0, status_port=None, status_bind="127.0.0.1",
+                           tick=1.0, stats=60.0)
     for k, v in overrides.items():
         setattr(o, k, v)
     return o
@@ -315,12 +326,17 @@ class Lobby:
         self.counts = collections.Counter()
         self.drops = collections.Counter()
         self.max_data = 0
+        self.started = time.monotonic()
+        self.status_server = None
+        self.status_open = 0
 
     # ---- plumbing ---------------------------------------------------------------------
     def close_ports(self):
         for wire in (self.sn, self.su):
             if wire.transport is not None:
                 wire.transport.close()
+        if self.status_server is not None:
+            self.status_server.close()
 
     def log(self, *what):
         if self.o.verbose:
@@ -1125,6 +1141,48 @@ class Lobby:
         else:
             self.to(c, header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
 
+    # ---- the status page ----------------------------------------------------------------
+    def status_json(self, now):
+        """Counts only: never an address, a name, a lobby code or a build."""
+        return json.dumps({"up": True, "players": len(self.by_addr) - self.pending, "rooms": len(self.listings),
+                           "searching": sum(len(w) for w in self.searching.values()),
+                           "version": f"{LOBBY_VERSION} (protocols SN {PROTOCOL}, SU {SU_PROTOCOL})",
+                           "uptime_s": int(now - self.started)})
+
+    async def status(self, reader, writer):
+        """One request to the status page: GET or HEAD /status, OPTIONS; any page may read it (CORS),
+        and nothing is logged (it would hold the callers' addresses). STATUS_OPEN at once,
+        STATUS_REQUEST bytes and STATUS_TIME to ask."""
+        if self.status_open >= STATUS_OPEN:
+            self.drops["status requests"] += 1
+            writer.transport.abort()
+            return
+        self.status_open += 1
+        try:
+            line = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), STATUS_TIME)).split(b"\r\n", 1)[0].split(b" ")
+            method, path = (line[0], line[1].split(b"?", 1)[0].rstrip(b"/")) if len(line) == 3 else (b"", b"")
+            if method == b"OPTIONS":
+                code, body = 204, b""
+            elif method not in (b"GET", b"HEAD"):
+                code, body = 405, b'{"error":"method not allowed"}'
+            elif path == b"/status":
+                code, body = 200, self.status_json(time.monotonic()).encode()
+            else:
+                code, body = 404, b'{"error":"not found"}'
+            reason = {200: "OK", 204: "No Content", 404: "Not Found", 405: "Method Not Allowed"}[code]
+            head = (f"HTTP/1.0 {code} {reason}\r\nServer: ssbu-lobby-status\r\nDate: {email.utils.formatdate(usegmt=True)}\r\n"
+                    f"Content-Type: {'text/plain' if code == 204 else 'application/json'}\r\nContent-Length: {len(body)}\r\n"
+                    "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\n"
+                    "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                    f"{'Allow: GET, HEAD, OPTIONS' + chr(13) + chr(10) if code == 405 else ''}Connection: close\r\n\r\n")
+            writer.write(head.encode() + (b"" if method == b"HEAD" else body))
+            await asyncio.wait_for(writer.drain(), STATUS_TIME)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+        finally:
+            self.status_open -= 1
+            writer.close()
+
     # ---- housekeeping -------------------------------------------------------------------
     def sweep(self, now):
         for c in list(self.by_addr.values()):
@@ -1179,6 +1237,8 @@ async def serve(o, make=None):
         transport, _ = await loop.create_datagram_endpoint(lambda: Endpoint(lobby, lobby.sn), local_addr=(o.bind, o.port))
         if o.su_port is not None:
             await loop.create_datagram_endpoint(lambda: Endpoint(lobby, lobby.su), local_addr=(o.bind, o.su_port))
+        if o.status_port is not None:
+            lobby.status_server = await asyncio.start_server(lobby.status, o.status_bind, o.status_port, limit=STATUS_REQUEST)
     except BaseException:
         lobby.close_ports()
         raise
@@ -1191,6 +1251,8 @@ async def main(o):
     if lobby.su.transport is not None:
         Lobby.say(f"and for ssbu-recomp's games on UDP {o.bind}:{lobby.su.transport.get_extra_info('sockname')[1]} "
                   f"(protocol SU {SU_PROTOCOL})")
+    if lobby.status_server is not None:
+        Lobby.say("status page on http://%s:%d/status" % lobby.status_server.sockets[0].getsockname()[:2])
     task = asyncio.ensure_future(lobby.run())
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1294,6 +1356,10 @@ def parse_args(argv=None, **defaults):
     a.add_argument("--match-secs", dest="match_for", type=float, default=d.match_for,
                    help="matchmaking: two players matched and not together by then are told it expired (default %(default)s)")
     a.add_argument("--stats", type=float, default=d.stats, help="seconds between statistics lines (0: none; default %(default)s)")
+    a.add_argument("--status-port", type=int, default=d.status_port or 0,
+                   help="TCP port of the status page, GET /status: counts only (0: none; default %(default)s)")
+    a.add_argument("--status-bind", default=d.status_bind,
+                   help="the status page's address (default %(default)s: behind a TLS proxy on this machine)")
     a.add_argument("--probe", metavar="HOST[:PORT]", help="instead of serving: check the lobby at this address")
     a.add_argument("--room", default="smash", help="(--probe) the lobby code (default: the public lobby)")
     a.add_argument("--build", default=REQUIRED_BUILD.decode(), help="(--probe) the game build id to join with "
@@ -1301,7 +1367,7 @@ def parse_args(argv=None, **defaults):
     args = a.parse_args(argv)
     for k, v in vars(args).items():
         setattr(d, k, v)
-    d.su_port = d.su_port or None
+    d.su_port, d.status_port = d.su_port or None, d.status_port or None
     return d
 
 
