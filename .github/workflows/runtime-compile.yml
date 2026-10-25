@@ -2,7 +2,9 @@
 # Windows, Linux and macOS, by the build a player's runs (tools/dev/runtime_compile_check.py): tools/recomp.py's
 # compile and link, tools/linux/build_linux.py, tools/mac/build_mac.py. The game is tools/mac/boottest's made-up one:
 # no dump, no game files, nothing derived from the game. On Windows and Linux for both instruction sets players'
-# builds compile for (tools/isa.py). The program is not started.
+# builds compile for (tools/isa.py). The program is not started. A runtime source the program lacks fails the job
+# unless the driver's LEFT_OUT says why it is left out, and so does any source in a subfolder of runtime/ other than
+# linux/ and macos/, where no build looks.
 name: Runtime compile
 
 on:

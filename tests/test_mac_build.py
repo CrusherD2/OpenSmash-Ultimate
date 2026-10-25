@@ -463,6 +463,23 @@ class BuildMacTests(unittest.TestCase):
         text = (Path(ns['GEN']) / 'overlay_font.h').read_text()
         self.assertEqual(text, 'static const unsigned char overlay_font[27648] = {0};\n')
 
+    def test_link_errors_name_the_missing_symbol(self):
+        """What ld prints for a symbol nothing defines (made-up names): the symbol and what refers to it kept,
+        though their lines say neither "error" nor "undefined"; the rest of the output left out."""
+        out = ('ld: warning: a made-up warning\n'
+               'Undefined symbols for architecture arm64:\n'
+               '  "_rt_made_up", referenced from:\n'
+               '      _rt_caller in hle_made_up.o\n'
+               '  "_rt_made_up_too", referenced from:\n'
+               '      _rt_other in hle_other.o\n'
+               'ld: symbol(s) not found for architecture arm64\n'
+               'clang: error: linker command failed with exit code 1 (use -v to see invocation)\n')
+        self.assertEqual(self.ns['link_errors'](out), [
+            'Undefined symbols for architecture arm64:', '  "_rt_made_up", referenced from:', '      _rt_caller in hle_made_up.o',
+            '  "_rt_made_up_too", referenced from:', '      _rt_other in hle_other.o',
+            'clang: error: linker command failed with exit code 1 (use -v to see invocation)'])
+        self.assertEqual(self.ns['link_errors']('something else\n  went wrong\n'), ['something else', '  went wrong'])
+
 
 @unittest.skipUnless(DARWIN, 'needs Core Text, sips, iconutil and codesign')
 class BuildMacOnMacTests(unittest.TestCase):
