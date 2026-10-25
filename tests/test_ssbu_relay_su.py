@@ -152,6 +152,27 @@ class SuPlayer:
         assert end[8] == len(out), (end[8], len(out))
         return out
 
+    def match(self, op, sid):
+        self.send(R.SU_MATCH, struct.pack(">QBI", self.cookie, op, sid))
+
+    def state(self, wait=1.0):
+        """The next MATCH_STATE: (id, state, role, flags, the other's address, its name, players
+        searching, players, seconds waited), or None."""
+        p = self.first(R.SU_MATCH_STATE, wait)
+        if p is None:
+            return None
+        assert len(p) == 4 + 49, len(p)
+        return struct.unpack_from(">IBBBI", p, 4) + (p[15:47].rstrip(b"\0"),) + struct.unpack_from(">HHH", p, 47)
+
+    def until_state(self, want, wait=3.0, flags=0):
+        """MATCH_STATEs until one is in state want (with these flags set), passing over the others; None
+        if none comes within wait seconds."""
+        end = time.monotonic() + wait
+        while True:
+            st = self.state(end - time.monotonic())
+            if st is None or (st[1] == want and st[3] & flags == flags):
+                return st
+
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.SU_DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
@@ -612,6 +633,127 @@ class RoomBrowser(SuTest):
         self.assertTrue(self.listed(sb))
         flags = {r[4]: (r[3], r[6]) for r in self.v5.rooms(6)}
         self.assertEqual(flags[b"Bad"], (1, b"\0"))   # (in the lobby, its mods not known)
+
+
+class Matchmaking(SuTest):
+    """ssbu-recomp's matchmaking test, split up."""
+    server_options = {"search_for": 30.0, "match_for": 30.0}
+    OTHER = b"ssbu-recomp-ldn1-13.0.4"
+
+    def pair(self, a, b, sa=101, sb=102):
+        """a searches, then b: matched, a hosts."""
+        a.match(1, sa)
+        self.assertEqual(a.state()[:2], (sa, R.MS_SEARCHING))
+        b.match(1, sb)
+        return a.until_state(R.MS_MATCHED), b.until_state(R.MS_MATCHED)
+
+    def test_paired_same_build_and_code_only(self):
+        a, b = self.player(name="MA", mods=mods()), self.player(name="MB", mods=mods())
+        y, e = self.player(name="MY", build=self.OTHER, mods=mods()), self.player(name="ME", code="other", mods=mods())
+        old = self.player(name="MOld")   # (an older game: it never sends MATCH)
+        a.match(1, 101)
+        self.assertEqual(a.state(), (101, R.MS_SEARCHING, 0, 0, 0, b"", 1, 3, 0))   # (searching 1, players of its build and code 3)
+        y.match(1, 201)   # (another version, another code: never paired with MA)
+        self.assertEqual(y.state()[:2], (201, R.MS_SEARCHING))
+        e.match(1, 301)
+        self.assertEqual(e.state()[:2], (301, R.MS_SEARCHING))
+        pong = a.ping()
+        self.assertEqual((len(pong), struct.unpack_from(">HHHH", pong, 12)), (20, (3, 0, 1, 4)))   # (and every build of "test": 4)
+        a.match(1, 101)   # (the same search asked again: still searching, not a new one)
+        self.assertEqual(a.state()[:2], (101, R.MS_SEARCHING))
+        b.match(1, 102)
+        sa, sb = a.until_state(R.MS_MATCHED), b.until_state(R.MS_MATCHED)
+        self.assertEqual(sa[:7], (101, R.MS_MATCHED, R.ROLE_HOST, 0, b.ip, b"MB", 0))   # (MA waited longer: MA hosts)
+        self.assertEqual(sb[:7], (102, R.MS_MATCHED, R.ROLE_JOIN, 0, a.ip, b"MA", 0))
+        b.match(1, 102)   # (asked again, as if an answer was lost: the same match)
+        self.assertEqual(b.state()[:3], (102, R.MS_MATCHED, R.ROLE_JOIN))
+        self.assertIsNone(old.state(0.2))
+        self.assertIsNone(y.state(0))
+
+    def test_room_first_then_together(self):
+        a, b = self.player(name="MA", mods=mods()), self.player(name="MB", mods=mods())
+        self.pair(a, b)
+        o = self.player(name="MOther", mods=mods())   # (another room of the same build, open already)
+        so = secrets.token_bytes(16)
+        o.advertise(so)
+        self.assertTrue(self.listed(so))
+        session = secrets.token_bytes(16)
+        a.advertise(session)
+        self.assertIsNotNone(b.until_state(R.MS_MATCHED, flags=1), "the guest was not told the host's room is open")
+        rooms = b.list(9, other=1)
+        self.assertEqual(([r[0] for r in rooms][0], len(rooms)), (a.ip, 2))   # (the matched host's room first)
+        self.assertEqual([r[0] for r in b.list(10)][0], a.ip)
+        b.ldn(a.ip, R.LM_JOIN, session + b"MB".ljust(32, b"\0") + b"\0\0")
+        self.assertTrue(a.datas())
+        a.advertise(session, [b.ip])
+        ta, tb = a.until_state(R.MS_TOGETHER), b.until_state(R.MS_TOGETHER)
+        self.assertEqual(ta[:6], (101, R.MS_TOGETHER, R.ROLE_HOST, 0, b.ip, b"MB"))
+        self.assertEqual(tb[:6], (102, R.MS_TOGETHER, R.ROLE_JOIN, 0, a.ip, b"MA"))
+        b.match(1, 102)   # (asked again: how it ended, not a new search)
+        self.assertEqual(b.state()[:2], (102, R.MS_TOGETHER))
+        self.assertEqual(self.server.lobby.matches, set())
+
+    def test_cancel_tells_the_other(self):
+        f, g = self.player(name="MF", mods=mods()), self.player(name="MG", mods=mods())
+        self.pair(f, g, 1, 2)
+        g.match(0, 2)
+        self.assertEqual(g.until_state(R.MS_IDLE)[0], 2)
+        self.assertEqual(f.until_state(R.MS_PEER_LEFT)[4:6], (g.ip, b"MG"))
+
+    def test_leaving_tells_the_other(self):
+        h, i = self.player(name="MH", mods=mods()), self.player(name="MI", mods=mods())
+        self.pair(h, i, 5, 6)
+        h.leave()
+        self.assertEqual(i.until_state(R.MS_PEER_LEFT)[5], b"MH")
+
+    def test_searching_again_ends_the_match(self):
+        h, i = self.player(name="MH", mods=mods()), self.player(name="MI", mods=mods())
+        self.pair(h, i, 5, 6)
+        i.match(1, 7)
+        self.assertEqual(h.until_state(R.MS_PEER_LEFT)[5], b"MI")
+        self.assertEqual(i.until_state(R.MS_SEARCHING)[0], 7)
+
+    def test_an_open_room_hosts(self):
+        k, m = self.player(name="MK", mods=mods()), self.player(name="MM", mods=mods())
+        sk = secrets.token_bytes(16)
+        k.advertise(sk)
+        self.assertTrue(self.listed(sk))
+        m.match(1, 7)
+        self.assertEqual(m.state()[1], R.MS_SEARCHING)
+        k.match(1, 8)   # (searched second, but has an open room: hosts)
+        sk_, sm = k.until_state(R.MS_MATCHED), m.until_state(R.MS_MATCHED)
+        self.assertEqual((sk_[2], sm[2], sm[3] & 1, sm[4]), (R.ROLE_HOST, R.ROLE_JOIN, 1, k.ip))
+
+    def test_rate(self):
+        a = self.player(mods=mods())
+        for _ in range(40):
+            a.match(1, 9)
+        self.assertLess(len(a.all(R.SU_MATCH_STATE, 0.5)), 15)
+
+
+class MatchTimeouts(SuTest):
+    server_options = {"search_for": 0.5, "match_for": 1.0}
+
+    def test_search_times_out(self):
+        y = self.player(name="MY", mods=mods())
+        y.match(1, 201)
+        self.assertEqual(y.state()[:2], (201, R.MS_SEARCHING))
+        self.assertEqual(y.until_state(R.MS_TIMEOUT, 4.0)[0], 201)
+        y.match(1, 201)   # (the search that ended, asked again: its end again)
+        self.assertEqual(y.state()[:2], (201, R.MS_TIMEOUT))
+        y.match(1, 202)   # (a new search)
+        self.assertEqual(y.state()[:2], (202, R.MS_SEARCHING))
+        y.match(0, 202)
+        self.assertEqual(y.until_state(R.MS_IDLE)[0], 202)
+
+    def test_match_nobody_follows_expires(self):
+        self.server.lobby.o.search_for = 30.0   # (a slow runner must not end k's search before m's comes)
+        k, m = self.player(name="MK", mods=mods()), self.player(name="MM", mods=mods())
+        k.match(1, 7)
+        m.match(1, 8)
+        self.assertIsNotNone(k.until_state(R.MS_MATCHED))
+        self.assertEqual(k.until_state(R.MS_EXPIRED, 4.0)[4], m.ip)
+        self.assertEqual(m.until_state(R.MS_EXPIRED, 4.0)[4], k.ip)
 
 
 class BothProtocols(SuTest):

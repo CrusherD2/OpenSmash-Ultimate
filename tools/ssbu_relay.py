@@ -84,6 +84,15 @@ SU_ROOMS, SU_ROOM_INFO, SU_ROOMS_END = 17, 18, 19
 ROOMS_MAX = 32        # rooms in a ROOMS answer, at most
 MODS_MAX = 32         # a game's mod set (its JOIN ends with "MS" and it): mods at most...
 MOD_NAME = 31         # ...and a mod's name, bytes at most
+# Matchmaking ("Find an opponent"): a game searching sends MATCH (again every 2 s) and hears how it
+# stands in MATCH_STATE. Two players of one build and lobby code are paired: the host (the one
+# with an open room, else the one that waited longer) makes the Local Wireless room, the other
+# finds it first in its Rooms List; or, searching for a rollback match, the two games agree on the
+# match in rollback messages (SU_RB) and the one that waited longer is player 1.
+SU_MATCH, SU_MATCH_STATE = 20, 21
+MS_IDLE, MS_SEARCHING, MS_MATCHED, MS_TIMEOUT, MS_PEER_LEFT, MS_TOGETHER, MS_EXPIRED = range(7)
+ROLE_HOST, ROLE_JOIN = 1, 2
+KIND_ROOM, KIND_ROLLBACK = 1, 2   # MATCH's op: a search for a Local Wireless room, for a rollback match (0: cancel)
 
 
 def header(kind, version=PROTOCOL):
@@ -203,6 +212,12 @@ class Client:
         self.build, self.code = b"", ""   # (its part: wire, build and lobby code)
         self.code_key = None   # (wire, lobby code): its part and the parts of other builds with that code
         self.mods = None       # (SU) its mod set (None: its game does not say)
+        # matchmaking (SU)
+        self.search_id = None     # its search's id (None: it never searched)
+        self.search_since = None  # searching since (None: not searching)
+        self.kind = KIND_ROOM     # what it searches for
+        self.match = None         # the Match it is in
+        self.final = None         # how its last search ended: (id, state, role, the other's address and name)
         self.cookie = secrets.randbits(64)   # proves the address is real (it came back in a PING)
         self.verified = False
         self.seen = now
@@ -223,6 +238,17 @@ class Client:
         self.bytes = Bucket(o.byte_rate, o.byte_rate * 2, now)
         self.joins = Bucket(2, 8, now)
         self.lists = Bucket(4, 8, now)
+        self.match_asks = Bucket(2, 8, now)
+
+
+class Match:
+    """Two players matchmaking paired: the host makes the room (or is player 1)."""
+    def __init__(self, host, guest, now):
+        self.host, self.guest, self.at = host, guest, now
+        self.room_said = False   # the guest was told the host's room is open
+
+    def other(self, c):
+        return self.guest if c is self.host else self.host
 
 
 class Listing:
@@ -251,7 +277,7 @@ def options(**overrides):
                            max_clients=2000, max_pending=1000, per_ip=8, gate_rate=5.0, gate_burst=20,
                            packet_rate=600.0, byte_rate=400_000.0, max_data=1500,
                            client_timeout=10.0, pending_timeout=3.0, listed_for=3.5, listing_timeout=10.0,
-                           tick=1.0, stats=60.0)
+                           search_for=120.0, match_for=180.0, tick=1.0, stats=60.0)
     for k, v in overrides.items():
         setattr(o, k, v)
     return o
@@ -267,6 +293,9 @@ class Lobby:
         self.parts = {}         # (wire name, build, lobby code) -> set of Client
         self.part_rooms = {}    # (wire name, build, lobby code) -> set of Listing
         self.code_rooms = {}    # (wire name, lobby code) -> set of Listing, every build's
+        self.code_players = collections.Counter()   # (wire name, lobby code) -> players, every build's
+        self.searching = {}     # part -> {Client: None}: its players searching, the first first
+        self.matches = set()    # Match
         self.listings = {}      # session id -> Listing
         self.per_ip = collections.Counter()   # host -> verified players from there
         self.pending = 0        # players not verified yet
@@ -403,6 +432,11 @@ class Lobby:
         self.log(f"room of {printable(listing.owner.name)} closed")
 
     def drop(self, c, why):
+        if c.match is not None:   # (the other player is told at once)
+            other = c.match.other(c)
+            c.match = None
+            self.match_end(other, MS_PEER_LEFT, f"{printable(c.name)} left the lobby", time.monotonic())
+        self.unsearch(c)
         if c.listing is not None:
             self.close(c.listing)
         if c.claim:   # tell its host at once rather than after the host's timeout
@@ -418,6 +452,10 @@ class Lobby:
             players.discard(c)
             if not players:
                 del self.parts[c.part]
+        if self.code_players[c.code_key] > 1:
+            self.code_players[c.code_key] -= 1
+        else:
+            del self.code_players[c.code_key]
         if c.verified:
             self.per_ip[c.at[0]] -= 1
             if self.per_ip[c.at[0]] <= 0:
@@ -565,6 +603,7 @@ class Lobby:
             c.build, c.code, c.code_key = build, room, (wire.name, room)
             self.by_addr[wire, at], self.by_ip[ip] = c, c
             self.parts.setdefault(part, set()).add(c)
+            self.code_players[c.code_key] += 1
             self.pending += 1
             self.log(f"{printable(name)} joined lobby {printable(room)!r} ({wire.name}, build "
                      f"{build[:8].decode('ascii', 'replace')}) as {ip_text(ip)} from {at[0]}:{at[1]}")
@@ -600,8 +639,9 @@ class Lobby:
             if len(p) < SU_PING_SIZE:
                 return
             c.direct_count = min(p[20], ROOM_MAX - 1)
-            self.to(c, su_header(SU_PONG) + p[12:20] + struct.pack(">HH", min(len(self.parts.get(c.part, ())), 0xFFFF),
-                                                                  min(len(self.part_rooms.get(c.part, ())), 0xFFFF)))
+            counts = (len(self.parts.get(c.part, ())), len(self.part_rooms.get(c.part, ())),
+                      len(self.searching.get(c.part, ())), self.code_players[c.code_key])   # (the last: every build's)
+            self.to(c, su_header(SU_PONG) + p[12:20] + struct.pack(">HHHH", *(min(n, 0xFFFF) for n in counts)))
             if c.peers_version and now - c.peers_at >= SU_PEERS_AGAIN:   # (in case the last was lost)
                 self.sync(c, now, again=True)
         elif kind == SU_LEAVE:
@@ -616,6 +656,13 @@ class Lobby:
                 self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))
             else:
                 self.on_rooms(c, p[12:16], now)
+        elif kind == SU_MATCH:
+            if len(p) < 17:
+                return
+            if not c.match_asks.take(now):
+                self.drops["match rate"] += 1
+                return
+            self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
 
     def su_join(self, p, at, c, now):
         """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections),
@@ -644,10 +691,11 @@ class Lobby:
         ones whose host is closest to the lobby (in 100 ms steps, taken when the room opened: the
         list must not reorder under the player's cursor from one scan to the next), then the oldest.
         every (SU): the rooms of every build of its lobby code, its own build's first, each LISTING
-        ending with its host's build."""
+        ending with its host's build. A player matchmaking paired sees its host's room first."""
         pool = self.code_rooms.get(c.code_key, ()) if every else self.part_rooms.get(c.part, ())
+        host = c.match.host if c.match is not None and c.match.guest is c else None   # (the host it was matched with first)
         rooms = sorted((r for r in pool if r.owner is not c and now - r.updated <= self.o.listed_for),
-                       key=lambda r: (r.owner.part != c.part, *self.room_order(r)))[:LIST_MAX]
+                       key=lambda r: (r.owner is not host, r.owner.part != c.part, *self.room_order(r)))[:LIST_MAX]
         su = c.wire is self.su
         for r in rooms:
             self.to(c, (su_header(SU_LISTING) if su else header(LISTING)) + seq + struct.pack(">I", r.owner.ip) + r.info +
@@ -756,6 +804,8 @@ class Lobby:
         for m in {*before, *self.members(listing)}:
             if m is not c:
                 self.to(m, p)
+        if c.match is not None and c.match.host is c and c.kind == KIND_ROOM:
+            self.match_room(c.match, listing, now)
 
     def on_game(self, c, p, dst):
         """The game's own traffic: only within a network, between its players."""
@@ -810,6 +860,122 @@ class Lobby:
             if m is not c and m.ip not in skip:
                 self.to(m, out)
                 self.counts["game relayed"] += 1
+
+    # ---- matchmaking (SU) ---------------------------------------------------------------
+    def on_match(self, c, op, sid, now):
+        """MATCH: op 1 (or 2: for a rollback match) searches, sent again every 2 s while it waits or
+        is matched (the answer says how it stands); op 0 cancels. sid: the search's id."""
+        if op == 0:
+            if c.match is not None:
+                other = c.match.other(c)
+                c.match = None
+                self.match_end(other, MS_PEER_LEFT, f"{printable(c.name)} cancelled the match", now)
+            if c.search_since is not None:
+                self.log(f"match: {printable(c.name)} stopped searching")
+            self.unsearch(c)
+            c.search_id, c.final = sid, (sid, MS_IDLE, 0, 0, b"")
+            self.match_send(c, now)
+            return
+        if op not in (KIND_ROOM, KIND_ROLLBACK):
+            return
+        if c.search_id == sid and (c.match is not None or c.search_since is not None or c.final is not None):
+            self.match_send(c, now)   # (the same search: how it stands, or how it ended)
+            return
+        if c.match is not None:   # (a new search while matched: that match is over)
+            other = c.match.other(c)
+            c.match = None
+            self.match_end(other, MS_PEER_LEFT, f"{printable(c.name)} searches again", now)
+        c.search_id, c.final, c.kind = sid, None, op
+        self.unsearch(c)
+        waiting = [x for x in self.searching.get(c.part, ()) if x.kind == op]
+        if not waiting:
+            c.search_since = now
+            self.searching.setdefault(c.part, {})[c] = None
+            self.log(f"match: {printable(c.name)} searches{' for a rollback match' if op == KIND_ROLLBACK else ''}")
+            self.match_send(c, now)
+            return
+        o = min(waiting, key=lambda x: x.search_since)
+        self.unsearch(o)
+
+        def hosts_open(x):
+            return op == KIND_ROOM and x.listing is not None and x.listing.open
+        host = c if hosts_open(c) and not hosts_open(o) else o   # (an open room, else the one that waited longer)
+        m = c.match = o.match = Match(host, o if host is c else c, now)
+        self.matches.add(m)
+        self.log(f"match: {printable(m.host.name)} hosts, {printable(m.guest.name)} joins"
+                 f"{' (a rollback match)' if op == KIND_ROLLBACK else ''}")
+        self.match_send(m.host, now)
+        self.match_send(m.guest, now)
+        if op == KIND_ROOM and m.host.listing is not None:
+            self.match_room(m, m.host.listing, now)
+
+    def unsearch(self, c):
+        c.search_since = None
+        waiting = self.searching.get(c.part)
+        if waiting is not None:
+            waiting.pop(c, None)
+            if not waiting:
+                del self.searching[c.part]
+
+    def match_room(self, m, listing, now):
+        """The host of a match advertised its room: with the guest in it, they are together; once it
+        is open, both are told (once: the guest asks again anyway)."""
+        if m.guest.ip in listing.nodes and m.guest.claim == listing.session:
+            host, guest = m.host, m.guest
+            self.match_end(host, MS_TOGETHER, f"in a room with {printable(guest.name)}", now)
+            self.match_end(guest, MS_TOGETHER, f"in {printable(host.name)}'s room", now)
+        elif listing.open and not m.room_said:
+            m.room_said = True
+            self.match_send(m.guest, now)
+            self.match_send(m.host, now)
+
+    def match_end(self, c, state, why, now):
+        """c's search or match is over (MS_TIMEOUT, MS_PEER_LEFT, MS_TOGETHER, MS_EXPIRED): it is told,
+        and told again when it asks."""
+        m, role, peer, name = c.match, 0, 0, b""
+        if m is not None:
+            o = m.other(c)
+            role, peer, name = ROLE_HOST if m.host is c else ROLE_JOIN, o.ip, o.name.encode()
+            self.matches.discard(m)
+        c.match = None
+        self.unsearch(c)
+        c.final = (c.search_id or 0, state, role, peer, name)
+        self.match_send(c, now)
+        self.log(f"match: {printable(c.name)}: {why}")
+
+    def match_send(self, c, now):
+        """MATCH_STATE: search id u32, state u8, role u8, flags u8 (1: the host's room is open), the
+        other player's address u32 and name[32], then of its build and lobby code: players
+        searching u16, players u16; and the seconds waited u16."""
+        m, sid, role, flags, peer, name = c.match, c.search_id or 0, 0, 0, 0, b""
+        if m is not None:
+            o = m.other(c)
+            state, role, peer, name = MS_MATCHED, ROLE_HOST if m.host is c else ROLE_JOIN, o.ip, o.name.encode()
+            r = m.host.listing
+            if r is not None and r.open and now - r.updated <= self.o.listed_for:
+                flags |= 1
+        elif c.search_since is not None:
+            state = MS_SEARCHING
+        elif c.final is not None:
+            sid, state, role, peer, name = c.final
+        else:
+            state = MS_IDLE
+        since = m.at if m is not None else c.search_since
+        waited = 0 if since is None else min(int(now - since), 0xFFFF)
+        self.to(c, su_header(SU_MATCH_STATE) + struct.pack(">IBBBI", sid & 0xFFFFFFFF, state, role, flags, peer) +
+                name[:NAME_LEN].ljust(NAME_LEN, b"\0") +
+                struct.pack(">HHH", min(len(self.searching.get(c.part, ())), 0xFFFF), min(len(self.parts.get(c.part, ())), 0xFFFF), waited))
+
+    def match_sweep(self, now):
+        for waiting in list(self.searching.values()):
+            for c in list(waiting):
+                if now - c.search_since > self.o.search_for:
+                    self.match_end(c, MS_TIMEOUT, f"no opponent in {self.o.search_for:.0f} s", now)
+        for m in list(self.matches):
+            if now - m.at > self.o.match_for:
+                host, guest = m.host, m.guest
+                self.match_end(host, MS_EXPIRED, f"the match with {printable(guest.name)} expired", now)
+                self.match_end(guest, MS_EXPIRED, f"the match with {printable(host.name)} expired", now)
 
     # ---- direct connections -------------------------------------------------------------
     # The players of a room whose games can connect directly are introduced to each other: each
@@ -918,6 +1084,7 @@ class Lobby:
         for listing in list(self.listings.values()):
             if now - listing.updated > self.o.listing_timeout:
                 self.close(listing)
+        self.match_sweep(now)
         for host, b in list(self.gates.items()):
             if now - b.at > 60:
                 del self.gates[host]
@@ -932,7 +1099,8 @@ class Lobby:
         direct = sum(min(p.direct_count, p.introduced_count) for p in self.by_addr.values())
         su = sum(1 for p in self.by_addr.values() if p.wire is self.su)
         self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {su} on SU) in {len(self.parts)} "
-                 f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}; "
+                 f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}, "
+                 f"{sum(len(w) for w in self.searching.values())} searching, {len(self.matches)} matched; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
                  f"out {c['out packets'] / secs:.0f}/s {c['out bytes'] / secs / 1024:.1f} KB/s; "
                  f"game relayed {c['game relayed'] / secs:.0f}/s; direct paths {direct} of {paths}; "
@@ -1071,6 +1239,10 @@ def parse_args(argv=None, **defaults):
     a.add_argument("--packet-rate", type=float, default=d.packet_rate, help="a player's packets a second (default %(default)s)")
     a.add_argument("--byte-rate", type=float, default=d.byte_rate, help="a player's bytes a second (default %(default)s)")
     a.add_argument("--max-data", type=int, default=d.max_data, help="largest game datagram (default %(default)s)")
+    a.add_argument("--search-secs", dest="search_for", type=float, default=d.search_for,
+                   help="matchmaking: a search without an opponent ends after this (default %(default)s)")
+    a.add_argument("--match-secs", dest="match_for", type=float, default=d.match_for,
+                   help="matchmaking: two players matched and not together by then are told it expired (default %(default)s)")
     a.add_argument("--stats", type=float, default=d.stats, help="seconds between statistics lines (0: none; default %(default)s)")
     a.add_argument("--probe", metavar="HOST[:PORT]", help="instead of serving: check the lobby at this address")
     a.add_argument("--room", default="smash", help="(--probe) the lobby code (default: the public lobby)")
