@@ -1,15 +1,24 @@
 # Open-source replacement system fonts
 
-The game asks the system for 7 shared fonts. A console has them in its firmware; with a firmware dump
-ssbu-recomp's build uses those (`ssbu-recomp/tools/extract/fw_fonts.py`, `<dump>/sysdata/fonts`). Without one, its
-runtime uses the files in this folder: open-source fonts the yuzu project put together for the same purpose, taken
-unmodified from the suyu repository and saved under the file names the runtime asks for. `ssbu-recomp/scripts/setup.py`
-copies this folder beside the game's exe (`build/work/fonts_open`), where `ssbu-recomp/runtime/nnpl.c` looks when no
-firmware font is found.
+The game asks the system for its shared fonts. A console has them in its firmware, and with your firmware's fonts
+the game uses those. In place of each one that isn't there, the runtime uses the file of the same name in this
+folder: open-source fonts the yuzu project put together for the same purpose, taken unmodified from the suyu
+repository and saved under the file names the console uses (`.ttf` for the firmware's `.bfttf`).
+
+- WindowSmash (`runtime/hle_pl.c`) reads them here, font by font: a firmware font in `dump/fonts` always comes
+  first. It serves the six that nn::pl's font types name (`nintendo_ext2_003.ttf` is ssbu-recomp's). The log says
+  which came from where (`[pl] shared fonts from the firmware ...`, `[pl] open shared fonts ...`). It adds U+25A1,
+  the box the game draws for a missing character, to the character map of the copy it loads (drawn as the font's
+  U+FFFD, else U+25CA, else a space): none of these has it, and the game crashes on a face whose fonts all lack it
+  (ssbu-recomp's `runtime/nnfontll.c` found that). The files here stay as they are.
+- ssbu-recomp (`ssbu-recomp/runtime/nnpl.c`) looks for them in `fonts_open` beside its exe when a font is not in
+  `<dump>/sysdata/fonts` (`ssbu-recomp/tools/extract/fw_fonts.py`); its `scripts/setup.py` copies this folder
+  there (`build/work/fonts_open`).
 
 What changes without your firmware's fonts: Latin text uses Open Sans and Source Sans Pro instead of the console's
-typefaces; Chinese, Japanese and Korean text and most symbols are missing (each missing character is drawn as an
-empty box); the button icons come from yuzu's small icon font. Fights are not affected.
+typefaces; Chinese, Japanese and Korean text and most symbols are missing (each missing character is drawn as a
+stand-in: ssbu-recomp's an empty box, WindowSmash's the one above); the button icons come from yuzu's small icon
+font. Fights are not affected.
 
 ## Files
 

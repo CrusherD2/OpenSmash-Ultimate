@@ -28,7 +28,7 @@ libopus 1.5.2 (Xiph.Org Foundation and contributors) is included as source in [`
 
 ### Open fonts
 
-[`third_party/fonts_open/`](third_party/fonts_open/) holds seven TrueType fonts that ssbu-recomp's runtime ([`ssbu-recomp/runtime/nnpl.c`](ssbu-recomp/runtime/nnpl.c)) uses when no firmware fonts are given. They are open-source fonts the yuzu project put together for the same purpose, taken unmodified (only renamed) from the suyu repository at commit `c0dd2ff554327657f0c6318f29b740ac7e329ea0`. [Their README](third_party/fonts_open/README.md) lists each file with the SHA-256 of its source, and the license texts are beside them. They are separate files the game reads when it runs, not compiled into it.
+[`third_party/fonts_open/`](third_party/fonts_open/) holds seven TrueType fonts that both runtimes use in place of a firmware font that isn't there ([`runtime/hle_pl.c`](runtime/hle_pl.c), font by font; [`ssbu-recomp/runtime/nnpl.c`](ssbu-recomp/runtime/nnpl.c)). They are open-source fonts the yuzu project put together for the same purpose, taken unmodified (only renamed) from the suyu repository at commit `c0dd2ff554327657f0c6318f29b740ac7e329ea0`. [Their README](third_party/fonts_open/README.md) lists each file with the SHA-256 of its source, and the license texts are beside them. They are separate files the game reads when it runs, not compiled into it. The files stay as they are: WindowSmash's runtime adds U+25A1 to the character map of the copy it loads, in memory.
 
 | Font | Copyright | License |
 | :--- | :--- | :--- |
