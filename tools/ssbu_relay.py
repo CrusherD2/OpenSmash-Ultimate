@@ -574,7 +574,7 @@ class Lobby:
             self.on_data(c, p, now)
         elif kind == BCAST:
             self.on_bcast(c, p, now)
-        elif wire is self.sn3 and kind == ROOMS:   # (version 3's own: they start with the cookie)
+        elif wire is self.sn3 and kind in (ROOMS, MATCH):   # (version 3's own: they start with the cookie)
             if len(p) < 12 or struct.unpack_from(">Q", p, 4)[0] != c.cookie:
                 return
             self.verify(c)
@@ -647,7 +647,7 @@ class Lobby:
         flags = LOBBY | INTRODUCES
         if wire is self.sn3:
             c.sim, c.mods = sim, mods
-            flags |= HAS_ROOMS
+            flags |= HAS_ROOMS | HAS_MATCH
         self.to(c, wire.header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, flags) + b"\0")
 
     def join(self, wire, at, c, nonce, room, name, build, now, part=None):
@@ -952,7 +952,7 @@ class Lobby:
                 self.to(m, out)
                 self.counts["game relayed"] += 1
 
-    # ---- matchmaking (SU) ---------------------------------------------------------------
+    # ---- matchmaking (SU, SN 3) -----------------------------------------------------------
     def on_match(self, c, op, sid, now):
         """MATCH: op 1 (or 2: for a rollback match) searches, sent again every 2 s while it waits or
         is matched (the answer says how it stands); op 0 cancels. sid: the search's id."""
@@ -1075,8 +1075,8 @@ class Lobby:
 
     def match_send(self, c, now):
         """MATCH_STATE: search id u32, state u8, role u8, flags u8 (1: the host's room is open), the
-        other player's address u32 and name[32], then of its build and lobby code: players
-        searching u16, players u16; and the seconds waited u16."""
+        other player's address u32 and name[32], then of its build and lobby code (SN 3: its key):
+        players searching u16, players u16; and the seconds waited u16."""
         m, sid, role, flags, peer, name = c.match, c.search_id or 0, 0, 0, 0, b""
         if m is not None:
             o = m.other(c)
@@ -1092,7 +1092,7 @@ class Lobby:
             state = MS_IDLE
         since = m.at if m is not None else c.search_since
         waited = 0 if since is None else min(int(now - since), 0xFFFF)
-        self.to(c, su_header(SU_MATCH_STATE) + struct.pack(">IBBBI", sid & 0xFFFFFFFF, state, role, flags, peer) +
+        self.to(c, (c.wire or self.sn).header(MATCH_STATE) + struct.pack(">IBBBI", sid & 0xFFFFFFFF, state, role, flags, peer) +
                 name[:NAME_LEN].ljust(NAME_LEN, b"\0") +
                 struct.pack(">HHH", min(len(self.searching.get(c.part, ())), 0xFFFF), min(len(self.parts.get(c.part, ())), 0xFFFF), waited))
 

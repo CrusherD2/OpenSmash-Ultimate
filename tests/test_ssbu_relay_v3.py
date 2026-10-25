@@ -158,6 +158,27 @@ class V3Player:
         assert end[8] == len(out), (end[8], len(out))
         return out
 
+    def match(self, op, sid):
+        self.send(R.MATCH, struct.pack(">QBI", self.cookie, op, sid))
+
+    def state(self, wait=1.0):
+        """The next MATCH_STATE: (id, state, role, flags, the other's address, its name, players
+        searching, players, seconds waited), or None."""
+        p = self.first(R.MATCH_STATE, wait)
+        if p is None:
+            return None
+        assert len(p) == 4 + 49, len(p)
+        return struct.unpack_from(">IBBBI", p, 4) + (p[15:47].rstrip(b"\0"),) + struct.unpack_from(">HHH", p, 47)
+
+    def until_state(self, want, wait=3.0, flags=0):
+        """MATCH_STATEs until one is in state want (with these flags set), passing over the others; None
+        if none comes within wait seconds."""
+        end = time.monotonic() + wait
+        while True:
+            st = self.state(end - time.monotonic())
+            if st is None or (st[1] == want and st[3] & flags == flags):
+                return st
+
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
@@ -394,6 +415,65 @@ class RoomBrowser(V3Test):
         p = self.player(mod_set=self.mine)
         p.send(R.ROOMS, struct.pack(">QI", p.cookie ^ 1, 3))
         self.assertIsNone(p.first(R.ROOMS_END, 0.3))
+
+
+class Matchmaking(V3Test):
+    """MATCH and MATCH_STATE as SU's, for the players of one key."""
+    server_options = {"search_for": 30.0, "match_for": 30.0}
+
+    def test_paired_within_the_key_only(self):
+        a, b = self.player(name="MA"), self.player(name="MB")
+        self.assertTrue(a.flags & R.HAS_MATCH)
+        y, z = self.player(name="MY", sim=SIM + 1), self.player(name="MZ", mod_set=mods((b"Alpha", 1)))
+        old = self.v2(room="v3test")
+        a.match(1, 101)
+        self.assertEqual(a.state(), (101, R.MS_SEARCHING, 0, 0, 0, b"", 1, 2, 0))   # (searching 1, players of its key 2)
+        y.match(1, 201)
+        self.assertEqual(y.state()[:2], (201, R.MS_SEARCHING))
+        z.match(1, 301)
+        self.assertEqual(z.state()[:2], (301, R.MS_SEARCHING))
+        old.send(R.header(R.MATCH) + struct.pack(">QBI", old.cookie, 1, 401))   # (version 2 has no MATCH)
+        self.assertEqual(a.ping(), (2, 0, 1, 1, 4))   # (players and searching of its key; players of the code: 4)
+        b.match(1, 102)
+        sa, sb = a.until_state(R.MS_MATCHED), b.until_state(R.MS_MATCHED)
+        self.assertEqual(sa[:7], (101, R.MS_MATCHED, R.ROLE_HOST, 0, b.ip, b"MB", 0))   # (MA waited longer: MA hosts)
+        self.assertEqual(sb[:7], (102, R.MS_MATCHED, R.ROLE_JOIN, 0, a.ip, b"MA", 0))
+        self.assertEqual(y.state(0.2), None)
+        self.assertEqual(z.state(0), None)
+        self.assertEqual(old.recv(0.2), [])
+
+    def test_room_then_together(self):
+        a, b = self.player(name="MA"), self.player(name="MB")
+        a.match(1, 1)
+        self.assertEqual(a.state()[1], R.MS_SEARCHING)
+        b.match(1, 2)
+        self.assertIsNotNone(a.until_state(R.MS_MATCHED))
+        self.assertIsNotNone(b.until_state(R.MS_MATCHED))
+        session = secrets.token_bytes(16)
+        a.advertise(session)
+        self.assertIsNotNone(b.until_state(R.MS_MATCHED, flags=1), "the guest was not told the host's room is open")
+        self.assertEqual(b.list()[0][0], a.ip)
+        b.ldn(a.ip, R.LM_JOIN, session + b"MB".ljust(32, b"\0") + b"\0\0")
+        self.assertTrue(a.datas())
+        a.advertise(session, [b.ip])
+        self.assertEqual(a.until_state(R.MS_TOGETHER)[:6], (1, R.MS_TOGETHER, R.ROLE_HOST, 0, b.ip, b"MB"))
+        self.assertEqual(b.until_state(R.MS_TOGETHER)[:6], (2, R.MS_TOGETHER, R.ROLE_JOIN, 0, a.ip, b"MA"))
+
+    def test_cancel_tells_the_other(self):
+        f, g = self.player(name="MF"), self.player(name="MG")
+        f.match(1, 1)
+        self.assertEqual(f.state()[1], R.MS_SEARCHING)
+        g.match(1, 2)
+        self.assertIsNotNone(g.until_state(R.MS_MATCHED))
+        g.match(0, 2)
+        self.assertEqual(g.until_state(R.MS_IDLE)[0], 2)
+        self.assertEqual(f.until_state(R.MS_PEER_LEFT)[4:6], (g.ip, b"MG"))
+
+    def test_rate(self):
+        a = self.player()
+        for _ in range(40):
+            a.match(1, 9)
+        self.assertLess(len(a.all(R.MATCH_STATE, 0.5)), 15)
 
 
 class OnlineLobby(unittest.TestCase):
