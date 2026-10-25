@@ -11,7 +11,11 @@ room's traffic straight to each other (UDP hole punching) and use the lobby only
 The protocol is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay
 of its own for a private room (launchers\\Host SSBU Netplay.bat).
 
-    python3 ssbu_relay.py [--port 39420] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
+ssbu-recomp's games join the same lobby on a port of their own (--su-port, 39500): their protocol
+is "SU" version 1 (ssbu-recomp/runtime/net_relay.c), with its own numbers and layouts, and the
+same rooms, limits, rates and timeouts. Players of the two protocols never share a room.
+
+    python3 ssbu_relay.py [--port 39420] [--su-port 39500] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)
 
 Python 3.8+, standard library only."""
@@ -62,9 +66,24 @@ NI_NODES = 0x68
 NI_ADV_SIZE = 0x26A
 NODE_SIZE = 0x40
 
+# ssbu-recomp's games speak a protocol of their own, "SU" version 1 (ssbu-recomp/runtime/net_relay.c
+# describes it), on a port of its own: the same lobby, other numbers and layouts.
+SU_PROTOCOL = 1
+SU_PORT = 39500
+(SU_JOIN, SU_WELCOME, SU_REJECT, SU_PING, SU_PONG, SU_DATA, SU_LEAVE, SU_LIST, SU_LISTING, SU_LIST_END,
+ SU_PEERS, SU_PUNCH, SU_DIRECT, SU_BCAST) = range(1, 15)
+SU_JOIN_SIZE = 4 + 8 + 2 * NAME_LEN + BUILD_LEN + 4 + 2 + 1
+SU_PING_SIZE = 4 + 8 + 8 + 1
+SU_PEER = struct.Struct(">I32sIHIHQ")   # a PEERS entry (only the players introduced)
+SU_PEERS_AGAIN = 5.0   # seconds: its PINGs don't say which PEERS came last, so the last is sent again this often
+
 
 def header(kind, version=PROTOCOL):
     return b"SN" + bytes((version, kind))
+
+
+def su_header(kind):
+    return b"SU" + bytes((SU_PROTOCOL, kind))
 
 
 class Wire:
@@ -203,8 +222,9 @@ class Listing:
 
 
 def options(**overrides):
-    """The lobby's settings (main's command line; tests override some)."""
-    o = argparse.Namespace(port=DEFAULT_PORT, bind="0.0.0.0", verbose=False, banlist=None,
+    """The lobby's settings (main's command line; tests override some). su_port: SU's port (None: SU
+    not served, 0: any free port)."""
+    o = argparse.Namespace(port=DEFAULT_PORT, su_port=None, bind="0.0.0.0", verbose=False, banlist=None,
                            max_clients=2000, max_pending=1000, per_ip=8, gate_rate=5.0, gate_burst=20,
                            packet_rate=600.0, byte_rate=400_000.0, max_data=1500,
                            client_timeout=10.0, pending_timeout=3.0, listed_for=3.5, listing_timeout=10.0,
@@ -218,6 +238,7 @@ class Lobby:
     def __init__(self, o):
         self.o = o
         self.sn = Wire("SN", PROTOCOL, DATA, BCAST)
+        self.su = Wire("SU", SU_PROTOCOL, SU_DATA, SU_BCAST)
         self.by_addr = {}       # (wire, (host, port)) -> Client
         self.by_ip = {}         # virtual address -> Client
         self.parts = {}         # (wire name, build, lobby code) -> set of Client
@@ -236,7 +257,7 @@ class Lobby:
 
     # ---- plumbing ---------------------------------------------------------------------
     def close_ports(self):
-        for wire in (self.sn,):
+        for wire in (self.sn, self.su):
             if wire.transport is not None:
                 wire.transport.close()
 
@@ -263,7 +284,9 @@ class Lobby:
         return wire.header(wire.data)
 
     def reject(self, wire, at, nonce, reason, why, version=None):
-        self.send(wire.header(REJECT, version) + nonce + bytes((reason,)) + why.encode()[:63].ljust(64, b"\0"), at, wire)
+        """A REJECT (SU's has no reason byte)."""
+        reason = b"" if wire is self.su else bytes((reason,))
+        self.send(wire.header(REJECT, version) + nonce + reason + why.encode()[:63].ljust(64, b"\0"), at, wire)
 
     def gate(self, at, now):
         """Whether a stranger at this address may get an answer now (rate-limited: a lobby must not
@@ -392,7 +415,7 @@ class Lobby:
             return
         try:
             now = time.monotonic()
-            self.packet(p, at, now)
+            (self.packet if wire is self.sn else self.su_packet)(p, at, now)
             if self.dirty or self.dirty_clients:
                 self.flush(now)
         except Exception as e:   # (one bad packet never stops the lobby)
@@ -523,15 +546,78 @@ class Lobby:
         c.seen = now
         return c
 
+    # ---- ssbu-recomp's games (SU) -------------------------------------------------------
+    # The same lobby in SU's numbers and layouts, with WindowSmash's limits, rates and timeouts:
+    # a player is verified (its cookie came back) before anything of its is carried, and players
+    # are introduced to each other only once their games talk.
+    def su_packet(self, p, at, now):
+        """A packet of ssbu-recomp's games (SU)."""
+        if p[2] != SU_PROTOCOL:   # (another version: nothing it says is known)
+            return
+        kind = p[3]
+        c = self.by_addr.get((self.su, at))
+        if kind == SU_JOIN:
+            self.su_join(p, at, c, now)
+            return
+        if c is None:
+            return
+        if kind == SU_DATA:
+            self.on_data(c, p, now)
+            return
+        if kind == SU_BCAST:
+            self.on_bcast(c, p, now)
+            return
+        if len(p) < 12 or struct.unpack_from(">Q", p, 4)[0] != c.cookie:   # (the rest starts with the cookie)
+            return
+        self.verify(c)
+        c.seen = now
+        if kind == SU_PING:
+            if len(p) < SU_PING_SIZE:
+                return
+            c.direct_count = min(p[20], ROOM_MAX - 1)
+            self.to(c, su_header(SU_PONG) + p[12:20] + struct.pack(">HH", min(len(self.parts.get(c.part, ())), 0xFFFF),
+                                                                  min(len(self.part_rooms.get(c.part, ())), 0xFFFF)))
+            if c.peers_version and now - c.peers_at >= SU_PEERS_AGAIN:   # (in case the last was lost)
+                self.sync(c, now, again=True)
+        elif kind == SU_LEAVE:
+            self.drop(c, "left")
+        elif kind == SU_LIST:
+            if len(p) < 16:
+                return
+            if not c.lists.take(now):
+                self.drops["list rate"] += 1
+                return
+            self.on_list(c, p[12:16], now)
+
+    def su_join(self, p, at, c, now):
+        """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections)."""
+        if len(p) < SU_JOIN_SIZE:
+            return
+        nonce = p[4:12]
+        code, name = text(p[12:12 + NAME_LEN]), text(p[12 + NAME_LEN:12 + 2 * NAME_LEN]) or "Player"
+        o = 12 + 2 * NAME_LEN + BUILD_LEN
+        build = p[12 + 2 * NAME_LEN:o].rstrip(b"\0")
+        lan_ip, lan_port = struct.unpack_from(">IH", p, o)
+        c = self.join(self.su, at, c, nonce, code, name, build, now)
+        if c is None:
+            return
+        direct_ok, lan = bool(p[o + 6] & 1), ((lan_ip, lan_port) if lan_ip and lan_port else None)
+        if not c.ext or direct_ok != c.direct_ok or lan != c.lan:   # (every SU game can connect directly)
+            c.ext, c.direct_ok, c.lan = True, direct_ok, lan
+            self.mark(c)
+        self.to(c, su_header(SU_WELCOME) + nonce + struct.pack(">IQ", c.ip, c.cookie))
+
+    # ---- rooms ----------------------------------------------------------------------------
     def on_list(self, c, seq, now):
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
         ones whose host is closest to the lobby (in 100 ms steps, taken when the room opened: the
         list must not reorder under the player's cursor from one scan to the next), then the oldest."""
         rooms = sorted((r for r in self.part_rooms.get(c.part, ()) if r.owner is not c and now - r.updated <= self.o.listed_for),
                        key=lambda r: (not r.open, -r.count, 10 if r.distance is None else r.distance, r.created))[:LIST_MAX]
+        su = c.wire is self.su
         for r in rooms:
-            self.to(c, header(LISTING) + seq + struct.pack(">I", r.owner.ip) + r.info)
-        self.to(c, header(LIST_END) + seq + bytes((len(rooms),)))
+            self.to(c, (su_header(SU_LISTING) if su else header(LISTING)) + seq + struct.pack(">I", r.owner.ip) + r.info)
+        self.to(c, (su_header(SU_LIST_END) if su else header(LIST_END)) + seq + bytes((len(rooms),)))
 
     def on_ldn(self, c, p, dst, sport, dport, now):
         """Local wireless's own messages: only the ones its protocol has, between the players they
@@ -738,6 +824,7 @@ class Lobby:
             return
         listing = self.network_of(c)
         peers = sorted((m for m in self.members(listing) if m is not c), key=lambda m: m.ip) if listing else []
+        su = c.wire is self.su
         entries, introduced = [], 0
         for m in peers:
             secret = self.pair_secret(listing, c, m, now)
@@ -747,6 +834,10 @@ class Lobby:
                 pub = (address_number(m.at[0]), m.at[1])
                 if m.at[0] == c.at[0] and m.lan and m.lan != pub:   # (behind the same router: its address there too)
                     lan = m.lan
+            if su:   # (SU lists only the players introduced)
+                if secret:
+                    entries.append(SU_PEER.pack(m.ip, m.name.encode()[:NAME_LEN], *pub, *lan, secret))
+                continue
             flags = (1 if secret else 0) | (0 if m.direct_ok else 2 if m.ext else 4)   # (2: it turned them off, 4: an older game)
             entries.append(PEER.pack(m.ip, m.name.encode()[:NAME_LEN], flags, *pub, *lan, secret))
         entries = b"".join(entries)
@@ -760,7 +851,10 @@ class Lobby:
             c.peers_sent = entries
         c.peers_at = now
         c.introduced_count = introduced
-        self.to(c, header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
+        if su:
+            self.to(c, su_header(SU_PEERS) + struct.pack(">IB", c.peers_version, introduced) + entries)
+        else:
+            self.to(c, header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
 
     # ---- housekeeping -------------------------------------------------------------------
     def sweep(self, now):
@@ -782,7 +876,8 @@ class Lobby:
         drops = ", ".join(f"{k} {v}" for k, v in sorted(self.drops.items())) or "none"
         paths = sum(p.introduced_count for p in self.by_addr.values())
         direct = sum(min(p.direct_count, p.introduced_count) for p in self.by_addr.values())
-        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting) in {len(self.parts)} "
+        su = sum(1 for p in self.by_addr.values() if p.wire is self.su)
+        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {su} on SU) in {len(self.parts)} "
                  f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
                  f"out {c['out packets'] / secs:.0f}/s {c['out bytes'] / secs / 1024:.1f} KB/s; "
@@ -810,6 +905,8 @@ async def serve(o, make=None):
     lobby = (make or Lobby)(o)
     try:
         transport, _ = await loop.create_datagram_endpoint(lambda: Endpoint(lobby, lobby.sn), local_addr=(o.bind, o.port))
+        if o.su_port is not None:
+            await loop.create_datagram_endpoint(lambda: Endpoint(lobby, lobby.su), local_addr=(o.bind, o.su_port))
     except BaseException:
         lobby.close_ports()
         raise
@@ -819,6 +916,9 @@ async def serve(o, make=None):
 async def main(o):
     transport, lobby = await serve(o)
     Lobby.say(f"SSBU netplay lobby on UDP {o.bind}:{transport.get_extra_info('sockname')[1]} (protocol {PROTOCOL})")
+    if lobby.su.transport is not None:
+        Lobby.say(f"and for ssbu-recomp's games on UDP {o.bind}:{lobby.su.transport.get_extra_info('sockname')[1]} "
+                  f"(protocol SU {SU_PROTOCOL})")
     task = asyncio.ensure_future(lobby.run())
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -902,10 +1002,12 @@ def probe(target, room, name, build, wait=3.0):
     return 0
 
 
-def parse_args(argv=None):
-    d = options()
+def parse_args(argv=None, **defaults):
+    d = options(**defaults)
     a = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     a.add_argument("--port", type=int, default=int(os.environ.get("SSBU_NET_PORT", d.port)), help="UDP port (default 39420)")
+    a.add_argument("--su-port", type=int, default=d.su_port or 0,
+                   help=f"UDP port for ssbu-recomp's games (protocol SU {SU_PROTOCOL}; 0: none; default %(default)s)")
     a.add_argument("--bind", default=d.bind, help="the address to listen on (default: all)")
     a.add_argument("--verbose", action="store_true", help="log players and rooms coming and going")
     a.add_argument("--banlist", help="a file of IP addresses or networks (one a line, # comments) to turn away; "
@@ -923,11 +1025,12 @@ def parse_args(argv=None):
     args = a.parse_args(argv)
     for k, v in vars(args).items():
         setattr(d, k, v)
+    d.su_port = d.su_port or None
     return d
 
 
 if __name__ == "__main__":
-    o = parse_args()
+    o = parse_args(su_port=SU_PORT)
     if o.probe:
         sys.exit(probe(o.probe, o.room, "probe", o.build))
     try:

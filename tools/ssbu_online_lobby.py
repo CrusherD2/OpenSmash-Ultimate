@@ -8,6 +8,9 @@ has put in one match talk to each other.
 
     python3 ssbu_online_lobby.py [the lobby's options] [--state DIR] [--nex-log 0|1|2]
 
+ssbu-recomp's games are served only with --su-port (none by default: ssbu_relay.py's lobby on the
+same machine has SU's usual port), and without the game server: it is WindowSmash's games' only.
+
 Python 3.8+, standard library only."""
 import argparse
 import asyncio
@@ -106,6 +109,9 @@ class OnlineLobby(relay.Lobby):
         return super().new_ip() if ip == NAT_CHECK_SECOND else ip   # (nncs2's address is the server's)
 
     def on_game(self, c, p, dst):
+        if c.wire is self.su:   # (the game server is WindowSmash's games' only)
+            super().on_game(c, p, dst)
+            return
         if dst in (GATEWAY, NAT_CHECK_SECOND):
             _src, _dst, sport, dport = struct.unpack_from(">IIHH", p, 4)
             self.nex.datagram((relay.ip_text(c.ip), sport), dport, p[16:], time.monotonic(),
@@ -113,7 +119,7 @@ class OnlineLobby(relay.Lobby):
             return
         if dst not in relay.BROADCASTS:
             m = self.by_ip.get(dst)
-            if m is not None and m is not c and self.nex.may_talk(relay.ip_text(c.ip), relay.ip_text(dst)):
+            if m is not None and m is not c and m.wire is not self.su and self.nex.may_talk(relay.ip_text(c.ip), relay.ip_text(dst)):
                 self.to(m, p)
                 return
         super().on_game(c, p, dst)
@@ -170,7 +176,7 @@ class OnlineLobby(relay.Lobby):
                 return
             vip, vport, port = struct.unpack(">IHH", head[8:])
             c = self.by_ip.get(vip)
-            if c is None or not c.verified or c.at[0] != peer[0]:
+            if c is None or not c.verified or c.at[0] != peer[0] or c.wire is self.su:
                 self.say(f"NEX stream from {peer[0]} for {relay.ip_text(vip)}: not that player's")
                 return
             mine = self.streams.setdefault(vip, set())
