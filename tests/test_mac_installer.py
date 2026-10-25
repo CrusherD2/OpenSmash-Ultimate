@@ -945,6 +945,22 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertRegex(line, r'^R=a\.example:1\|C=\|N=Player\d{4}\|D=$')
         self.assertRegex((self.top / 'online_name.txt').read_text(), r'^Player\d{4}\n$')
 
+    def test_online_files_in_config_folder(self):
+        """Once the game has made config/ (runtime/config.h: its version.ini), the name and the direct
+        setting are read and written there; online_server.txt stays the port's own until there is one there."""
+        (self.top / 'online_server.txt').write_text('a.example:1\n')
+        (self.top / 'online_name.txt').write_text('Old Name\n')
+        (self.top / 'online_direct.txt').write_text('off\n')
+        (self.top / 'config').mkdir()
+        (self.top / 'config' / 'online_direct.txt').write_text('on\n')
+        self.assertEqual(self.sh(self.ONLINE).stdout.splitlines()[0], 'R=a.example:1|C=|N=Old Name|D=0')   # (not the game's folder yet)
+        (self.top / 'config' / 'version.ini').write_text('version = 1\n')
+        self.assertEqual(self.sh(self.ONLINE, 'New Name\n').stdout.splitlines()[0], 'R=a.example:1|C=|N=New Name|D=')
+        self.assertEqual((self.top / 'config' / 'online_name.txt').read_text(), 'New Name\n')
+        self.assertEqual((self.top / 'online_name.txt').read_text(), 'Old Name\n')
+        (self.top / 'config' / 'online_server.txt').write_text('off\n')
+        self.assertEqual(self.sh(self.ONLINE).stdout.splitlines()[0], 'R=|C=|N=|D=')
+
     def test_name_dialog(self):
         fake = FakeOsascript(self, ['=Zelda'])
         (self.top / 'online_server.txt').write_text('a.example:1\n')

@@ -578,6 +578,21 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('Playing offline (no lobby in online_server.txt).', r.stdout)
 
+    def test_online_files_in_config_folder(self):
+        """Once the game has made config/ (runtime/config.h: its version.ini), online_name.txt is read
+        there; online_server.txt stays the port's own until there is one there."""
+        (self.top / 'online_server.txt').write_text('lobby.example:39421 FRIENDS\n', newline='\n')
+        (self.top / 'online_name.txt').write_text('Old Name\n', newline='\n')
+        (self.top / 'config').mkdir()
+        (self.top / 'config' / 'version.ini').write_text('version = 1\n', newline='\n')
+        (self.top / 'config' / 'online_name.txt').write_text('Made-up Name\n', newline='\n')
+        r = self.run_launcher('play-ssbu.sh')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('Online: lobby lobby.example:39421 (lobby code FRIENDS), as Made-up Name.', r.stdout)
+        (self.top / 'config' / 'online_server.txt').write_text('off\n', newline='\n')
+        r = self.run_launcher('play-ssbu.sh')
+        self.assertIn('Playing offline (no lobby in online_server.txt).', r.stdout)
+
     def test_data_gone(self):
         (self.top / 'game.nca').unlink()
         r = self.run_launcher('launchers/play-ssbu-offline.sh')
