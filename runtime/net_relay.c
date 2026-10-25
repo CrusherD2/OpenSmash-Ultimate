@@ -71,7 +71,7 @@ typedef int SOCKET;
 #include <stdlib.h>
 #include <string.h>
 
-#include "config.h"
+#include "config_folder.h"
 #include "host.h"
 #include "net.h"
 #include "settings.h"

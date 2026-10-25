@@ -1,4 +1,4 @@
-/* The settings files' folder (config.h): config/, its version.ini, and the copy of the old files
+/* The settings files' folder (config_folder.h): config/, its version.ini, and the copy of the old files
  * into it on the first start that has it. (Not an HLE of anything: named hle_ so both builds'
  * runtime file patterns take it.)
  *
@@ -33,7 +33,7 @@
 #include <string.h>
 
 #include "host.h"
-#include "config.h"
+#include "config_folder.h"
 #include "settings.h"
 
 #ifdef _WIN32
