@@ -535,6 +535,87 @@ class Rollback(V3Test):
         self.assertEqual([len(m) for _, m in b.rbs()], [R.RB_MAX - 16])
 
 
+def talk(*players):
+    """Game packets between each two of these players (both ways), through the lobby."""
+    for a in players:
+        for b in players:
+            if a is not b:
+                a.data(b.ip, b"game")
+    for p in players:
+        p.all(R.DATA, 0.15)
+
+
+class Rules(V3Test):
+    """Version 3 under version 2's rules: verified before anything of its is carried, a room's
+    traffic between its players only, introductions once their games talk, limits."""
+    server_options = {"per_ip": 3}
+
+    def test_nothing_carried_before_verified(self):
+        p = self.player(join=False)
+        p.join(verify=False)
+        session = secrets.token_bytes(16)
+        p.advertise(session)
+        p.send(R.RB, struct.pack(">QI", p.cookie ^ 1, 0) + b"rollback")   # (not its cookie: no proof of its address)
+        self.assertFalse(until(lambda: session in self.server.lobby.listings, 0.3))
+        self.assertFalse(self.server.lobby.by_ip[p.ip].verified)
+        p.rooms()   # (its cookie came back: verified)
+        p.advertise(session)
+        self.assertTrue(self.listed(session))
+
+    def test_room_traffic_between_its_players(self):
+        host, session, (guest,) = self.room(1)
+        stranger = self.player(name="Stranger")
+        guest.data(host.ip, b"in the room")
+        stranger.data(host.ip, b"not")
+        self.assertEqual([m for *_, m in host.datas()], [b"in the room"])
+
+    def test_introduced_once_they_talk(self):
+        host, session, (guest,) = self.room(1)
+        host.ping()
+        got = host.peers()
+        self.assertIsNotNone(got)
+        self.assertEqual([(e[0], e[2] & 1) for e in got[1]], [(guest.ip, 0)])   # (listed, not introduced yet)
+        newest, end = None, time.monotonic() + 3.0
+        while time.monotonic() < end:   # (as two games do: their packets keep coming)
+            talk(host, guest)
+            host.ping()
+            newest = host.peers(0.3) or newest
+            if newest and any(e[0] == guest.ip and e[2] & 1 for e in newest[1]):
+                break
+        entry = next(e for e in newest[1] if e[0] == guest.ip)
+        self.assertEqual((entry[2] & 1, entry[3][1] != 0), (1, True))
+        self.assertNotEqual(entry[5], 0)
+
+    def test_per_address(self):
+        for _ in range(3):
+            self.player()
+        p = self.player(join=False)
+        p.s.sendto(p.join_packet(), p.addr)
+        r = p.first(R.REJECT)
+        self.assertEqual(r[12], 1)
+
+    def test_rate(self):
+        self.server.lobby.o.packet_rate = 20.0
+        host, session, (guest,) = self.room(1)
+        for i in range(200):
+            guest.data(host.ip, b"x%d" % i)
+        self.assertLess(len(host.datas(0.5)), 100)
+
+    def test_status_counts_version_3(self):
+        import json
+        import urllib.request
+        server = Server(status_port=0)
+        self.addCleanup(server.stop)
+        p = V3Player(server)
+        self.addCleanup(p.close)
+        p.join()
+        port = server.lobby.status_server.sockets[0].getsockname()[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=3) as r:
+            doc = json.loads(r.read())
+        self.assertEqual(doc["players"], 1)
+        self.assertIn(f"SN {R.PROTOCOL} and {R.V3}", doc["version"])
+
+
 class OnlineLobby(unittest.TestCase):
     def test_game_server_answers_in_version_3(self):
         """The online lobby's game server (NEX) writes to a game of version 3 in version 3."""

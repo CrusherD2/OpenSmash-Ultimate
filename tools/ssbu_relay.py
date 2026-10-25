@@ -1211,7 +1211,7 @@ class Lobby:
         """Counts only: never an address, a name, a lobby code or a build."""
         return json.dumps({"up": True, "players": len(self.by_addr) - self.pending, "rooms": len(self.listings),
                            "searching": sum(len(w) for w in self.searching.values()),
-                           "version": f"{LOBBY_VERSION} (protocols SN {PROTOCOL}, SU {SU_PROTOCOL})",
+                           "version": f"{LOBBY_VERSION} (protocols SN {PROTOCOL} and {V3}, SU {SU_PROTOCOL})",
                            "uptime_s": int(now - self.started)})
 
     async def status(self, reader, writer):
@@ -1270,7 +1270,8 @@ class Lobby:
         paths = sum(p.introduced_count for p in self.by_addr.values())
         direct = sum(min(p.direct_count, p.introduced_count) for p in self.by_addr.values())
         su = sum(1 for p in self.by_addr.values() if p.wire is self.su)
-        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {su} on SU) in {len(self.parts)} "
+        v3 = sum(1 for p in self.by_addr.values() if p.wire is self.sn3)
+        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {v3} on SN {V3}, {su} on SU) in {len(self.parts)} "
                  f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}, "
                  f"{sum(len(w) for w in self.searching.values())} searching, {len(self.matches)} matched; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
