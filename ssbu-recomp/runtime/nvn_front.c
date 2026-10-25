@@ -112,92 +112,65 @@ void logf_limited(int *counter, int limit, const char *fmt, ...) {
     fflush(stdout);
 }
 
-/* ---------------------------------------------------------------- formats */
-static const uint16_t k_int12[4][12] = {
-    {0x8229, 0x8F94, 0x8232, 0x8231, 0x822D, 0x822A, 0x8F98, 0x8234, 0x8233, 0x822E, 0x8236, 0x8235},
-    {0x822B, 0x8F95, 0x8238, 0x8237, 0x822F, 0x822C, 0x8F99, 0x823A, 0x8239, 0x8230, 0x823C, 0x823B},
-    {0x8051, 0x8F96, 0x8D7D, 0x8D8F, 0x881B, 0x8054, 0x8F9A, 0x8D77, 0x8D89, 0x8815, 0x8D71, 0x8D83},
-    {0x8058, 0x8F97, 0x8D7C, 0x8D8E, 0x881A, 0x805B, 0x8F9B, 0x8D76, 0x8D88, 0x8814, 0x8D70, 0x8D82}};
-static const uint16_t k_type12[12] = {0x1401, 0x1400, 0x1401, 0x1400, 0x140B, 0x1403, 0x1402, 0x1403, 0x1402, 0x1406, 0x1405, 0x1404};
+/* ---------------------------------------------------------------- formats
+ * What the front end and every back end need of an NVN texture format: bytes per block, block size, kind. The formats
+ * of the APIs are the back ends' (OpenGL: gl_fmt in nvn_gl.c; Vulkan: tex_vkfmt in nvn_vk_draw.c), for the formats listed here. */
 static const uint8_t k_size12[12] = {1, 1, 1, 1, 2, 2, 2, 2, 2, 4, 4, 4};
-static const uint8_t k_isint12[12] = {0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1};
-static const uint8_t k_norm12[12] = {1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0};
-static const uint16_t k_pix[4] = {0x1903, 0x8227, 0x1907, 0x1908}, k_pixint[4] = {0x8D94, 0x8228, 0x8D98, 0x8D99};
 static const uint8_t k_astc[14][2] = {{4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}, {8, 5}, {8, 6}, {8, 8}, {10, 5}, {10, 6}, {10, 8}, {10, 10}, {12, 10}, {12, 12}};
 
 int fmt_get(int nf, Fmt *f) {
     memset(f, 0, sizeof *f);
     f->bw = f->bh = 1;
-#define SET(i, fo, ty, b, k) (f->internal = (i), f->format = (fo), f->type = (ty), f->bpb = (b), f->kind = (k), 1)
-#define BC(i, b) (f->bw = f->bh = 4, SET(i, 0, 0, b, 4))
+#define SET(b, k) (f->bpb = (b), f->kind = (k), 1)
+#define BC(b) (f->bw = f->bh = 4, SET(b, 4))
     if ((nf >= 0x01 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) {
         int comps = nf >= 0x6D ? 4 : (nf - 1) / 12 + 1, i = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
-        return SET(k_int12[comps - 1][i], k_isint12[i] ? k_pixint[comps - 1] : k_pix[comps - 1], k_type12[i], comps * k_size12[i], 0);
+        return SET(comps * k_size12[i], 0);
     }
     if (nf >= 0x79 && nf <= 0x94) {
         int i = (nf - 0x79) % 14;
         f->bw = k_astc[i][0]; f->bh = k_astc[i][1];
-        return SET((nf >= 0x87 ? 0x93D0 : 0x93B0) + i, 0, 0, 16, 4);
+        return SET(16, 4);
     }
     switch (nf) {
-    case 0x31: return SET(0x8D48, GL_STENCIL_INDEX_, 0x1401, 1, 2);
-    case 0x32: return SET(0x81A5, 0x1902, 0x1403, 2, 1);
-    case 0x33: return SET(0x81A6, 0x1902, 0x1405, 4, 1);
-    case 0x34: return SET(0x8CAC, 0x1902, 0x1406, 4, 1);
-    case 0x35: return SET(0x88F0, GL_DEPTH_STENCIL_, 0x84FA, 4, 3);
-    case 0x36: return SET(0x8CAD, GL_DEPTH_STENCIL_, 0x8DAD, 8, 3);
-    case 0x37: case 0x38: return SET(0x8C43, 0x1908, 0x1401, 4, 0);
-    case 0x39: return SET(0x8056, 0x1908, 0x8033, 2, 0);
-    case 0x3A: return SET(0x8050, 0x1908, 0x8034, 2, 0);
-    case 0x3B: return SET(0x8057, 0x1908, 0x8034, 2, 0);
-    case 0x3C: return SET(0x8D62, 0x1907, 0x8363, 2, 0);
-    case 0x3D: return SET(0x8059, 0x1908, 0x8368, 4, 0);
-    case 0x3E: return SET(0x906F, 0x8D99, 0x8368, 4, 0);
-    case 0x3F: return SET(0x8C3A, 0x1907, 0x8C3B, 4, 0);
-    case 0x40: return SET(0x8C3D, 0x1907, 0x8C3E, 4, 0);
-    case 0x41: return BC(0x83F0, 8);
-    case 0x42: return BC(0x83F1, 8);
-    case 0x43: return BC(0x83F2, 16);
-    case 0x44: return BC(0x83F3, 16);
-    case 0x45: return BC(0x8C4C, 8);
-    case 0x46: return BC(0x8C4D, 8);
-    case 0x47: return BC(0x8C4E, 16);
-    case 0x48: return BC(0x8C4F, 16);
-    case 0x49: return BC(0x8DBB, 8);
-    case 0x4A: return BC(0x8DBC, 8);
-    case 0x4B: return BC(0x8DBD, 16);
-    case 0x4C: return BC(0x8DBE, 16);
-    case 0x4D: return BC(0x8E8C, 16);
-    case 0x4E: return BC(0x8E8D, 16);
-    case 0x4F: return BC(0x8E8E, 16);
-    case 0x50: return BC(0x8E8F, 16);
-    case 0x95: return SET(0x8D62, GL_BGR_, 0x8363, 2, 0);
-    case 0x99: case 0x9A: return SET(0x8058, GL_BGRA_, 0x1401, 4, 0);
-    case 0x9B: case 0x9C: return SET(0x8C43, GL_BGRA_, 0x1401, 4, 0);
+    case 0x31: return SET(1, 2);
+    case 0x32: return SET(2, 1);
+    case 0x33: return SET(4, 1);
+    case 0x34: return SET(4, 1);
+    case 0x35: return SET(4, 3);
+    case 0x36: return SET(8, 3);
+    case 0x37: case 0x38: return SET(4, 0);
+    case 0x39: return SET(2, 0);
+    case 0x3A: return SET(2, 0);
+    case 0x3B: return SET(2, 0);
+    case 0x3C: return SET(2, 0);
+    case 0x3D: return SET(4, 0);
+    case 0x3E: return SET(4, 0);
+    case 0x3F: return SET(4, 0);
+    case 0x40: return SET(4, 0);
+    case 0x41: return BC(8);
+    case 0x42: return BC(8);
+    case 0x43: return BC(16);
+    case 0x44: return BC(16);
+    case 0x45: return BC(8);
+    case 0x46: return BC(8);
+    case 0x47: return BC(16);
+    case 0x48: return BC(16);
+    case 0x49: return BC(8);
+    case 0x4A: return BC(8);
+    case 0x4B: return BC(16);
+    case 0x4C: return BC(16);
+    case 0x4D: return BC(16);
+    case 0x4E: return BC(16);
+    case 0x4F: return BC(16);
+    case 0x50: return BC(16);
+    case 0x95: return SET(2, 0);
+    case 0x99: case 0x9A: return SET(4, 0);
+    case 0x9B: case 0x9C: return SET(4, 0);
     }
     return 0;
 #undef SET
 #undef BC
-}
-
-/* Vertex attribute format: component count, GL type, normalised, integer. */
-int vfmt_get(int nf, int *size, GLenum *type, int *norm, int *integer) {
-    static const uint16_t t6[6] = {0x1401, 0x1400, 0x1403, 0x1402, 0x1405, 0x1404};
-    if ((nf >= 0x01 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) {
-        int i = nf >= 0x6D ? nf - 0x6D : (nf - 1) % 12;
-        *size = nf >= 0x6D ? 4 : (nf - 1) / 12 + 1; *type = k_type12[i]; *norm = k_norm12[i]; *integer = k_isint12[i];
-        return 1;
-    }
-    if (nf >= 0x51 && nf <= 0x68) { *size = (nf - 0x51) / 6 + 1; *type = t6[(nf - 0x51) % 6]; *norm = 0; *integer = 0; return 1; }
-    switch (nf) {
-    case 0x3D: *size = 4; *type = 0x8368; *norm = 1; *integer = 0; return 1;
-    case 0x3E: *size = 4; *type = 0x8368; *norm = 0; *integer = 1; return 1;
-    case 0x69: *size = 4; *type = 0x8D9F; *norm = 1; *integer = 0; return 1;
-    case 0x6A: *size = 4; *type = 0x8D9F; *norm = 0; *integer = 1; return 1;
-    case 0x6B: *size = 4; *type = 0x8368; *norm = 0; *integer = 0; return 1;
-    case 0x6C: *size = 4; *type = 0x8D9F; *norm = 0; *integer = 0; return 1;
-    }
-    return 0;
 }
 
 /* ---------------------------------------------------------------- guest objects

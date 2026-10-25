@@ -10,7 +10,7 @@
 #include <GL/gl.h>
 #include "mx_translate.h"
 
-typedef struct { uint16_t internal, format, type; uint8_t bpb, bw, bh, kind; } Fmt;   /* kind: 0 colour, 1 depth, 2 stencil, 3 depth+stencil, 4 compressed */
+typedef struct { uint8_t bpb, bw, bh, kind; } Fmt;   /* bytes per block, block width and height in texels; kind: 0 colour, 1 depth, 2 stencil, 3 depth+stencil, 4 compressed */
 
 /* Small state objects and builders keep their contents in the guest's own memory (the game copies them
  * around freely); textures, programs, command buffers, pools and windows keep a pointer to a host struct

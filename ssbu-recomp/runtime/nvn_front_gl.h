@@ -92,7 +92,6 @@ extern LONG64 g_prev_frame_draws, g_frame_dispatch;
 
 /* ---- formats, guest objects, texture memory (nvn_front.c) */
 int fmt_get(int nf, Fmt *f);
-int vfmt_get(int nf, int *size, GLenum *type, int *norm, int *integer);
 extern SRWLOCK g_pool_lock;
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
