@@ -24,8 +24,9 @@
 
 #ifdef __linux__
 #include <sys/resource.h>   /* (RLIMIT_NICE: see "priorities and cores") */
-#include <unistd.h>
+#include <unistd.h>         /* (geteuid) */
 #endif
+#undef R_OK   /* (unistd.h's access() flag: here R_OK is the kernel's result code, below) */
 
 #ifdef __APPLE__
 void rt_upnp_remove(void);   /* (linux/upnp.c: the netplay relay's port mapping, if it made one) */
