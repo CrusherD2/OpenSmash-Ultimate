@@ -616,6 +616,25 @@ class TerminalTests(unittest.TestCase):
         self.assertIn('Name it with --game', str(stop.exception))
 
 
+    def test_online_name_in_config_folder(self):
+        """online_name.txt where the game reads it (runtime/config.h): config/ once the game has made it
+        (config/version.ini), else the port's folder."""
+        def files(**kw):
+            with mock.patch.object(im, 'ROOT', self.top), mock.patch.object(im, 'Checks', StubChecks), \
+                    mock.patch.object(im, 'detected_folders', lambda: {'game': None, 'keys': None, 'firmware': None}), \
+                    mock.patch('builtins.input', side_effect=AssertionError('asked')), contextlib.redirect_stdout(io.StringIO()):
+                return im.step_files(arguments(**kw), 'off')
+        Path(self.top, 'online_name.txt').write_text('Old Name\n')
+        self.assertEqual(files(dry_run=True)['name'], 'Old Name')
+        Path(self.top, 'config').mkdir()
+        Path(self.top, 'config', 'version.ini').write_text('version = 1\n')
+        Path(self.top, 'config', 'online_name.txt').write_text('Made-up Name\n')
+        self.assertEqual(files(dry_run=True)['name'], 'Made-up Name')
+        got = files(yes=True, online_name='New Name', game=self.dirs['My Game'], keys=self.dirs['My Keys'], firmware=self.dirs['My Firmware'])
+        self.assertEqual(got['name'], 'New Name')
+        self.assertEqual(Path(self.top, 'config', 'online_name.txt').read_text(), 'New Name\n')
+        self.assertEqual(Path(self.top, 'online_name.txt').read_text(), 'Old Name\n')   # (the old file as it was)
+
 @unittest.skipUnless(DARWIN and shutil.which('codesign'), 'needs macOS')
 class FirewallTests(unittest.TestCase):
     """Step 9, with the firewall's tool and the password dialog stood in for."""

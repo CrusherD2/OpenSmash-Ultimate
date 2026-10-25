@@ -201,6 +201,19 @@ function Merge-OnlineServer {
     return $Local
 }
 
+function Get-ConfigPath {
+    <# Where the game reads a settings file (runtime/config.h): config\ once the game has made it
+       (config\version.ini), else the port's folder; online_server.txt is config\'s only once there
+       is one there. (tools\launcher.ps1 has the same.) #>
+    param([string]$Root, [string]$Name)
+    $inFolder = Join-Path (Join-Path $Root 'config') $Name
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $Root 'config') 'version.ini') -PathType Leaf) -or
+        ($Name -eq 'online_server.txt' -and -not (Test-Path -LiteralPath $inFolder -PathType Leaf))) {
+        return Join-Path $Root $Name
+    }
+    return $inFolder
+}
+
 function Join-CommandLine {
     <# One Windows command line of these arguments (Start-Process takes a string: Windows PowerShell
        does not quote the elements of an array), quoted by CommandLineToArgvW's rules. #>
@@ -1302,7 +1315,7 @@ function Step-GameFiles {
     foreach ($k in @('Game', 'Keys', 'Firmware')) {
         if ($detected[$k]) { Write-Info "$($k.ToLower()): $($detected[$k])" } else { Write-Info "$($k.ToLower()): not found on this PC (to be chosen)" }
     }
-    $nameFile = Join-Path $Root 'online_name.txt'
+    $nameFile = Get-ConfigPath $Root 'online_name.txt'
     $default = $OnlineName
     if (-not $default -and (Test-Path -LiteralPath $nameFile)) { $default = ([IO.File]::ReadAllText($nameFile)).Trim() }
     if (-not $default) { $default = 'Player' + (Get-Random -Minimum 1000 -Maximum 9999) }

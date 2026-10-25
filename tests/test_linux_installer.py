@@ -443,6 +443,30 @@ class RebuildTests(unittest.TestCase):
             files = il.step_files(self.args())
         self.assertEqual(files, {'game': None, 'keys': None, 'firmware': None, 'name': 'Me'})
 
+    def test_online_name_in_config_folder(self):
+        """online_name.txt where the game reads it (runtime/config.h): config/ once the game has made it
+        (config/version.ini), else the folder itself; online_server.txt stays the folder's own."""
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(il, 'ROOT', tmp), \
+                unittest.mock.patch.object(il, 'detected_folders', lambda: {'game': None, 'keys': None, 'firmware': None}), \
+                unittest.mock.patch.object(il, 'files_ready', return_value=True), \
+                unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable), \
+                unittest.mock.patch.object(il, 'ask', side_effect=AssertionError('asked')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            Path(tmp, 'online_name.txt').write_text('Old Name\n')
+            self.assertEqual(il.config_file('online_name.txt'), os.path.join(tmp, 'online_name.txt'))
+            self.assertEqual(il.step_files(self.args(dry_run=True))['name'], 'Old Name')
+            os.makedirs(os.path.join(tmp, 'config'))
+            Path(tmp, 'config', 'version.ini').write_text('version = 1\n')
+            Path(tmp, 'config', 'online_name.txt').write_text('Made-up Name\n')
+            self.assertEqual(il.config_file('online_name.txt'), os.path.join(tmp, 'config', 'online_name.txt'))
+            self.assertEqual(il.config_file('online_server.txt'), os.path.join(tmp, 'online_server.txt'))
+            self.assertEqual(il.step_files(self.args(dry_run=True))['name'], 'Made-up Name')
+            self.assertEqual(il.step_files(self.args(online_name='New Name'))['name'], 'New Name')
+            self.assertEqual(Path(tmp, 'config', 'online_name.txt').read_text(), 'New Name\n')
+            self.assertEqual(Path(tmp, 'online_name.txt').read_text(), 'Old Name\n')   # (the old file as it was)
+            Path(tmp, 'config', 'online_server.txt').write_text('off\n')
+            self.assertEqual(il.config_file('online_server.txt'), os.path.join(tmp, 'config', 'online_server.txt'))
+
     def test_a_named_game_folder_is_looked_at(self):
         with unittest.mock.patch.object(il, 'files_ready', side_effect=AssertionError('checked')),                 unittest.mock.patch.object(il, 'venv_python', return_value=sys.executable),                 unittest.mock.patch.object(il, 'check_keys', return_value=(False, 'no')),                 contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(il.Stop):   # (not interactive: the keys folder it was given is no good)
