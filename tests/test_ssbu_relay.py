@@ -22,8 +22,8 @@ GAME_PORT = 12345
 
 
 class Server:
-    """A lobby on its own event loop and thread, with short timeouts."""
-    def __init__(self, **over):
+    """A lobby on its own event loop and thread, with short timeouts (make: R.serve's)."""
+    def __init__(self, make=None, **over):
         settings = dict(bind="127.0.0.1", port=0, stats=0, tick=0.05, client_timeout=10.0, pending_timeout=0.5,
                         listed_for=3.5, listing_timeout=10.0, per_ip=1000, gate_rate=1000.0, gate_burst=1000)
         settings.update(over)   # (every player here comes from 127.0.0.1)
@@ -33,7 +33,7 @@ class Server:
 
         def run():
             asyncio.set_event_loop(self.loop)
-            self.transport, self.lobby = self.loop.run_until_complete(R.serve(o))
+            self.transport, self.lobby = self.loop.run_until_complete(R.serve(o, make))
             self.task = self.loop.create_task(self.lobby.run())
             ready.set()
             self.loop.run_forever()
