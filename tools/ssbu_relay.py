@@ -574,7 +574,7 @@ class Lobby:
             self.on_data(c, p, now)
         elif kind == BCAST:
             self.on_bcast(c, p, now)
-        elif wire is self.sn3 and kind in (ROOMS, MATCH):   # (version 3's own: they start with the cookie)
+        elif wire is self.sn3 and kind in (ROOMS, MATCH, RB):   # (version 3's own: they start with the cookie)
             if len(p) < 12 or struct.unpack_from(">Q", p, 4)[0] != c.cookie:
                 return
             self.verify(c)
@@ -647,7 +647,7 @@ class Lobby:
         flags = LOBBY | INTRODUCES
         if wire is self.sn3:
             c.sim, c.mods = sim, mods
-            flags |= HAS_ROOMS | HAS_MATCH
+            flags |= HAS_ROOMS | HAS_MATCH | HAS_RB
         self.to(c, wire.header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, flags) + b"\0")
 
     def join(self, wire, at, c, nonce, room, name, build, now, part=None):
@@ -1003,16 +1003,16 @@ class Lobby:
             self.match_room(m, m.host.listing, now)
 
     def on_rb(self, c, p, now):
-        """A rollback message: to a player of its build and lobby code, or (destination 0, on a private
-        code only) to all of them. On the public code, only to the player of its rollback match or a
-        player of its room. Once one went each way between the two of a rollback match, they are
-        together."""
+        """A rollback message: to a player of its build and lobby code (SN 3: its key), or (destination
+        0, on a private code only) to all of them. On the public code (SU's "public", SN's "smash"),
+        only to the player of its rollback match or a player of its room. Once one went each way
+        between the two of a rollback match, they are together."""
         if not 16 < len(p) <= RB_MAX:
             self.drops["bad rollback"] += 1
             return
         dst = struct.unpack_from(">I", p, 12)[0]
         m = self.by_ip.get(dst) if dst else None
-        if c.code == SU_PUBLIC:
+        if c.code == (SU_PUBLIC if c.wire is self.su else V3_PUBLIC):
             room = self.network_of(c)
             if m is None or (m is not c.rb_peer and (room is None or m not in self.members(room))):
                 self.drops["rollback stranger"] += 1
@@ -1027,7 +1027,7 @@ class Lobby:
         if not c.packets.take(now, len(to)) or not c.bytes.take(now, len(p) * len(to)):   # (every copy counts)
             self.drops["rate"] += 1
             return
-        out = su_header(SU_RB) + struct.pack(">I", c.ip) + p[16:]
+        out = (c.wire or self.sn).header(RB) + struct.pack(">I", c.ip) + p[16:]
         for x in to:
             self.to(x, out)
         self.counts["rollback relayed"] += len(to)

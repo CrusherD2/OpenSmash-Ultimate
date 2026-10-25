@@ -179,6 +179,13 @@ class V3Player:
             if st is None or (st[1] == want and st[3] & flags == flags):
                 return st
 
+    def rb(self, dst, message):
+        self.send(R.RB, struct.pack(">QI", self.cookie, dst) + message)
+
+    def rbs(self, wait=0.3):
+        """The rollback messages that came: [(source, message)]."""
+        return [(struct.unpack_from(">I", p, 4)[0], p[8:]) for p in self.all(R.RB, wait)]
+
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
 
@@ -474,6 +481,58 @@ class Matchmaking(V3Test):
         for _ in range(40):
             a.match(1, 9)
         self.assertLess(len(a.all(R.MATCH_STATE, 0.5)), 15)
+
+
+class Rollback(V3Test):
+    """RB as SU's, within the key; on the public code ("smash") only to an opponent or a player of
+    one's room."""
+    server_options = {"search_for": 30.0, "match_for": 30.0}
+
+    def test_rollback_match_on_the_public_code(self):
+        r1, r2, s = (self.player(name=n, room=R.V3_PUBLIC) for n in ("R1", "R2", "RS"))
+        self.assertTrue(r1.flags & R.HAS_RB)
+        r1.match(2, 401)
+        self.assertEqual(r1.state()[:2], (401, R.MS_SEARCHING))
+        r2.match(2, 402)
+        self.assertEqual(r1.until_state(R.MS_MATCHED)[:5], (401, R.MS_MATCHED, R.ROLE_HOST, 0, r2.ip))
+        self.assertEqual(r2.until_state(R.MS_MATCHED)[:5], (402, R.MS_MATCHED, R.ROLE_JOIN, 0, r1.ip))
+        s.rb(r1.ip, b"stranger")   # (not its opponent: dropped)
+        s.rb(0, b"to all")         # (to everyone, on the public code: dropped)
+        self.assertEqual(r1.rbs() + r2.rbs(0), [])
+        r1.rb(r2.ip, b"from r1")
+        self.assertEqual(r2.rbs(), [(r1.ip, b"from r1")])
+        r2.rb(r1.ip, b"from r2")
+        self.assertEqual(r1.rbs(), [(r2.ip, b"from r2")])
+        self.assertEqual(r1.until_state(R.MS_TOGETHER)[:2], (401, R.MS_TOGETHER))
+        self.assertEqual(r2.until_state(R.MS_TOGETHER)[:2], (402, R.MS_TOGETHER))
+
+    def test_public_code_room_players(self):
+        host, session, (a,) = self.room(1, room=R.V3_PUBLIC)
+        stranger = self.player(room=R.V3_PUBLIC)
+        a.rb(host.ip, b"in the room")
+        stranger.rb(host.ip, b"not")
+        self.assertEqual(host.rbs(), [(a.ip, b"in the room")])
+
+    def test_private_code_within_the_key(self):
+        a, b, c = (self.player(name=n, room="friends") for n in "ABC")
+        other = self.player(room="friends", sim=SIM + 1)
+        old = self.v2(room="friends")
+        a.rb(b.ip, b"to b")
+        self.assertEqual(b.rbs(), [(a.ip, b"to b")])
+        a.rb(0, b"to all")   # (a private code: every other player of its key)
+        self.assertEqual(b.rbs() + c.rbs(0), [(a.ip, b"to all")] * 2)
+        a.rb(other.ip, b"another key")
+        a.rb(old.ip, b"version 2")
+        self.assertEqual(other.rbs() + a.rbs(0), [])
+        self.assertEqual(old.recv(0.2), [])
+        old.send(R.header(R.RB) + struct.pack(">QI", old.cookie, a.ip) + b"from version 2")   # (version 2 has no RB)
+        self.assertEqual(a.rbs(), [])
+
+    def test_size(self):
+        a, b = self.player(room="friends"), self.player(room="friends")
+        a.rb(b.ip, bytes(R.RB_MAX - 16 + 1))
+        a.rb(b.ip, bytes(R.RB_MAX - 16))
+        self.assertEqual([len(m) for _, m in b.rbs()], [R.RB_MAX - 16])
 
 
 class OnlineLobby(unittest.TestCase):
