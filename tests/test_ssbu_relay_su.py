@@ -66,14 +66,12 @@ class SuPlayer:
         self.s.sendto(R.su_header(kind) + body, self.addr)
 
     def read(self, end):
-        """One more packet into the inbox before end (monotonic time): False if none came."""
-        left = end - time.monotonic()
-        if left <= 0:
-            return False
-        self.s.settimeout(left)
+        """One more packet into the inbox, waiting until end (monotonic time) at most (past it: one that
+        is there already): False if none came."""
+        self.s.settimeout(max(end - time.monotonic(), 0))
         try:
             data, _ = self.s.recvfrom(65536)
-        except (socket.timeout, ConnectionResetError):
+        except (socket.timeout, BlockingIOError, ConnectionResetError):
             return False
         self.inbox.append(data)
         return True
@@ -172,6 +170,13 @@ class SuPlayer:
             st = self.state(end - time.monotonic())
             if st is None or (st[1] == want and st[3] & flags == flags):
                 return st
+
+    def rb(self, dst, message):
+        self.send(R.SU_RB, struct.pack(">QI", self.cookie, dst) + message)
+
+    def rbs(self, wait=0.3):
+        """The rollback messages that came: [(source, message)]."""
+        return [(struct.unpack_from(">I", p, 4)[0], p[8:]) for p in self.all(R.SU_RB, wait)]
 
     def data(self, dst, payload, sport=GAME_PORT, dport=GAME_PORT, src=None):
         self.send(R.SU_DATA, struct.pack(">IIHH", self.ip if src is None else src, dst, sport, dport) + payload)
@@ -754,6 +759,69 @@ class MatchTimeouts(SuTest):
         self.assertIsNotNone(k.until_state(R.MS_MATCHED))
         self.assertEqual(k.until_state(R.MS_EXPIRED, 4.0)[4], m.ip)
         self.assertEqual(m.until_state(R.MS_EXPIRED, 4.0)[4], k.ip)
+
+
+class Rollback(SuTest):
+    """ssbu-recomp's rollback matchmaking test (lobby 1.4: MATCH op 2), on the public lobby code."""
+    server_options = {"search_for": 30.0, "match_for": 30.0}
+
+    def test_rollback_match(self):
+        r1, r2, r3, s = (self.player(name=n, code=R.SU_PUBLIC, mods=mods()) for n in ("R1", "R2", "R3", "RS"))
+        r1.match(2, 401)
+        self.assertEqual(r1.state()[:2], (401, R.MS_SEARCHING))
+        r2.match(1, 402)   # (a Local Wireless search: never paired with a rollback search)
+        self.assertEqual(r2.state()[:2], (402, R.MS_SEARCHING))
+        self.assertIsNone(r1.state(0.3))
+        r3.match(2, 403)
+        a, b = r1.until_state(R.MS_MATCHED), r3.until_state(R.MS_MATCHED)
+        self.assertEqual(a[:6], (401, R.MS_MATCHED, R.ROLE_HOST, 0, r3.ip, b"R3"))   # (R1 waited longer: player 1)
+        self.assertEqual(b[:6], (403, R.MS_MATCHED, R.ROLE_JOIN, 0, r1.ip, b"R1"))
+        r3.match(2, 403)   # (asked again: the same match)
+        self.assertEqual(r3.state()[:3], (403, R.MS_MATCHED, R.ROLE_JOIN))
+        s.rb(r1.ip, b"Hstranger")   # (a stranger on the public code: dropped)
+        r2.rb(0, b"Hall")            # (to everyone, on the public code: dropped)
+        self.assertEqual(r1.rbs(), [])
+        r1.rb(r3.ip, b"Hchoice-from-r1")
+        self.assertEqual(r3.rbs(), [(r1.ip, b"Hchoice-from-r1")])
+        self.assertEqual(s.rbs(0.1) + r2.rbs(0), [])
+        r3.rb(r1.ip, b"Ipropose-from-r3")
+        self.assertEqual(r1.rbs(), [(r3.ip, b"Ipropose-from-r3")])
+        ta, tb = r1.until_state(R.MS_TOGETHER), r3.until_state(R.MS_TOGETHER)   # (messages both ways: together)
+        self.assertEqual(ta[:5], (401, R.MS_TOGETHER, R.ROLE_HOST, 0, r3.ip))
+        self.assertEqual(tb[:5], (403, R.MS_TOGETHER, R.ROLE_JOIN, 0, r1.ip))
+        r1.rb(r3.ip, b"pads")   # (after: still carried, the match goes on)
+        self.assertEqual(r3.rbs(), [(r1.ip, b"pads")])
+        r2.match(0, 402)
+        self.assertEqual(r2.until_state(R.MS_IDLE)[0], 402)
+
+    def test_public_code_room_players(self):
+        host, session, (a,) = self.room(1, code=R.SU_PUBLIC)
+        stranger = self.player(code=R.SU_PUBLIC)
+        a.rb(host.ip, b"in the room")
+        stranger.rb(host.ip, b"not")
+        self.assertEqual(host.rbs(), [(a.ip, b"in the room")])
+
+    def test_private_code(self):
+        a, b, c = (self.player(name=n, code="friends") for n in "ABC")
+        other = self.player(code="friends", build=b"ssbu-recomp-ldn1-13.0.4")
+        a.rb(b.ip, b"to b")
+        self.assertEqual(b.rbs(), [(a.ip, b"to b")])
+        a.rb(0, b"to all")   # (a private code: to every other player of its build and code)
+        self.assertEqual(b.rbs() + c.rbs(0), [(a.ip, b"to all")] * 2)
+        a.rb(other.ip, b"another build")
+        self.assertEqual(other.rbs() + a.rbs(0), [])
+
+    def test_size_and_rate(self):
+        self.server.lobby.o.packet_rate = 20.0
+        a, b = self.player(code="friends"), self.player(code="friends")
+        a.send(R.SU_RB, struct.pack(">QI", a.cookie, b.ip))   # (no message)
+        a.rb(b.ip, bytes(R.RB_MAX - 16 + 1))
+        a.rb(b.ip, bytes(R.RB_MAX - 16))
+        self.assertEqual([len(m) for _, m in b.rbs()], [R.RB_MAX - 16])
+        flood = self.player(code="friends")
+        for i in range(200):
+            flood.rb(b.ip, b"x%d" % i)
+        self.assertLess(len(b.rbs(0.5)), 100)
 
 
 class BothProtocols(SuTest):

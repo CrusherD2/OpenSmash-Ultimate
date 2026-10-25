@@ -93,6 +93,12 @@ SU_MATCH, SU_MATCH_STATE = 20, 21
 MS_IDLE, MS_SEARCHING, MS_MATCHED, MS_TIMEOUT, MS_PEER_LEFT, MS_TOGETHER, MS_EXPIRED = range(7)
 ROLE_HOST, ROLE_JOIN = 1, 2
 KIND_ROOM, KIND_ROLLBACK = 1, 2   # MATCH's op: a search for a Local Wireless room, for a rollback match (0: cancel)
+# Online rollback (Smash versus with rollback, ssbu-recomp's rb_net.c): its games' messages to each
+# other through the lobby. From a game: cookie u64, destination u32 (0: every other player of its
+# build and lobby code), message; to a game: source u32, message.
+SU_RB = 16
+SU_PUBLIC = "public"   # ssbu-recomp's public lobby code: rollback messages go only to an opponent or a player of one's room
+RB_MAX = 1500          # largest rollback packet
 
 
 def header(kind, version=PROTOCOL):
@@ -218,6 +224,7 @@ class Client:
         self.kind = KIND_ROOM     # what it searches for
         self.match = None         # the Match it is in
         self.final = None         # how its last search ended: (id, state, role, the other's address and name)
+        self.rb_peer = None       # the player of its last rollback match
         self.cookie = secrets.randbits(64)   # proves the address is real (it came back in a PING)
         self.verified = False
         self.seen = now
@@ -246,6 +253,7 @@ class Match:
     def __init__(self, host, guest, now):
         self.host, self.guest, self.at = host, guest, now
         self.room_said = False   # the guest was told the host's room is open
+        self.rb_seen = set()     # (a rollback match) the players whose rollback message to the other was carried
 
     def other(self, c):
         return self.guest if c is self.host else self.host
@@ -663,6 +671,8 @@ class Lobby:
                 self.drops["match rate"] += 1
                 return
             self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
+        elif kind == SU_RB:
+            self.on_rb(c, p, now)
 
     def su_join(self, p, at, c, now):
         """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections),
@@ -902,12 +912,51 @@ class Lobby:
         host = c if hosts_open(c) and not hosts_open(o) else o   # (an open room, else the one that waited longer)
         m = c.match = o.match = Match(host, o if host is c else c, now)
         self.matches.add(m)
+        if op == KIND_ROLLBACK:
+            c.rb_peer, o.rb_peer = o, c
         self.log(f"match: {printable(m.host.name)} hosts, {printable(m.guest.name)} joins"
                  f"{' (a rollback match)' if op == KIND_ROLLBACK else ''}")
         self.match_send(m.host, now)
         self.match_send(m.guest, now)
         if op == KIND_ROOM and m.host.listing is not None:
             self.match_room(m, m.host.listing, now)
+
+    def on_rb(self, c, p, now):
+        """A rollback message: to a player of its build and lobby code, or (destination 0, on a private
+        code only) to all of them. On the public code, only to the player of its rollback match or a
+        player of its room. Once one went each way between the two of a rollback match, they are
+        together."""
+        if not 16 < len(p) <= RB_MAX:
+            self.drops["bad rollback"] += 1
+            return
+        dst = struct.unpack_from(">I", p, 12)[0]
+        m = self.by_ip.get(dst) if dst else None
+        if c.code == SU_PUBLIC:
+            room = self.network_of(c)
+            if m is None or (m is not c.rb_peer and (room is None or m not in self.members(room))):
+                self.drops["rollback stranger"] += 1
+                return
+        if dst:
+            to = [m] if m is not None and m is not c and m.part == c.part and m.verified else []
+        else:
+            to = [x for x in self.parts.get(c.part, ()) if x is not c and x.verified]
+        if not to:
+            self.drops["rollback nobody"] += 1
+            return
+        if not c.packets.take(now, len(to)) or not c.bytes.take(now, len(p) * len(to)):   # (every copy counts)
+            self.drops["rate"] += 1
+            return
+        out = su_header(SU_RB) + struct.pack(">I", c.ip) + p[16:]
+        for x in to:
+            self.to(x, out)
+        self.counts["rollback relayed"] += len(to)
+        match = c.match
+        if m is not None and match is not None and c.kind == KIND_ROLLBACK and match.other(c) is m:
+            match.rb_seen.add(c)
+            if len(match.rb_seen) == 2:
+                host, guest = match.host, match.guest
+                self.match_end(host, MS_TOGETHER, f"playing a rollback match with {printable(guest.name)}", now)
+                self.match_end(guest, MS_TOGETHER, f"playing a rollback match with {printable(host.name)}", now)
 
     def unsearch(self, c):
         c.search_since = None
@@ -1103,7 +1152,8 @@ class Lobby:
                  f"{sum(len(w) for w in self.searching.values())} searching, {len(self.matches)} matched; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
                  f"out {c['out packets'] / secs:.0f}/s {c['out bytes'] / secs / 1024:.1f} KB/s; "
-                 f"game relayed {c['game relayed'] / secs:.0f}/s; direct paths {direct} of {paths}; "
+                 f"game relayed {c['game relayed'] / secs:.0f}/s, rollback {c['rollback relayed'] / secs:.0f}/s; "
+                 f"direct paths {direct} of {paths}; "
                  f"largest {self.max_data} B; dropped: {drops}")
         self.counts.clear()
         self.drops.clear()
