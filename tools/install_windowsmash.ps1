@@ -119,7 +119,7 @@ $UserAgent = 'WindowSmash-installer'
 $ZstdCheck = 'import sys, importlib.util as u; sys.exit(0 if u.find_spec(''zstandard'') or (sys.version_info >= (3, 14) and u.find_spec(''compression.zstd'')) else 1)'
 # where updates come from: this repository's branch
 $RepoOwner = 'OpenSmash-Ultimate'
-$RepoName = 'WindowSmash'
+$RepoName = 'OpenSmash-Ultimate'
 $UpdateBranch = 'main'
 $RepoApi = "https://api.github.com/repos/$RepoOwner/$RepoName"
 $SourceVersionFile = 'tools\source_version.txt'   # "<commit> <date>": GitHub's ZIP download fills it in

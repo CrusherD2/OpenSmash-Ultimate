@@ -47,7 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools"))   # (isa.py: what the game is compiled for)
 import isa  # noqa: E402
-REPO_OWNER, REPO_NAME, BRANCH = "OpenSmash-Ultimate", "WindowSmash", "main"
+REPO_OWNER, REPO_NAME, BRANCH = "OpenSmash-Ultimate", "OpenSmash-Ultimate", "main"
 REPO_API = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
 SOURCE_VERSION = os.path.join("tools", "source_version.txt")   # "<commit> <date>": GitHub's ZIP fills it in
 USER_AGENT = "WindowSmash-installer"
