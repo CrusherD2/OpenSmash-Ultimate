@@ -18,8 +18,8 @@
  * Build, from ssbu-recomp:
  *   clang -arch arm64 -mmacosx-version-min=14.0 -fobjc-arc -fno-strict-aliasing -ffp-contract=off -O1 -I runtime \
  *     tools/lifter/mxmsltest.m runtime/mx_translate.c -framework Metal -framework Foundation -o mxmsltest
- * With -DMXMSLTEST_GLSL_ONLY (and -x c) only the glsl modes are built, needing neither Metal nor the MSL target: that
- * builds against an older mx_translate.c, to write the file glsldiff compares with. */
+ * With -DMXMSLTEST_GLSL_ONLY (and -x c; on Linux also -lm) only the glsl modes are built, needing neither Metal nor the MSL
+ * target: that builds against an older mx_translate.c, to write the file glsldiff compares with. */
 #define _CRT_SECURE_NO_WARNINGS
 #include <float.h>
 #include <math.h>

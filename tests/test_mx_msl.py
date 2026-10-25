@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SR = ROOT / 'ssbu-recomp'
 SOURCES = ['tools/lifter/mxmsltest.m', 'runtime/mx_translate.c']
 FLAGS = ['-fno-strict-aliasing', '-ffp-contract=off', '-O1', '-I', 'runtime']
+LIBM = [] if sys.platform in ('darwin', 'win32') else ['-lm']   # (Linux: rintf, floorf... are in libm; macOS's are in libSystem)
 
 
 class MxMslTests(unittest.TestCase):
@@ -53,7 +54,7 @@ class MxMslTests(unittest.TestCase):
             self.skipTest('no C compiler')
         with tempfile.TemporaryDirectory(prefix='mxmsltest ') as tmp:
             exe, txt = os.path.join(tmp, 'mxglsl'), os.path.join(tmp, 'glsl.txt')
-            self.build([cc, '-DMXMSLTEST_GLSL_ONLY', *FLAGS, '-x', 'c', *SOURCES, '-o', exe])
+            self.build([cc, '-DMXMSLTEST_GLSL_ONLY', *FLAGS, '-x', 'c', *SOURCES, '-o', exe, *LIBM])
             self.run_tool(exe, 'glsl', txt)
             text = Path(txt).read_text()
             self.assertIn('==== fuzz 2999 (', text)
