@@ -1,7 +1,8 @@
 """tools/dev/runtime_compile_check.py without compiling anything: the made-up game's tree it lays out
-(tools/mac/boottest's modules), the build's commands on each system, what its builds leave out, and
-how a run ends (a failed step, a build without its program, the line for the job's page). The real
-build runs in CI (.github/workflows/runtime-compile.yml) on Windows, Linux and macOS."""
+(tools/mac/boottest's modules), the build's commands on each system, the runtime sources a program
+must have (by its link's list, against LEFT_OUT, and none in a folder no build looks in), and how a
+run ends (a failed step, a build without its program or without a source, the line for the job's
+page). The real build runs in CI (.github/workflows/runtime-compile.yml) on Windows, Linux and macOS."""
 from pathlib import Path
 import contextlib
 import io
@@ -82,23 +83,114 @@ class Steps(unittest.TestCase):
                 self.assertNotIn('--jobs', command)
 
 
-class LeftOut(Folder):
-    def test_the_sources_without_an_object(self):
-        runtime, objects = os.path.join(self.top, 'runtime'), os.path.join(self.top, 'rt')
-        os.makedirs(runtime)
-        os.makedirs(objects)
-        for name in ('host.c', 'smoke.c', 'host.h', '._host.c'):
-            Path(runtime, name).write_text('')
-        for name in ('host.obj', 'hle_table.obj', 'smoke.o'):
-            Path(objects, name).write_text('')
-        self.assertEqual(check.left_out(runtime, objects, '.obj'), ['smoke.c'])
-        self.assertEqual(check.left_out(runtime, os.path.join(self.top, 'none'), '.obj'), ['host.c', 'smoke.c'])
+def complete_link(tree, host, drop=()):
+    """A link list with an object of every source of the real runtime/ the host's program should have
+    (as the builds name them), less those in drop; with the made-up game's and a generated table's."""
+    rt, objs = check.runtime_folder(tree, host), [os.path.join(tree, 'build', 'main', 'g0000.o')]
+    for rel in check.runtime_sources(check.RUNTIME):
+        folder, _, name = rel.rpartition('/')
+        if rel in check.LEFT_OUT[host] or rel in drop or (folder and folder not in check.PLATFORMS[host]):
+            continue
+        objs.append(os.path.join(rt, folder if host == 'macos' else '', os.path.splitext(name)[0] + '.o'))
+    return objs + [os.path.join(rt, 'hle_table.o')]
+
+
+class Sources(Folder):
+    """source_problems on a made-up runtime/ (and LEFT_OUT), linked() and link_list()."""
+    LEFT_OUT = {'windows': {'smoke.c': 'a test'}, 'linux': {'smoke.c': 'a test', 'gone.c': 'removed'},
+                'macos': {'smoke.c': 'a test', 'linux/window.c': 'Linux only'}}
+
+    def setUp(self):
+        super().setUp()
+        self.runtime = os.path.join(self.top, 'runtime')
+        for rel in ('host.c', 'smoke.c', 'new.c', 'host.h', '._host.c', 'linux/win32.c', 'linux/window.c', 'linux/eh.cpp',
+                    'macos/fiber.c', 'macos/fiber.S', 'macos/window.m', 'core/moved.c', 'linux/include/stray.c',
+                    'macos/include/windows.h'):
+            os.makedirs(os.path.dirname(os.path.join(self.runtime, rel)), exist_ok=True)
+            Path(self.runtime, rel).write_text('')
+        patch = mock.patch.object(check, 'LEFT_OUT', self.LEFT_OUT)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def problems(self, host, have):
+        return check.source_problems(self.runtime, host, set(have))
+
+    MOVED = [f'runtime/{rel}: {check.MISPLACED}' for rel in ('core/moved.c', 'linux/include/stray.c')]
+
+    def not_in(self, host, rel):
+        return (f'runtime/{rel}: not in the {host} program: add it to the build\'s runtime sources, or to LEFT_OUT in '
+                'tools/dev/runtime_compile_check.py with why')
+
+    def test_the_sources_listed(self):
+        self.assertEqual(check.runtime_sources(self.runtime),
+                         ['host.c', 'new.c', 'smoke.c', 'core/moved.c', 'linux/eh.cpp', 'linux/win32.c', 'linux/window.c',
+                          'linux/include/stray.c', 'macos/fiber.S', 'macos/fiber.c', 'macos/window.m'])
+
+    def test_linux_has_its_folder_and_the_top(self):
+        have = [('', 'host'), ('', 'new'), ('', 'win32'), ('', 'window'), ('', 'eh')]
+        self.assertEqual(self.problems('linux', have),
+                         self.MOVED + ['runtime/gone.c: in LEFT_OUT for linux, but there is no such file: take it off LEFT_OUT'])
+        self.assertEqual(self.problems('linux', [h for h in have if h != ('', 'window')]),
+                         self.MOVED + [self.not_in('linux', 'linux/window.c'),
+                                       'runtime/gone.c: in LEFT_OUT for linux, but there is no such file: take it off LEFT_OUT'])
+
+    def test_a_source_left_out_on_purpose_must_be_left_out(self):
+        self.assertEqual(self.problems('windows', [('', 'host'), ('', 'new'), ('', 'smoke')]),
+                         self.MOVED + ['runtime/smoke.c: in the windows program, though LEFT_OUT says it is left out (a test): '
+                                       'take it off LEFT_OUT'])
+
+    def test_windows_has_only_the_top(self):
+        self.assertEqual(self.problems('windows', [('', 'host')]), self.MOVED + [self.not_in('windows', 'new.c')])
+
+    def test_macos_by_folder_and_with_two_sources_of_one_name(self):
+        have = [('', 'host'), ('', 'new'), ('linux', 'win32'), ('linux', 'eh'), ('macos', 'fiber_c'), ('macos', 'fiber_S'),
+                ('macos', 'window')]
+        self.assertEqual(self.problems('macos', have), self.MOVED)
+        # (runtime/linux's objects in a folder of their own: one of that name at the top is another source's)
+        moved = [h for h in have if h not in (('macos', 'fiber_S'), ('linux', 'win32'))] + [('', 'win32')]
+        self.assertEqual(self.problems('macos', moved),
+                         self.MOVED + [self.not_in('macos', 'linux/win32.c'), self.not_in('macos', 'macos/fiber.S')])
+
+    def test_linked_are_the_runtime_folders_objects(self):
+        rt = os.path.join(self.top, 'rt')
+        objs = [os.path.join(rt, 'host.obj'), os.path.join(rt, 'macos', 'fiber_S.o'), os.path.join(self.top, 'main', 'g0000.obj'),
+                os.path.join(self.top, 'rt2', 'x.o'), rt]
+        self.assertEqual(check.linked(objs, rt), {('', 'host'), ('macos', 'fiber_S')})
+
+    def test_link_lists(self):
+        tree = self.tree
+        self.assertIsNone(check.link_list(tree, 'windows'))
+        exe = check.program(tree, 'windows')
+        os.makedirs(os.path.dirname(exe))
+        Path(exe + '.rsp').write_text('"C:\\made up\\rt\\host.obj"\n"C:\\made up\\main\\g0000.obj"')   # (cc.link's)
+        self.assertEqual(check.link_list(tree, 'windows'), ['C:\\made up\\rt\\host.obj', 'C:\\made up\\main\\g0000.obj'])
+        os.makedirs(os.path.join(tree, 'build-linux'))
+        Path(tree, 'build-linux', 'ssbu.rsp').write_text('"/made up/rt/host.o"\n"/made up/main/g0000.o"')   # (build_linux.py's)
+        self.assertEqual(check.link_list(tree, 'linux'), ['/made up/rt/host.o', '/made up/main/g0000.o'])
+        os.makedirs(os.path.join(tree, 'build-mac'))
+        Path(tree, 'build-mac', 'ssbu.filelist').write_text('/made up/obj/rt/host.o\n/made up/obj/main/g0000.o\n')   # (build_mac's)
+        self.assertEqual(check.link_list(tree, 'macos'), ['/made up/obj/rt/host.o', '/made up/obj/main/g0000.o'])
+
+
+class LeftOut(unittest.TestCase):
+    """The real LEFT_OUT, against the real runtime/."""
+    def test_each_file_left_out_is_there_with_why(self):
+        sources = set(check.runtime_sources(check.RUNTIME))
+        for host, left_out in check.LEFT_OUT.items():
+            for rel, why in left_out.items():
+                self.assertIn(rel, sources, host)
+                self.assertIn(rel.rpartition('/')[0], ('',) + check.PLATFORMS[host], (host, rel))
+                self.assertTrue(why.strip(), (host, rel))
+
+    def test_no_source_is_where_no_build_looks(self):
+        self.assertEqual(check.misplaced(check.runtime_sources(check.RUNTIME)), [])
 
 
 class Run(Folder):
-    def main(self, argv, host, made=True, fail=None, isa=None):
-        """main with each build step recorded rather than run: the last one makes the program (made),
-        the one named `fail` fails; isa: what the made-up link's isa.txt says."""
+    def main(self, argv, host, made=True, fail=None, isa=None, link=complete_link):
+        """main with each build step recorded rather than run: the last one makes the program (made) and
+        the link list (link(tree, host), or none), the one named `fail` fails; isa: what the made-up link's
+        isa.txt says."""
         self.ran = []
 
         def run(command, cwd):
@@ -111,6 +203,10 @@ class Run(Folder):
                 Path(exe).write_bytes(b'\0' * 4096)
                 if isa:
                     Path(os.path.dirname(exe), 'isa.txt').write_text(isa + '\nchosen\n')
+                if link:
+                    listed = {'windows': exe + '.rsp', 'linux': os.path.join(self.tree, 'build-linux', 'ssbu.rsp'),
+                              'macos': os.path.join(self.tree, 'build-mac', 'ssbu.filelist')}[host]
+                    Path(listed).write_text('\n'.join(f'"{o}"' if host != 'macos' else o for o in link(self.tree, host)))
             return subprocess.CompletedProcess(command, 0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), mock.patch.object(check, 'vkd3d_ready', return_value=False):
@@ -142,9 +238,24 @@ class Run(Folder):
             code, out = self.main(['--tree', self.tree], 'macos')
         self.assertEqual(code, 0, out)
         line = Path(summary).read_text()
-        self.assertRegex(line, r'^macos, arm64: the runtime compiled and linked into ssbu \(0\.0 MB\) in \d+ s; '
-                               r'runtime/\*\.c not in it: .*\bhost\.c\b')   # (no object folder: every source left out)
+        self.assertRegex(line, r'^macos, arm64: the runtime compiled and linked into ssbu \(0\.0 MB\) in \d+ s, every source in it '
+                               r'but those left out on purpose: difftest\.c, .*linux/window\.c\n$')
         self.assertIn(line.strip(), out)
+
+    def test_a_program_without_a_source_fails(self):
+        summary = os.path.join(self.top, 'summary.md')
+        for host in ('windows', 'linux', 'macos'):
+            with self.subTest(host), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': summary}):
+                code, out = self.main(['--tree', self.tree], host, link=lambda tree, h: complete_link(tree, h, drop=('host.c',)))
+                self.assertEqual(code, 1, out)
+                problem = f'FAILED ({host}): runtime/host.c: not in the {host} program'
+                self.assertIn(problem, out)
+                self.assertIn(problem, Path(summary).read_text())
+
+    def test_a_program_without_a_link_list_fails(self):
+        code, out = self.main(['--tree', self.tree], 'linux', link=None)
+        self.assertEqual(code, 1, out)
+        self.assertIn('FAILED (linux): the build left no list of the objects it linked', out)
 
     def test_not_in_this_checkout(self):
         code, out = self.main(['--tree', check.REPO], 'macos')
