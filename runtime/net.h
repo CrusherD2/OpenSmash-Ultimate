@@ -18,6 +18,9 @@
  *   SSBU_NET_DIRECT=0       no direct connections: all of a room's traffic through the lobby, and the
  *                           lobby gives this player's internet address to nobody
  *   SSBU_NET_LOG=1          log every socket/network call (debugging)
+ *   SSBU_NET_PROTOCOL=3     (being tried out) join the lobby in protocol version 3, which has a room browser
+ *                           and matchmaking; a lobby or a private room's relay of version 2 says no, and the
+ *                           game joins it in version 2 at once. 2, the default: version 2 only, as before
  * With neither set the game stays offline, as before. */
 #pragma once
 #include "recomp.h"
@@ -27,7 +30,9 @@
 #define NET_GATEWAY     0x0A0D0001u   /* 10.13.0.1: the relay's own address */
 #define NET_BROADCAST   0x0A0DFFFFu
 #define NET_DEFAULT_PORT 39420
-#define NET_PROTOCOL    2
+#define NET_PROTOCOL    2             /* a private room's relay speaks it, and a game falls back to it */
+#define NET_PROTOCOL_V3 3             /* the online lobby's version 3 (tools/ssbu_relay.py): version 2 and more */
+#define NET_PROTOCOL_DEFAULT NET_PROTOCOL   /* what a game asks for without SSBU_NET_PROTOCOL (3 once played with) */
 #define NET_LDN_PORT    65511         /* local wireless's own messages (hle_net.c): always through the relay */
 
 int net_configured(void);            /* netplay asked for (host or join) */

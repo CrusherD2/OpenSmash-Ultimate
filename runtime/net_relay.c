@@ -35,7 +35,17 @@
  *
  * Direct connections: the lobby introduces the players of a room to each other, and their games
  * then send the room's traffic straight to each other where their routers let them (UDP hole
- * punching), through the lobby where not. See "direct connections" below. */
+ * punching), through the lobby where not. See "direct connections" below.
+ *
+ * Protocol 3 (SSBU_NET_PROTOCOL=3, net.h), the online lobby's: version 2 and more, on the same
+ * port; tools/ssbu_relay.py's comment has every message. The client's JOIN adds this game's
+ * simulation version (sim_version.h) and mod set; WELCOME's flags say what the lobby has (4 the
+ * room browser, 8 matchmaking, 16 rollback); PONG adds two counts. Every packet of the client is
+ * then of version 3, to the lobby and to the other players alike (two games of version 3 talk in
+ * version 3: a lobby of version 3 puts players of version 2 and 3 in rooms of their own). A lobby
+ * or relay of version 2 answers a JOIN of version 3 with REJECT reason 2: the client then joins it
+ * in version 2, as a game of version 2 does. A private room's relay (below) speaks version 2 only,
+ * so the host's own game joins it in version 2. */
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
 #define COBJMACROS
@@ -64,11 +74,14 @@ typedef int SOCKET;
 #include "host.h"
 #include "net.h"
 #include "settings.h"
+#include "sim_version.h"
 
 #define MAGIC0 'S'
 #define MAGIC1 'N'
 enum { T_JOIN = 1, T_WELCOME, T_REJECT, T_PING, T_PONG, T_DATA, T_MEMBERS, T_LEAVE, T_LIST, T_LISTING, T_LIST_END,
        T_PEERS, T_BCAST, T_PUNCH, T_DIRECT };
+enum { W_LOBBY = 1, W_INTRODUCES = 2, W_ROOMS = 4, W_MATCH = 8, W_RB = 16 };   /* WELCOME's flags (4, 8, 16: version 3's) */
+#define R_VERSION 2   /* REJECT's reason: another netplay version */
 #define NAME_LEN 32
 #define BUILD_LEN 40
 #define JOIN_SIZE (4 + 8 + 2 * NAME_LEN + BUILD_LEN)
@@ -87,7 +100,9 @@ static void put16(u8 *p, u16 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
 static void put32(u8 *p, u32 v) { p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v; }
 static void put64(u8 *p, u64 v) { put32(p, (u32)(v >> 32)); put32(p + 4, (u32)v); }
 static u64 now_ms(void) { return GetTickCount64(); }
-static void header(u8 *p, int type) { p[0] = MAGIC0; p[1] = MAGIC1; p[2] = NET_PROTOCOL; p[3] = (u8)type; }
+static volatile LONG proto = NET_PROTOCOL;   /* the version the client speaks now (configure; a REJECT of version 2's) */
+static void header(u8 *p, int type) { p[0] = MAGIC0; p[1] = MAGIC1; p[2] = (u8)proto; p[3] = (u8)type; }
+static void relay_header(u8 *p, int type) { header(p, type); p[2] = NET_PROTOCOL; }   /* (a private room's relay: version 2) */
 
 /* Every packet goes out here. macOS refuses packets to the local network (EHOSTUNREACH, or
  * EPERM) until the user lets the game reach it - macOS asks the first time; System Settings >
@@ -132,6 +147,7 @@ static int configured = -1, hosting, logging;
 static char relay_text[256], room[NAME_LEN + 1] = "smash", name[NAME_LEN + 1] = "Player";
 static u16 port = NET_DEFAULT_PORT;
 static int direct_ok = 1, test_nat;   /* SSBU_NET_DIRECT; SSBU_NET_TEST_NAT (tests) */
+static int proto_wanted = NET_PROTOCOL;   /* SSBU_NET_PROTOCOL: the version asked for first (proto: spoken now) */
 static u64 test_block_at = ~0ull;     /* SSBU_NET_TEST_BLOCK (tests): no direct packets from then on */
 
 #ifdef _WIN32
@@ -179,6 +195,10 @@ static void configure(void) {
     if ((v = getenv("SSBU_NET_NAME")) && *v) snprintf(name, sizeof name, "%s", v);
     if ((v = getenv("SSBU_NET_LOG"))) logging = atoi(v) > 0 ? atoi(v) : 1;
     if ((v = getenv("SSBU_NET_DIRECT")) && !strcmp(v, "0")) direct_ok = 0;
+    proto_wanted = NET_PROTOCOL_DEFAULT;   /* SSBU_NET_PROTOCOL=2|3; hosting: its own relay's, 2 */
+    if ((v = getenv("SSBU_NET_PROTOCOL")) && (atoi(v) == NET_PROTOCOL || atoi(v) == NET_PROTOCOL_V3)) proto_wanted = atoi(v);
+    if (hosting) proto_wanted = NET_PROTOCOL;
+    proto = proto_wanted;
     /* (tests) SSBU_NET_TEST_NAT=1: let in direct packets only from addresses sent to lately, as a
      * router does; SSBU_NET_TEST_BLOCK=<seconds after the game started>: drop every direct packet
      * from then on, as if a firewall closed the path (0: from the start, as a symmetric NAT) */
@@ -221,7 +241,7 @@ static int member_list(const Room *r, u8 *p) {
 
 static void tell_members(const Room *r) {
     u8 p[4 + 1 + ROOM_MEMBERS * (4 + NAME_LEN)];
-    header(p, T_MEMBERS);
+    relay_header(p, T_MEMBERS);
     int n = 4 + member_list(r, p + 4);
     for (int i = 0; i < r->count; i++) send_udp(relay_sock, p, n, &r->members[i].at);
 }
@@ -238,7 +258,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     if (p[2] != NET_PROTOCOL) {   /* another version of the game's netplay: say so */
         if (n >= 4 + 8 + 2 * NAME_LEN && p[3] == T_JOIN) {   /* (only to a whole JOIN: no small packet gets a bigger answer) */
             memset(out, 0, 4 + 8 + 1 + 64);
-            header(out, T_REJECT);
+            relay_header(out, T_REJECT);
             memcpy(out + 4, p + 4, 8);
             out[12] = 2;
             snprintf((char *)out + 13, 64, "different netplay version (relay %d, you %d)", NET_PROTOCOL, p[2]);
@@ -274,7 +294,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
                             : r->count && memcmp(r->build, build, BUILD_LEN) ? "the host has another game version" : NULL;
             if (why) {
                 memset(out, 0, 4 + 8 + 1 + 64);
-                header(out, T_REJECT);
+                relay_header(out, T_REJECT);
                 put64(out + 4, nonce);
                 out[12] = r && r->count < ROOM_MEMBERS ? 3 : 1;
                 snprintf((char *)out + 13, 64, "%s", why);
@@ -298,7 +318,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
             tell_members(r);
         }
         r->members[m].seen = now_ms();
-        header(out, T_WELCOME);
+        relay_header(out, T_WELCOME);
         put64(out + 4, nonce);
         put32(out + 12, r->members[m].ip);
         put64(out + 16, 0);   /* (cookie: a private room's relay checks none) */
@@ -310,7 +330,7 @@ static void relay_packet(const u8 *p, int n, const struct sockaddr_in *from) {
     case T_PING:
         if (m < 0 || n < 20) return;
         r->members[m].seen = now_ms();
-        header(out, T_PONG);
+        relay_header(out, T_PONG);
         memcpy(out + 4, p + 12, 8);
         put16(out + 12, (u16)r->count);
         put16(out + 14, 0);
@@ -476,6 +496,9 @@ static volatile LONG lobby;            /* ...from a lobby */
 static volatile u32 my_ip;
 static u64 nonce, cookie, last_pong, unjoined_since;
 static volatile LONG members, rooms_open, ping_ms = -1;
+static volatile LONG lobby_flags;                         /* the last WELCOME's (W_*) */
+static volatile LONG key_searching = -1, code_players = -1;   /* version 3's PONG: players of this key searching; of the code */
+static int fell_back;                                     /* a relay of version 2 said no to version 3: version 2 since */
 static char reject_text[80], member_names[ROOM_MEMBERS][NAME_LEN + 1];
 
 u32 net_local_ip(void) { start(); return joined ? my_ip : 0; }
@@ -851,8 +874,18 @@ static int resolve_relay(void) {
     return 1;
 }
 
+/* Version 3's JOIN ends with this game's mod set: count u8 (32 at most), count x (hash u32, name
+ * length u8 (31 at most), name). The lobby parts players by the hashes (in any order) and shows the
+ * names. WindowSmash loads no mods yet: none. Once it does, a mod's hash must come out the same on
+ * every OS, or players of one mod on Windows, Linux and macOS never meet: ssbu-recomp's rule ports
+ * (its runtime/net_relay.c tree_hash: over each file of the mod, FNV-1a 64 of its path in lower case
+ * with '/' and then of its size, summed and folded to 32 bits), over the files that are the same on
+ * every OS only - never a mod's native code (a .dll, .so or .dylib), which is built for each. */
+static const u8 mod_set[] = {0};
+#define JOIN_V3_SIZE (JOIN_SIZE + 4 + (int)sizeof mod_set)
+
 static void send_join(void) {
-    u8 p[JOIN_SIZE] = {0};
+    u8 p[JOIN_V3_SIZE] = {0};
     header(p, T_JOIN);
     put64(p + 4, nonce);
     memcpy(p + 12, room, strlen(room));
@@ -860,7 +893,11 @@ static void send_join(void) {
     const char *build = rt_module_main.build_id ? rt_module_main.build_id : "";
     size_t build_len = strlen(build);
     memcpy(p + 12 + 2 * NAME_LEN, build, build_len < BUILD_LEN ? build_len : BUILD_LEN);
-    send_udp(client_sock, p, sizeof p, &relay_at);
+    if (proto == NET_PROTOCOL_V3) {   /* (then the simulation version and the mod set) */
+        put32(p + JOIN_SIZE, SIM_VERSION);
+        memcpy(p + JOIN_SIZE + 4, mod_set, sizeof mod_set);
+    }
+    send_udp(client_sock, p, proto == NET_PROTOCOL_V3 ? JOIN_V3_SIZE : JOIN_SIZE, &relay_at);
 }
 
 void net_lobby_list(u32 seq) {
@@ -921,6 +958,9 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             InterlockedExchange(&joined, 0);   /* the relay is gone: keep asking to join again */
             InterlockedExchange(&ping_ms, -1);
             clear_peers();
+            InterlockedExchange(&lobby_flags, 0);
+            InterlockedExchange(&proto, proto_wanted);   /* (asked in its version again: it may be another lobby now) */
+            fell_back = 0;
             fprintf(stderr, "[net] lost the relay %s; reconnecting\n", relay_text);
         }
         if (joined && t - last_tick >= 50) { peers_tick(t); last_tick = t; }
@@ -929,10 +969,10 @@ static DWORD WINAPI client_thread(LPVOID unused) {
         int n = recvfrom(client_sock, (char *)buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
         if (n < 4 || buf[0] != MAGIC0 || buf[1] != MAGIC1) continue;
         if (!same_addr(&from, &relay_at)) {   /* (another player, straight) */
-            if (buf[2] == NET_PROTOCOL && joined) direct_packet(buf, n, &from);
+            if (buf[2] == proto && joined) direct_packet(buf, n, &from);
             continue;
         }
-        if (buf[2] != NET_PROTOCOL && buf[3] != T_REJECT) continue;   /* (a REJECT comes in our own version) */
+        if (buf[2] != proto && buf[3] != T_REJECT) continue;   /* (a REJECT comes in the JOIN's version, or a relay's own) */
         switch (buf[3]) {
         case T_DATA:
             if (n >= 16 && joined) {
@@ -945,18 +985,28 @@ static DWORD WINAPI client_thread(LPVOID unused) {
             if (!joined) clear_peers();   /* (a new start: the lobby counts PEERS from 1 again) */
             my_ip = get32(buf + 12);
             cookie = get64(buf + 16);
-            InterlockedExchange(&lobby, buf[24] & 1);
+            InterlockedExchange(&lobby, buf[24] & W_LOBBY);
+            InterlockedExchange(&lobby_flags, buf[24]);
             read_members(buf + 25, n - 25);
             last_pong = now_ms();
             last_ping = 0;   /* (a ping at once: a lobby answers nothing else until it has seen the cookie) */
             reject_text[0] = 0;
-            if (!joined && lobby) fprintf(stderr, "[net] joined the lobby on %s as 10.13.%u.%u (lobby code %s)\n", relay_text, my_ip >> 8 & 255, my_ip & 255, room);
+            if (!joined && lobby) fprintf(stderr, "[net] joined the lobby on %s as 10.13.%u.%u (lobby code %s)%s\n", relay_text, my_ip >> 8 & 255, my_ip & 255, room,
+                                          proto == NET_PROTOCOL_V3 ? ", protocol 3" : "");
             else if (!joined) fprintf(stderr, "[net] joined room %s on %s as 10.13.%u.%u (%ld players)\n", room, relay_text, my_ip >> 8 & 255, my_ip & 255, (long)members);
             InterlockedExchange(&joined, 1);
             break;
         case T_REJECT:
             if (n >= 13 + 1 && get64(buf + 4) == nonce) {
-                snprintf(reject_text, sizeof reject_text, "%.64s", (const char *)buf + 13);
+                if (fell_back && buf[2] == NET_PROTOCOL_V3) break;   /* (the answer to a JOIN of version 3, sent before) */
+                if (proto == NET_PROTOCOL_V3 && buf[12] == R_VERSION) {   /* a lobby or relay of version 2: join it in version 2 */
+                    InterlockedExchange(&proto, NET_PROTOCOL);
+                    fell_back = 1;
+                    last_join = 0;   /* (at once) */
+                    fprintf(stderr, "[net] %s speaks netplay version 2: joining it in version 2 (no room browser or matchmaking there)\n", relay_text);
+                    break;
+                }
+                snprintf(reject_text, sizeof reject_text, "%.64s", (const char *)buf + 13);   /* (also version 3's reason 5: a mod set it can't read) */
                 fprintf(stderr, "[net] the relay refused: %s\n", reject_text);
                 Sleep(2000);
             }
@@ -966,6 +1016,10 @@ static DWORD WINAPI client_thread(LPVOID unused) {
                 last_pong = now_ms();
                 InterlockedExchange(&ping_ms, (LONG)(last_pong - get64(buf + 4)));
                 if (lobby) { InterlockedExchange(&members, get16(buf + 12)); InterlockedExchange(&rooms_open, get16(buf + 14)); }
+                if (proto == NET_PROTOCOL_V3 && n >= 21) {   /* (version 3's: players of this key searching, players of the code) */
+                    InterlockedExchange(&key_searching, get16(buf + 17));
+                    InterlockedExchange(&code_players, get16(buf + 19));
+                }
             }
             break;
         case T_MEMBERS:
