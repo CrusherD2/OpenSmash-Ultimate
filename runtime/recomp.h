@@ -279,29 +279,182 @@ static inline i32 f2i32(f64 v) { return v != v ? 0 : v >= 2147483648.0 ? INT32_M
 static inline u32 f2u32(f64 v) { return v != v ? 0 : v >= 4294967296.0 ? UINT32_MAX : v <= -1.0 ? 0 : (u32)v; }
 static inline i64 f2i64(f64 v) { return v != v ? 0 : v >= 9223372036854775808.0 ? INT64_MAX : v < -9223372036854775808.0 ? INT64_MIN : (i64)v; }
 static inline u64 f2u64(f64 v) { return v != v ? 0 : v >= 18446744073709551616.0 ? UINT64_MAX : v <= -1.0 ? 0 : (u64)v; }
-static inline f32 fmaxS(f32 a, f32 b) { return a != a || b != b ? NAN : a > b ? a : b > a ? b : signbit(a) ? b : a; }
-static inline f32 fminS(f32 a, f32 b) { return a != a || b != b ? NAN : a < b ? a : b < a ? b : signbit(a) ? a : b; }
-static inline f64 fmaxD(f64 a, f64 b) { return a != a || b != b ? NAN : a > b ? a : b > a ? b : signbit(a) ? b : a; }
-static inline f64 fminD(f64 a, f64 b) { return a != a || b != b ? NAN : a < b ? a : b < a ? b : signbit(a) ? a : b; }
-static inline f32 fmaxnmS(f32 a, f32 b) { return a != a ? b : b != b ? a : fmaxS(a, b); }
-static inline f32 fminnmS(f32 a, f32 b) { return a != a ? b : b != b ? a : fminS(a, b); }
-static inline f64 fmaxnmD(f64 a, f64 b) { return a != a ? b : b != b ? a : fmaxD(a, b); }
-static inline f64 fminnmD(f64 a, f64 b) { return a != a ? b : b != b ? a : fminD(a, b); }
 
-/* fmulx / Newton-Raphson step helpers: fused, and inf * 0 has a defined result. */
+/* NaN results as AArch64 makes them (FPCR.DN = 0). A NaN operand comes out quiet: the first
+ * signalling one, else the first quiet one. An invalid operation on numbers gives the default
+ * NaN, +0x7FC00000. A multiply-add looks at its addend first, and inf * 0 plus a quiet NaN gives
+ * the default NaN. x86 makes the default NaN negative (0xFFC00000) and takes the first NaN
+ * operand whether it signals or not, and C leaves the compiler free to swap a + b's operands or
+ * to move a negation to the other multiplicand. So fnan2S(r, a, b) is r (a op b), or when r is a
+ * NaN the one Arm makes from a and b, worked out of line. fnan1S takes one operand, fnan3S a
+ * multiply-add's: the addend, then the multiplicands, each negated as the instruction negates it.
+ * The D forms are for doubles; rt_nan_any32 / 64 says whether a vector result has a NaN lane.
+ * On arm64 the instructions make Arm's NaNs, so there these return r unchecked (RT_EXACT_NAN 0):
+ * only which of two NaN operands comes out, or a negated NaN's sign, can differ there, where the
+ * compiler moves them. RT_EXACT_NAN=1 checks there too (difftest.py --exact-nan). The max / min
+ * and step helpers below make Arm's NaNs on every host. */
+#ifndef RT_EXACT_NAN
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define RT_EXACT_NAN 0
+#else
+#define RT_EXACT_NAN 1
+#endif
+#endif
+static inline u32 rt_nan_bits32(int n, const u32 *x) {
+    for (int i = 0; i < n; i++)
+        if ((x[i] & 0x7FC00000u) == 0x7F800000u && (x[i] & 0x003FFFFFu)) return x[i] | 0x00400000u;   /* signalling: quieted */
+    for (int i = 0; i < n; i++)
+        if ((x[i] & 0x7FFFFFFFu) > 0x7F800000u) return x[i];
+    return 0x7FC00000u;
+}
+static inline u64 rt_nan_bits64(int n, const u64 *x) {
+    for (int i = 0; i < n; i++)
+        if ((x[i] & 0x7FF8000000000000ull) == 0x7FF0000000000000ull && (x[i] & 0x0007FFFFFFFFFFFFull))
+            return x[i] | 0x0008000000000000ull;
+    for (int i = 0; i < n; i++)
+        if ((x[i] & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull) return x[i];
+    return 0x7FF8000000000000ull;
+}
+/* The slow paths: out of line, and reading and writing no memory, so that around them the compiler
+ * keeps guest registers where they were. rt_nanS / D: Arm's NaN from the first n of a, b, c; n == 3
+ * is a multiply-add, a its addend. */
+#define RT_NAN_SLOW __attribute__((noinline, cold, const, nothrow))
+static inline RT_NAN_SLOW f32 rt_nanS(int n, f32 a, f32 b, f32 c) {
+    u32 x[3], r;
+    memcpy(&x[0], &a, 4); memcpy(&x[1], &b, 4); memcpy(&x[2], &c, 4);
+    u32 m1 = x[1] & 0x7FFFFFFFu, m2 = x[2] & 0x7FFFFFFFu;
+    if (n == 3 && (x[0] & 0x7FC00000u) == 0x7FC00000u && ((m1 == 0x7F800000u && !m2) || (!m1 && m2 == 0x7F800000u)))
+        r = 0x7FC00000u;
+    else r = rt_nan_bits32(n, x);
+    memcpy(&a, &r, 4);
+    return a;
+}
+static inline RT_NAN_SLOW f64 rt_nanD(int n, f64 a, f64 b, f64 c) {
+    u64 x[3], r;
+    memcpy(&x[0], &a, 8); memcpy(&x[1], &b, 8); memcpy(&x[2], &c, 8);
+    u64 m1 = x[1] & 0x7FFFFFFFFFFFFFFFull, m2 = x[2] & 0x7FFFFFFFFFFFFFFFull, inf = 0x7FF0000000000000ull;
+    if (n == 3 && (x[0] & 0x7FF8000000000000ull) == 0x7FF8000000000000ull && ((m1 == inf && !m2) || (!m1 && m2 == inf)))
+        r = 0x7FF8000000000000ull;
+    else r = rt_nan_bits64(n, x);
+    memcpy(&a, &r, 8);
+    return a;
+}
+static inline f32 fnan1S(f32 r, f32 a) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanS(1, a, a, a) : r; }
+static inline f32 fnan2S(f32 r, f32 a, f32 b) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanS(2, a, b, b) : r; }
+static inline f32 fnan3S(f32 r, f32 acc, f32 a, f32 b) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanS(3, acc, a, b) : r; }
+static inline f64 fnan1D(f64 r, f64 a) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanD(1, a, a, a) : r; }
+static inline f64 fnan2D(f64 r, f64 a, f64 b) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanD(2, a, b, b) : r; }
+static inline f64 fnan3D(f64 r, f64 acc, f64 a, f64 b) { return RT_EXACT_NAN && __builtin_expect(r != r, 0) ? rt_nanD(3, acc, a, b) : r; }
+/* Vectors: rt_nan_any32 / 64 says whether a result has a NaN lane (one vector compare: lanes an
+ * instruction does not write are 0), and rt_vnanS / D, out of line, makes its NaN lanes Arm's from
+ * the operands. form: the operands, 1 (a), 2 (a, b) or 3 (a multiply-add: d the addend, a, b), with
+ * RT_VNAN_NEG when a is negated first (fmls) and RT_VNAN_ABS when the result's sign is cleared
+ * after (fabd); index >= 0: b's element `index` for every lane. (Vector types to and from the slow
+ * path, which x86-64 passes in registers, where a V128 would go through memory.) */
+typedef f32 RtV4f __attribute__((vector_size(16)));
+typedef i32 RtV4i __attribute__((vector_size(16)));
+typedef f64 RtV2d __attribute__((vector_size(16)));
+typedef i64 RtV2l __attribute__((vector_size(16)));
+static inline int rt_nan_any32(const V128 *r) {
+    RtV4f x;
+    memcpy(&x, r, 16);
+    RtV4i m = x != x;
+    return RT_EXACT_NAN && __builtin_expect((m[0] | m[1] | m[2] | m[3]) != 0, 0);
+}
+static inline int rt_nan_any64(const V128 *r) {
+    RtV2d x;
+    memcpy(&x, r, 16);
+    RtV2l m = x != x;
+    return RT_EXACT_NAN && __builtin_expect((m[0] | m[1]) != 0, 0);
+}
+#define RT_VNAN_NEG 4
+#define RT_VNAN_ABS 8
+static inline RT_NAN_SLOW RtV4f rt_vnan4S(RtV4f r, RtV4f a, RtV4f b, RtV4f d, int form, int index) {
+    for (int i = 0; i < 4; i++) {
+        if (r[i] == r[i]) continue;
+        f32 x = form & RT_VNAN_NEG ? -a[i] : a[i], y = b[index < 0 ? i : index];
+        f32 v = rt_nanS(form & 3, (form & 3) == 3 ? d[i] : x, (form & 3) == 3 ? x : y, y);
+        r[i] = form & RT_VNAN_ABS ? fabsf(v) : v;
+    }
+    return r;
+}
+static inline RT_NAN_SLOW RtV2d rt_vnan2D(RtV2d r, RtV2d a, RtV2d b, RtV2d d, int form, int index) {
+    for (int i = 0; i < 2; i++) {
+        if (r[i] == r[i]) continue;
+        f64 x = form & RT_VNAN_NEG ? -a[i] : a[i], y = b[index < 0 ? i : index];
+        f64 v = rt_nanD(form & 3, (form & 3) == 3 ? d[i] : x, (form & 3) == 3 ? x : y, y);
+        r[i] = form & RT_VNAN_ABS ? fabs(v) : v;
+    }
+    return r;
+}
+static inline V128 rt_vnanS(V128 r, V128 a, V128 b, V128 d, int form, int index) {
+    RtV4f v[4];
+    memcpy(&v[0], &r, 16); memcpy(&v[1], &a, 16); memcpy(&v[2], &b, 16); memcpy(&v[3], &d, 16);
+    v[0] = rt_vnan4S(v[0], v[1], v[2], v[3], form, index);
+    memcpy(&r, &v[0], 16);
+    return r;
+}
+static inline V128 rt_vnanD(V128 r, V128 a, V128 b, V128 d, int form, int index) {
+    RtV2d v[4];
+    memcpy(&v[0], &r, 16); memcpy(&v[1], &a, 16); memcpy(&v[2], &b, 16); memcpy(&v[3], &d, 16);
+    v[0] = rt_vnan2D(v[0], v[1], v[2], v[3], form, index);
+    memcpy(&r, &v[0], 16);
+    return r;
+}
+
+/* fmax / fmin: Arm's NaN, and +0 is greater than -0. The NM forms leave out a quiet NaN against a
+ * number or a signalling NaN (FPMaxNum / FPMinNum), and are fmax / fmin otherwise. */
+static inline RT_NAN_SLOW f32 rt_nan_nmS(f32 a, f32 b) {
+    u32 x, y;
+    memcpy(&x, &a, 4); memcpy(&y, &b, 4);
+    int qa = (x & 0x7FC00000u) == 0x7FC00000u, qb = (y & 0x7FC00000u) == 0x7FC00000u;
+    f32 other = qa ? b : a;
+    return qa == qb ? rt_nanS(2, a, b, b) : other == other ? other : rt_nanS(1, other, other, other);
+}
+static inline RT_NAN_SLOW f64 rt_nan_nmD(f64 a, f64 b) {
+    u64 x, y;
+    memcpy(&x, &a, 8); memcpy(&y, &b, 8);
+    int qa = (x & 0x7FF8000000000000ull) == 0x7FF8000000000000ull, qb = (y & 0x7FF8000000000000ull) == 0x7FF8000000000000ull;
+    f64 other = qa ? b : a;
+    return qa == qb ? rt_nanD(2, a, b, b) : other == other ? other : rt_nanD(1, other, other, other);
+}
+static inline f32 fmaxS(f32 a, f32 b) { return a != a || b != b ? rt_nanS(2, a, b, b) : a > b ? a : b > a ? b : signbit(a) ? b : a; }
+static inline f32 fminS(f32 a, f32 b) { return a != a || b != b ? rt_nanS(2, a, b, b) : a < b ? a : b < a ? b : signbit(a) ? a : b; }
+static inline f64 fmaxD(f64 a, f64 b) { return a != a || b != b ? rt_nanD(2, a, b, b) : a > b ? a : b > a ? b : signbit(a) ? b : a; }
+static inline f64 fminD(f64 a, f64 b) { return a != a || b != b ? rt_nanD(2, a, b, b) : a < b ? a : b < a ? b : signbit(a) ? a : b; }
+static inline f32 fmaxnmS(f32 a, f32 b) { return a != a || b != b ? rt_nan_nmS(a, b) : fmaxS(a, b); }
+static inline f32 fminnmS(f32 a, f32 b) { return a != a || b != b ? rt_nan_nmS(a, b) : fminS(a, b); }
+static inline f64 fmaxnmD(f64 a, f64 b) { return a != a || b != b ? rt_nan_nmD(a, b) : fmaxD(a, b); }
+static inline f64 fminnmD(f64 a, f64 b) { return a != a || b != b ? rt_nan_nmD(a, b) : fminD(a, b); }
+
+/* fmulx / Newton-Raphson step helpers: fused, and inf * 0 has a defined result. A NaN product
+ * comes only from that or from a NaN operand, so both are looked at only then. The steps negate
+ * their first operand before they look for NaNs (FPRecipStepFused, FPRSqrtStepFused). */
 #define RT_INF_ZERO(a, b) ((isinf(a) && (b) == 0) || ((a) == 0 && isinf(b)))
-static inline f32 rt_fmulx32(f32 a, f32 b) { return RT_INF_ZERO(a, b) ? (signbit(a) != signbit(b) ? -2.0f : 2.0f) : a * b; }
-static inline f64 rt_fmulx64(f64 a, f64 b) { return RT_INF_ZERO(a, b) ? (signbit(a) != signbit(b) ? -2.0 : 2.0) : a * b; }
-static inline f32 rt_frecps32(f32 a, f32 b) { return RT_INF_ZERO(a, b) ? 2.0f : fmaf(-a, b, 2.0f); }
-static inline f64 rt_frecps64(f64 a, f64 b) { return RT_INF_ZERO(a, b) ? 2.0 : fma(-a, b, 2.0); }
+static inline f32 rt_fmulx32(f32 a, f32 b) {
+    f32 r = a * b;
+    return r == r ? r : RT_INF_ZERO(a, b) ? (signbit(a) != signbit(b) ? -2.0f : 2.0f) : rt_nanS(2, a, b, b);
+}
+static inline f64 rt_fmulx64(f64 a, f64 b) {
+    f64 r = a * b;
+    return r == r ? r : RT_INF_ZERO(a, b) ? (signbit(a) != signbit(b) ? -2.0 : 2.0) : rt_nanD(2, a, b, b);
+}
+static inline f32 rt_frecps32(f32 a, f32 b) {
+    f32 r = fmaf(-a, b, 2.0f);
+    return r == r ? r : RT_INF_ZERO(a, b) ? 2.0f : rt_nanS(2, -a, b, b);
+}
+static inline f64 rt_frecps64(f64 a, f64 b) {
+    f64 r = fma(-a, b, 2.0);
+    return r == r ? r : RT_INF_ZERO(a, b) ? 2.0 : rt_nanD(2, -a, b, b);
+}
 /* (3 - a*b) / 2 with one rounding: halve whichever operand is larger, exactly, then fuse. */
 static inline f32 rt_frsqrts32(f32 a, f32 b) {
-    if (RT_INF_ZERO(a, b)) return 1.5f;
-    return fabsf(a) >= fabsf(b) ? fmaf(-(a * 0.5f), b, 1.5f) : fmaf(-a, b * 0.5f, 1.5f);
+    f32 r = fabsf(a) >= fabsf(b) ? fmaf(-(a * 0.5f), b, 1.5f) : fmaf(-a, b * 0.5f, 1.5f);
+    return r == r ? r : RT_INF_ZERO(a, b) ? 1.5f : rt_nanS(2, -a, b, b);
 }
 static inline f64 rt_frsqrts64(f64 a, f64 b) {
-    if (RT_INF_ZERO(a, b)) return 1.5;
-    return fabs(a) >= fabs(b) ? fma(-(a * 0.5), b, 1.5) : fma(-a, b * 0.5, 1.5);
+    f64 r = fabs(a) >= fabs(b) ? fma(-(a * 0.5), b, 1.5) : fma(-a, b * 0.5, 1.5);
+    return r == r ? r : RT_INF_ZERO(a, b) ? 1.5 : rt_nanD(2, -a, b, b);
 }
 
 /* Reciprocal and reciprocal-square-root estimates: the architecture's table algorithm,
