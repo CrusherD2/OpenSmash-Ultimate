@@ -49,7 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools"))   # (isa.py: what the game is compiled for)
 import isa  # noqa: E402
-REPO_OWNER, REPO_NAME, BRANCH = "OpenSmash-Ultimate", "WindowSmash", "main"
+REPO_OWNER, REPO_NAME, BRANCH = "OpenSmash-Ultimate", "OpenSmash-Ultimate", "main"
 REPO_API = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
 SOURCE_VERSION = os.path.join("tools", "source_version.txt")   # "<commit> <date>": GitHub's ZIP fills it in
 USER_AGENT = "WindowSmash-installer"
@@ -565,6 +565,17 @@ def read_text(path):
         return ""
 
 
+def config_file(name, root=None):
+    """Where the game reads a settings file (runtime/config.h): config/ once the game has made it
+    (config/version.ini), else the folder itself; online_server.txt is config/'s only once there is
+    one there."""
+    root = root or ROOT
+    inside = os.path.join(root, "config", name)
+    if os.path.isfile(os.path.join(root, "config", "version.ini")) and (name != "online_server.txt" or os.path.isfile(inside)):
+        return inside
+    return os.path.join(root, name)
+
+
 def folder_gb(path):
     total = 0
     for root, _dirs, files in os.walk(path):
@@ -964,7 +975,7 @@ def step_files(a):
     if not (a.game or a.keys or a.firmware) and not a.dry_run and os.path.isfile(venv_python()) and files_ready():
         info("already read from your game files (dump/): not asking for them again. To build from other game files, "
              "run: bash install-windowsmash.sh --game <folder>")
-        name_file = os.path.join(ROOT, "online_name.txt")
+        name_file = config_file("online_name.txt")
         name = a.online_name or read_text(name_file).strip()
         if name and name != read_text(name_file).strip():
             with open(name_file, "w", encoding="utf-8", newline="\n") as f:
@@ -981,7 +992,7 @@ def step_files(a):
     interactive = sys.stdin.isatty() and not a.yes
     if interactive:
         info("Press Enter to keep the folder in [brackets], or type another.")
-    name_file = os.path.join(ROOT, "online_name.txt")
+    name_file = config_file("online_name.txt")
     default_name = a.online_name or read_text(name_file).strip() or f"Player{int.from_bytes(os.urandom(2), 'big') % 9000 + 1000}"
     if a.dry_run:
         for key in ("game", "keys", "firmware"):

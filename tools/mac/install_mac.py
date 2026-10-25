@@ -54,9 +54,9 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools", "linux"))
 import install_linux as il  # noqa: E402  (the update, download and folder helpers)
 
-# Updates come from this branch: the macOS port's own until it is merged into main (then: "main").
+# Updates come from this branch (the macOS port is in main).
 # SSBU_UPDATE_BRANCH names another, for testing one.
-BRANCH = os.environ.get("SSBU_UPDATE_BRANCH") or "macos-port"
+BRANCH = os.environ.get("SSBU_UPDATE_BRANCH") or "main"
 DEPS = il.DEPS
 VENV = il.VENV
 DOWNLOADS = os.path.join(DEPS, "downloads")
@@ -996,7 +996,7 @@ def step_files(a, firewall):
             found[key] = os.path.abspath(os.path.expanduser(getattr(a, key)))
         none = "none (optional: the open fonts without it)" if key == "firmware" else "not found on this Mac (to be chosen)"
         info(f"{key}: {found[key] or none}")
-    name_file = os.path.join(ROOT, "online_name.txt")
+    name_file = il.config_file("online_name.txt", ROOT)
     name = clean_name(a.online_name or read_text(name_file).strip()) or f"Player{int.from_bytes(os.urandom(2), 'big') % 9000 + 1000}"
     # (--yes: no question that needs an answer, the administrator's password included)
     options = {"launcher": True, "firewall": firewall == "on" and not a.yes}

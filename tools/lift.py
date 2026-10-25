@@ -872,7 +872,8 @@ class Lifter(SimdMixin):
                 n = f"-{n}"
             if o1:
                 a = f"-{a}"
-            return f"w{p}(c, {rd}, {'fmaf' if ftype == 0 else 'fma'}({n}, {m}, {a}));"
+            # (a NaN result: Arm's, from the addend and multiplicands as negated: recomp.h's fnan3)
+            return f"w{p}(c, {rd}, fnan3{p}({'fmaf' if ftype == 0 else 'fma'}({n}, {m}, {a}), {a}, {n}, {m}));"
         if w & 0x7F200000 != 0x1E200000:
             if w & 0x7F200000 == 0x1E000000:
                 return self.fp_fixed(w)
@@ -892,7 +893,7 @@ class Lifter(SimdMixin):
             opcode = (w >> 15) & 0x3F
             if opcode == 0:
                 return f"w{p}(c, {rd}, {a});"
-            simple = {1: f"fabs{sfx}({a})", 2: f"-{a}", 3: f"sqrt{sfx}({a})", 8: f"__builtin_roundeven{sfx}({a})",
+            simple = {1: f"fabs{sfx}({a})", 2: f"-{a}", 3: f"fnan1{p}(sqrt{sfx}({a}), {a})", 8: f"__builtin_roundeven{sfx}({a})",
                       9: f"ceil{sfx}({a})", 10: f"floor{sfx}({a})", 11: f"trunc{sfx}({a})",
                       12: f"round{sfx}({a})", 14: f"rint{sfx}({a})", 15: f"nearbyint{sfx}({a})"}
             if opcode in simple:
@@ -923,8 +924,10 @@ class Lifter(SimdMixin):
         if low & 3 != 2:
             raise Unsupported("reserved fp encoding")
         opcode = (w >> 12) & 15
-        ops = {0: f"{a} * {b}", 1: f"{a} / {b}", 2: f"{a} + {b}", 3: f"{a} - {b}", 4: f"fmax{p}({a}, {b})",
-               5: f"fmin{p}({a}, {b})", 6: f"fmaxnm{p}({a}, {b})", 7: f"fminnm{p}({a}, {b})", 8: f"-({a} * {b})"}
+        nan = f"fnan2{p}({{}}, {a}, {b})"   # (a NaN result: Arm's, from a and b)
+        ops = {0: nan.format(f"{a} * {b}"), 1: nan.format(f"{a} / {b}"), 2: nan.format(f"{a} + {b}"),
+               3: nan.format(f"{a} - {b}"), 4: f"fmax{p}({a}, {b})", 5: f"fmin{p}({a}, {b})", 6: f"fmaxnm{p}({a}, {b})",
+               7: f"fminnm{p}({a}, {b})", 8: "-" + nan.format(f"{a} * {b}")}
         if opcode not in ops:
             raise Unsupported("reserved fp two-source")
         return f"w{p}(c, {rd}, {ops[opcode]});"

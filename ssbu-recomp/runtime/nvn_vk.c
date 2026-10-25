@@ -1,8 +1,8 @@
 /* NVN on Vulkan: the second back end of the graphics layer (design, milestones, state: plan\phases\V1_vulkan.md).
  *
  * Selected with SSBU_RENDERER=vk (default: gl). The front end (NVN entry points, command lists, the job queue and its
- * render thread) is in nvn_gl.c; in Vulkan mode that render thread calls nvn_vk_init() instead of creating an OpenGL
- * context and gives its jobs to the functions below (nvn_gl.c, vk_route: seam step S0).
+ * render thread) is in nvn_front.c; in Vulkan mode that render thread calls nvn_vk_init() instead of creating an OpenGL
+ * context and gives its jobs to the back end below (rb_vk, nvn_vk_draw.c; seam steps S0 and S2).
  *
  * What exists (milestone M1): instance, device selection (discrete GPU preferred), a swapchain on the game window,
  * clear + present, paced by the one 60 Hz clock of display.c, a clean shutdown. Everything else stops the game with
@@ -49,7 +49,7 @@ typedef char vk_min_check_swapchain[sizeof(VkSwapchainCreateInfoKHR) == 104 ? 1 
 typedef char vk_min_check_barrier[sizeof(VkImageMemoryBarrier) == 72 ? 1 : -1];
 typedef char vk_min_check_submit[sizeof(VkSubmitInfo) == 72 ? 1 : -1];
 
-void nvn_render_run(void (*fn)(void *), void *arg);       /* nvn_gl.c: run on the render thread and wait */
+void nvn_render_run(void (*fn)(void *), void *arg);       /* nvn_front.c: run on the render thread and wait */
 void display_pace(void);                                  /* display.c */
 int display_wait_refresh(void);
 void display_before_present(void);

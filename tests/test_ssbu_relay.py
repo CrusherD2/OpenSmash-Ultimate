@@ -50,7 +50,7 @@ class Server:
                 await self.task
             except asyncio.CancelledError:
                 pass
-            self.transport.close()
+            self.lobby.close_ports()
         asyncio.run_coroutine_threadsafe(end(), self.loop).result(5)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(5)

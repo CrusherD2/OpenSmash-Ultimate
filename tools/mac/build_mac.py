@@ -661,6 +661,19 @@ def bundle():
     return True
 
 
+def link_errors(out):
+    """The lines of a failed link that say why: those with an error, and each missing symbol with what
+    refers to it (ld's indented lines under "Undefined symbols", which say neither); all of them when
+    none does."""
+    lines, kept, undefined = out.splitlines(), [], False
+    for line in lines:
+        low = line.lower()
+        undefined = (undefined and line[:1] in (" ", "\t")) or low.startswith("undefined symbols")
+        if undefined or "error" in low or "undefined" in low:
+            kept.append(line)
+    return kept or lines
+
+
 def link():
     objs = runtime_objects()
     for _name, src_dir, out_dir in modules():
@@ -686,8 +699,7 @@ def link():
                      "-F", SDL3_DIR, *frameworks, "-lc++", "-Wl,-rpath,@executable_path/../Frameworks",
                      "-Wl,-no_deduplicate"])
     if code:
-        errors = [l for l in out.splitlines() if "error" in l.lower() or "undefined" in l.lower()] or out.splitlines()
-        print("link failed\n" + "\n".join(errors)[:6000])
+        print("link failed\n" + "\n".join(link_errors(out))[:6000])
         return False
     os.makedirs(os.path.dirname(EXE), exist_ok=True)
     os.replace(partial, EXE)

@@ -125,7 +125,7 @@ $UserAgent = 'WindowSmash-installer'
 $ZstdCheck = 'import sys, importlib.util as u; sys.exit(0 if u.find_spec(''zstandard'') or (sys.version_info >= (3, 14) and u.find_spec(''compression.zstd'')) else 1)'
 # where updates come from: this repository's branch
 $RepoOwner = 'OpenSmash-Ultimate'
-$RepoName = 'WindowSmash'
+$RepoName = 'OpenSmash-Ultimate'
 $UpdateBranch = 'main'
 $RepoApi = "https://api.github.com/repos/$RepoOwner/$RepoName"
 $SourceVersionFile = 'tools\source_version.txt'   # "<commit> <date>": GitHub's ZIP download fills it in
@@ -205,6 +205,19 @@ function Merge-OnlineServer {
         return ($newLines -join "`n")
     }
     return $Local
+}
+
+function Get-ConfigPath {
+    <# Where the game reads a settings file (runtime/config.h): config\ once the game has made it
+       (config\version.ini), else the port's folder; online_server.txt is config\'s only once there
+       is one there. (tools\launcher.ps1 has the same.) #>
+    param([string]$Root, [string]$Name)
+    $inFolder = Join-Path (Join-Path $Root 'config') $Name
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $Root 'config') 'version.ini') -PathType Leaf) -or
+        ($Name -eq 'online_server.txt' -and -not (Test-Path -LiteralPath $inFolder -PathType Leaf))) {
+        return Join-Path $Root $Name
+    }
+    return $inFolder
 }
 
 function Join-CommandLine {
@@ -1317,7 +1330,7 @@ function Step-GameFiles {
     foreach ($k in @('Game', 'Keys', 'Firmware')) {
         if ($detected[$k]) { Write-Info "$($k.ToLower()): $($detected[$k])" } elseif ($k -eq 'Firmware') { Write-Info 'firmware: none (optional: without it the game uses the open fonts of third_party\fonts_open)' } else { Write-Info "$($k.ToLower()): not found on this PC (to be chosen)" }
     }
-    $nameFile = Join-Path $Root 'online_name.txt'
+    $nameFile = Get-ConfigPath $Root 'online_name.txt'
     $default = $OnlineName
     if (-not $default -and (Test-Path -LiteralPath $nameFile)) { $default = ([IO.File]::ReadAllText($nameFile)).Trim() }
     if (-not $default) { $default = 'Player' + (Get-Random -Minimum 1000 -Maximum 9999) }
