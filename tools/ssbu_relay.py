@@ -9,7 +9,9 @@ lobby, so nobody needs port forwarding; the lobby's machine needs its UDP port o
 the same room whose games can do it are also introduced to each other, so their games can send the
 room's traffic straight to each other (UDP hole punching) and use the lobby only when that fails.
 The protocol is runtime/net_relay.c's (version 2); the host player's game can run a smaller relay
-of its own for a private room (launchers\\Host SSBU Netplay.bat).
+of its own for a private room (launchers\\Host SSBU Netplay.bat). Version 3, on the same port, is
+version 2 with a room browser, mod sets, matchmaking and a rollback relay, for games that say
+their simulation version and mods: "Protocol SN" below has both, message by message.
 
 ssbu-recomp's games join the same lobby on a port of their own (--su-port, 39500): their protocol
 is "SU" version 1 (ssbu-recomp/runtime/net_relay.c), with its own numbers and layouts, and the
@@ -23,6 +25,83 @@ room browser, matchmaking and a rollback relay here. --status-port serves GET /s
     python3 ssbu_relay.py --probe HOST[:PORT] [--room CODE] [--build ID]   (is a lobby there?)
 
 Python 3.8+, standard library only."""
+
+# ---- Protocol SN, versions 2 and 3 ---------------------------------------------------------------
+# UDP, every field big-endian; each packet starts 'S' 'N' version type. Version 2 is runtime/net_relay.c's
+# (its comment says it too). Version 3 is version 2 and more, on the same port: the lobby answers a
+# game in the version of its JOIN, and two games of version 3 talk to each other in version 3 (a game
+# of version 2 drops packets of another version, but a REJECT). "3:" marks what version 3 adds.
+#
+#  1 JOIN        game:  nonce u64, lobby code[32], name[32], build[40]         (repeated until answered)
+#                       3: then sim u32, mod set: count u8 (32 at most), count x (hash u32, length u8 (31 at
+#                       most), name[length]): 121 bytes at least; bytes after the mod set are ignored (room
+#                       for later additions)
+#  2 WELCOME     lobby: nonce u64, address u32, cookie u64, flags u8, members u8 (0: a lobby lists none)
+#                       flags 1 a lobby, 2 it introduces players; 3: 4 ROOMS, 8 MATCH, 16 RB (it has them)
+#  3 REJECT      lobby: nonce u64, reason u8, text[64]                         (in the JOIN's version)
+#                       reasons 1 full or too many from that address, 2 another netplay version, 4 not
+#                       13.0.5 (version 2 only); 3: 5 the mod set is not one (too many, a name too long, cut short)
+#  4 PING        game:  nonce u64, time u64, cookie u64, ping u16              (every second)
+#                       then, from a game that can connect directly: peers version u32, LAN address u32,
+#                       port u16, flags u8 (1 direct connections allowed), direct peers u8
+#  5 PONG        lobby: time u64, players u16, rooms u16 (of its key), flags u8 (1)
+#                       3: then players searching u16 (of its key), players u16 (of its lobby code, every key)
+#  6 DATA        both:  source u32, destination u32, source port u16, destination port u16, payload
+#                       (payload 1500 bytes at most: --max-data)
+#  7 MEMBERS     a player's relay only: count u8, count x (address u32, name[32])
+#  8 LEAVE       game:  nonce u64
+#  9 LIST        game:  cookie u64, seq u32                                    (nn::ldn's Scan)
+#                       3: then flags u8 (1: every key's rooms of the lobby code, its own key's first)
+# 10 LISTING     lobby: seq u32, host address u32, NetworkInfo[0x480]          (24 at most, best first)
+#                       3, LIST flag 1: then the host's build[40], sim u32, mod set
+# 11 LIST_END    lobby: seq u32, count u8
+# 12 PEERS       lobby: cookie u64, version u32, count u8, count x (address u32, name[32], flags u8, public
+#                       address u32, port u16, LAN address u32, port u16, secret u64)   (its room's players;
+#                       flags 1 introduced, 2 that player turned direct connections off, 4 its game can't)
+# 13 BCAST       game:  count u8, count x address u32 (players it reaches directly), then as DATA
+# 14 PUNCH       game to game: secret u64, from u32, to u32, ack u8, nonce u64
+# 15 DIRECT      game to game: secret u64, then as DATA
+# Version 3 only, in SU's numbers and layouts (ssbu-recomp/runtime/net_relay.c); a lobby or game of
+# version 2 never sends them, and the lobby ignores them from one:
+# 16 RB          game:  cookie u64, destination u32 (0: every player of its key, not on the public code),
+#                       message                                                (16 < packet length <= 1500)
+#                lobby: source u32, message
+#                       (on the public code "smash", only to its rollback opponent or a player of its room)
+# 17 ROOMS       game:  cookie u64, seq u32                                    (the room browser)
+# 18 ROOM_INFO   lobby: seq u32, host address u32, players u8, most u8, flags u8 (1 open, 2 yours, 4 mods
+#                       known, 8 of your key: you can join it), host name[32], build[40], sim u32, mod set
+#                       (every key's rooms of the lobby code, yours first; 32 at most)
+# 19 ROOMS_END   lobby: seq u32, count u8
+# 20 MATCH       game:  cookie u64, op u8 (1 a search for a room, 2 for a rollback match, 0 cancel), search
+#                       id u32                                (again every 2 s while it searches or is matched)
+# 21 MATCH_STATE lobby: search id u32, state u8 (0 idle, 1 searching, 2 matched, 3 none found in time, 4 the
+#                       other cancelled or left, 5 together, 6 expired), role u8 (1 you host or are player 1, 2 you join),
+#                       flags u8 (1 the host's room is open), the other's address u32, its name[32],
+#                       players searching u16, players u16 (both of your key), seconds waited u16
+#
+# Version 3's key: two games meet (rooms, matchmaking, rollback messages) when all four are the same.
+#   build  the game's main module build id, as version 2's (13.0.5's for WindowSmash; the lobby lets any in)
+#   sim    the simulation version: a number in the game's source, bumped whenever the lifter or the runtime
+#          changes what the game computes (anything that can make two games' matches differ); never a
+#          per-OS or per-CPU number, so Windows, Linux and macOS, avx2 and x86-64-v2 builds meet
+#   mods   the mods' hashes, in any order (names are shown, not compared); each the same on every OS
+#   code   the lobby code ("smash", the default, is the public lobby)
+# Players of version 2 are a pool of their own (their games say no sim or mods), SU's another (their port).
+#
+# For the C client (runtime/net_relay.c), from ssbu-recomp/runtime/net_relay.c (SU), message by message:
+#   JOIN         send_join's tail: the mod set is mods_scan's g_mods_wire, the hashes mod_add's; after
+#                build put sim. tree_hash is Win32 (FindFirstFile, '\\'): its rule (lower-case path with '/',
+#                FNV-1a 64 of path then size) ports, but a mod's native code (a .dll, .so, .dylib) differs
+#                per OS: hash what is the same on every OS, or two OSes never meet
+#   WELCOME      its flags, in place of SU's guesses (mm_tick's 6.5 s "older lobby")
+#   REJECT 2     from a lobby or a player's relay of version 2: JOIN again in version 2 (no ROOMS, MATCH, RB)
+#   PONG         SU's T_PONG tail (n >= 20), 1 byte later (after flags)
+#   LIST         net_list_rooms with flags 1; LISTING's tail: listing_build, then sim and the mod set
+#   ROOMS..      rooms_ask, rooms_info (sim at body offset 83, the mod set at 87; flag 8), rooms_end,
+#                net_rooms_get, room_why (build, then sim, then mods), net_room_refusal; mods_read as is
+#   MATCH..      mm_find, mm_send, mm_tick, mm_state, net_match_*: as they are, in this header
+#   RB           net_rb_send and its T_RB case: as they are; the public code is "smash", not "public"
+#   the rest     WindowSmash's own, as now; PUNCH and DIRECT between two games of version 3 in version 3
 import argparse
 import asyncio
 import collections
@@ -57,6 +136,14 @@ SUBNET = 0x0A0D0000
 BROADCASTS = (0x0A0DFFFF, 0xFFFFFFFF)
 DEFAULT_PORT = 39420
 LIST_MAX = 24
+# Version 3, on the same port: version 2's messages, and ssbu-recomp's room browser, mod sets,
+# matchmaking and rollback relay in SU's numbers and layouts. Its players are parted by a key of
+# their own: build, simulation version, mod set and lobby code (see "Protocol SN" above).
+V3 = 3
+RB, ROOMS, ROOM_INFO, ROOMS_END, MATCH, MATCH_STATE = range(16, 22)
+V3_JOIN_SIZE = JOIN_SIZE + 4 + 1   # (a JOIN of version 2's, the simulation version, a mod set of none)
+V3_PUBLIC = "smash"                # (the public lobby's code, where rollback messages go to opponents only)
+LOBBY, INTRODUCES, HAS_ROOMS, HAS_MATCH, HAS_RB = 1, 2, 4, 8, 16   # WELCOME's flags
 
 # Local wireless's own messages (runtime/hle_net.c), carried in DATA between port 65511s:
 # 'L', type, 0, 0, payload.
@@ -86,7 +173,7 @@ SU_PEERS_AGAIN = 5.0   # seconds: its PINGs don't say which PEERS came last, so 
 # id has its version and a hash of its mods, so players of another version or mod set never share a
 # room; their rooms are listed all the same, with the host's build and mods, and the game says why
 # it can't join one (ssbu-recomp/runtime/net_relay.c room_why).
-SU_ROOMS, SU_ROOM_INFO, SU_ROOMS_END = 17, 18, 19
+SU_ROOMS, SU_ROOM_INFO, SU_ROOMS_END = ROOMS, ROOM_INFO, ROOMS_END
 ROOMS_MAX = 32        # rooms in a ROOMS answer, at most
 MODS_MAX = 32         # a game's mod set (its JOIN ends with "MS" and it): mods at most...
 MOD_NAME = 31         # ...and a mod's name, bytes at most
@@ -95,14 +182,14 @@ MOD_NAME = 31         # ...and a mod's name, bytes at most
 # with an open room, else the one that waited longer) makes the Local Wireless room, the other
 # finds it first in its Rooms List; or, searching for a rollback match, the two games agree on the
 # match in rollback messages (SU_RB) and the one that waited longer is player 1.
-SU_MATCH, SU_MATCH_STATE = 20, 21
+SU_MATCH, SU_MATCH_STATE = MATCH, MATCH_STATE
 MS_IDLE, MS_SEARCHING, MS_MATCHED, MS_TIMEOUT, MS_PEER_LEFT, MS_TOGETHER, MS_EXPIRED = range(7)
 ROLE_HOST, ROLE_JOIN = 1, 2
 KIND_ROOM, KIND_ROLLBACK = 1, 2   # MATCH's op: a search for a Local Wireless room, for a rollback match (0: cancel)
 # Online rollback (Smash versus with rollback, ssbu-recomp's rb_net.c): its games' messages to each
 # other through the lobby. From a game: cookie u64, destination u32 (0: every other player of its
 # build and lobby code), message; to a game: source u32, message.
-SU_RB = 16
+SU_RB = RB
 SU_PUBLIC = "public"   # ssbu-recomp's public lobby code: rollback messages go only to an opponent or a player of one's room
 RB_MAX = 1500          # largest rollback packet
 # The status page (--status-port): GET /status, counts only, for ssbu-recomp's site.
@@ -133,11 +220,23 @@ def mods_block(raw):
     return bytes(raw[:o])
 
 
+def mods_key(block):
+    """What of a mod set parts players (SN 3): its mods' hashes, in order (not their names, nor the
+    order the game lists them in)."""
+    out, o = [], 1
+    for _ in range(block[0]):
+        out.append(struct.unpack_from(">I", block, o)[0])
+        o += 5 + block[o + 4]
+    return tuple(sorted(out))
+
+
 class Wire:
-    """A protocol the lobby speaks, on a UDP port of its own."""
-    def __init__(self, name, version, data, bcast):
-        self.name, self.magic, self.version = name, name.encode(), version
+    """A protocol the lobby speaks (a version of one), on a UDP port of its own or of another's (port:
+    the wire that has the port)."""
+    def __init__(self, name, version, data, bcast, magic=None, port=None):
+        self.name, self.magic, self.version = name, magic or name.encode(), version
         self.data, self.bcast = data, bcast   # (its DATA and BCAST types)
+        self.port = port or self
         self.transport = None
 
     def header(self, kind, version=None):
@@ -228,7 +327,8 @@ class Client:
         self.wire = wire       # the protocol it speaks (None: SN)
         self.build, self.code = b"", ""   # (its part: wire, build and lobby code)
         self.code_key = None   # (wire, lobby code): its part and the parts of other builds with that code
-        self.mods = None       # (SU) its mod set (None: its game does not say)
+        self.mods = None       # (SU, SN 3) its mod set (None: its game does not say)
+        self.sim = 0           # (SN 3) its simulation version
         # matchmaking (SU)
         self.search_id = None     # its search's id (None: it never searched)
         self.search_since = None  # searching since (None: not searching)
@@ -307,11 +407,12 @@ class Lobby:
     def __init__(self, o):
         self.o = o
         self.sn = Wire("SN", PROTOCOL, DATA, BCAST)
+        self.sn3 = Wire("SN3", V3, DATA, BCAST, b"SN", self.sn)
         self.su = Wire("SU", SU_PROTOCOL, SU_DATA, SU_BCAST)
-        self.by_addr = {}       # (wire, (host, port)) -> Client
+        self.by_addr = {}       # (wire of the port, (host, port)) -> Client
         self.by_ip = {}         # virtual address -> Client
-        self.parts = {}         # (wire name, build, lobby code) -> set of Client
-        self.part_rooms = {}    # (wire name, build, lobby code) -> set of Listing
+        self.parts = {}         # (wire name, build, lobby code), SN 3: (..., build, simulation, mods, code) -> set of Client
+        self.part_rooms = {}    # part -> set of Listing
         self.code_rooms = {}    # (wire name, lobby code) -> set of Listing, every build's
         self.code_players = collections.Counter()   # (wire name, lobby code) -> players, every build's
         self.searching = {}     # part -> {Client: None}: its players searching, the first first
@@ -351,7 +452,7 @@ class Lobby:
         """data to the address at, from the port of wire (SN's by default)."""
         self.counts["out packets"] += 1
         self.counts["out bytes"] += len(data)
-        (wire or self.sn).transport.sendto(data, at)
+        (wire or self.sn).port.transport.sendto(data, at)
 
     def to(self, c, data):
         self.send(data, c.at, c.wire)
@@ -470,7 +571,7 @@ class Lobby:
                 self.to(listing.owner, ldn_packet(c.ip, listing.owner.ip, LM_LEAVE, c.claim, self.data_header(listing.owner)))
                 self.dirty.add(listing)
         self.dirty_clients.discard(c)
-        self.by_addr.pop((c.wire, c.at), None)
+        self.by_addr.pop(((c.wire or self.sn).port, c.at), None)
         self.by_ip.pop(c.ip, None)
         players = self.parts.get(c.part)
         if players is not None:
@@ -511,16 +612,17 @@ class Lobby:
             self.say(f"error on a packet from {at[0]}: {e!r}")
 
     def packet(self, p, at, now):
-        """A packet of WindowSmash's games (SN)."""
+        """A packet of WindowSmash's games (SN, version 2 or 3)."""
         kind = p[3]
-        if p[2] != PROTOCOL:   # another version of the game's netplay: say so
+        if p[2] not in (PROTOCOL, V3):   # another version of the game's netplay: say so
             if kind == JOIN and len(p) >= V1_JOIN_SIZE and self.gate(at, now):
-                self.reject(self.sn, at, p[4:12], 2, f"different netplay version (lobby {PROTOCOL}, you {p[2]})", p[2])
+                self.reject(self.sn, at, p[4:12], 2, f"different netplay version (lobby {PROTOCOL} or {V3}, you {p[2]})", p[2])
             return
+        wire = self.sn if p[2] == PROTOCOL else self.sn3
         c = self.by_addr.get((self.sn, at))
         if kind == JOIN:
-            self.on_join(p, at, c, now)
-        elif c is None:
+            self.on_join(wire, p, at, c, now)
+        elif c is None or (c.wire or self.sn) is not wire:   # (none, or a packet of the other version from there)
             return
         elif kind == PING:
             if len(p) < PING_SIZE or p[4:12] != c.nonce or struct.unpack_from(">Q", p, 20)[0] != c.cookie:
@@ -530,8 +632,11 @@ class Lobby:
             c.ping = struct.unpack_from(">H", p, 28)[0]
             if len(p) >= PING_EXT_SIZE:
                 self.on_ping_ext(c, p, now)
-            self.to(c, header(PONG) + p[12:20] + struct.pack(">HHB", min(len(self.parts.get(c.part, ())), 0xFFFF),
-                                                             min(len(self.part_rooms.get(c.part, ())), 0xFFFF), 1))
+            pong = wire.header(PONG) + p[12:20] + struct.pack(">HHB", min(len(self.parts.get(c.part, ())), 0xFFFF),
+                                                              min(len(self.part_rooms.get(c.part, ())), 0xFFFF), 1)
+            if wire is self.sn3:   # (and players searching of its key, players of its lobby code)
+                pong += struct.pack(">HH", min(len(self.searching.get(c.part, ())), 0xFFFF), min(self.code_players[c.code_key], 0xFFFF))
+            self.to(c, pong)
         elif kind == LEAVE:
             if len(p) >= 12 and p[4:12] == c.nonce:
                 self.drop(c, "left")
@@ -543,11 +648,36 @@ class Lobby:
             if not c.lists.take(now):
                 self.drops["list rate"] += 1
                 return
-            self.on_list(c, p[12:16], now)
+            self.on_list(c, p[12:16], now, wire is self.sn3 and len(p) > 16 and bool(p[16] & 1))   # (3: flags 1, every key's)
         elif kind == DATA:
             self.on_data(c, p, now)
         elif kind == BCAST:
             self.on_bcast(c, p, now)
+        elif wire is self.sn3 and kind in (ROOMS, MATCH, RB):   # (version 3's own: they start with the cookie)
+            if len(p) < 12 or struct.unpack_from(">Q", p, 4)[0] != c.cookie:
+                return
+            self.verify(c)
+            c.seen = now
+            self.on_extra(c, kind, p, now)
+
+    def on_extra(self, c, kind, p, now):
+        """ROOMS, MATCH and RB, of SU and SN 3 (the same numbers and layouts; the cookie checked)."""
+        if kind == ROOMS:
+            if len(p) < 16:
+                return
+            if not c.lists.take(now):
+                self.drops["list rate"] += 1
+                return
+            self.on_rooms(c, p[12:16], now)
+        elif kind == MATCH:
+            if len(p) < 17:
+                return
+            if not c.match_asks.take(now):
+                self.drops["match rate"] += 1
+                return
+            self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
+        elif kind == RB:
+            self.on_rb(c, p, now)
 
     def on_data(self, c, p, now):
         if len(p) < 16 or not self.admit(c, p, 4, now):
@@ -575,36 +705,51 @@ class Lobby:
             return False
         return True
 
-    def on_join(self, p, at, c, now):
-        if len(p) < JOIN_SIZE:
+    def on_join(self, wire, p, at, c, now):
+        """JOIN: nonce, lobby code, name, build; version 3's then its simulation version and mod set."""
+        if len(p) < (JOIN_SIZE if wire is self.sn else V3_JOIN_SIZE):
             return
         nonce = p[4:12]
         room, name = text(p[12:12 + NAME_LEN]), text(p[12 + NAME_LEN:12 + 2 * NAME_LEN])
         build = p[12 + 2 * NAME_LEN:JOIN_SIZE].rstrip(b"\0")
-        c = self.join(self.sn, at, c, nonce, room, name, build, now)
-        if c is not None:
-            self.to(c, header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, 1 | 2) + b"\0")   # (2: introduces peers)
+        part = mods = None
+        if wire is self.sn3:
+            sim, mods = struct.unpack_from(">I", p, JOIN_SIZE)[0], mods_block(p[JOIN_SIZE + 4:])
+            if mods is None:
+                if not self.is_banned(at[0]) and self.gate(at, now):
+                    self.reject(wire, at, nonce, 5, "the lobby cannot read your game's mod list")
+                return
+            part = (wire.name, build.upper(), sim, mods_key(mods), room)
+        c = self.join(wire, at, c, nonce, room, name, build, now, part)
+        if c is None:
+            return
+        flags = LOBBY | INTRODUCES
+        if wire is self.sn3:
+            c.sim, c.mods = sim, mods
+            flags |= HAS_ROOMS | HAS_MATCH | HAS_RB
+        self.to(c, wire.header(WELCOME) + nonce + struct.pack(">IQB", c.ip, c.cookie, flags) + b"\0")
 
-    def join(self, wire, at, c, nonce, room, name, build, now):
+    def join(self, wire, at, c, nonce, room, name, build, now, part=None):
         """The player a JOIN comes from (c: the one at its address, if any): a new one, one back
-        from a new port, or the same again; None when it is turned away."""
+        from a new port, or the same again; None when it is turned away. part: its key (by default
+        the wire's name, its build and lobby code)."""
         if self.is_banned(at[0]):
             self.drops["banned"] += 1
             return None
-        if c is not None and c.nonce != nonce:   # a new game from the same place
-            self.drop(c, "restarted")
+        part = part or (wire.name, build, room)
+        if c is not None and (c.nonce != nonce or (c.wire or self.sn) is not wire or c.part != part):
+            self.drop(c, "restarted")   # (a new game from the same place, or another version or key)
             c = None
-        part = (wire.name, build, room)
         if c is None:   # a player back from a new place (its router changed its port)?
             for other in self.parts.get(part, ()):
                 if other.nonce == nonce and other.verified:
-                    del self.by_addr[wire, other.at]
+                    del self.by_addr[wire.port, other.at]
                     self.per_ip[other.at[0]] -= 1
                     if self.per_ip[other.at[0]] <= 0:
                         del self.per_ip[other.at[0]]
                     self.per_ip[at[0]] += 1
                     other.at = at
-                    self.by_addr[wire, at] = c = other
+                    self.by_addr[wire.port, at] = c = other
                     self.mark(c)   # (the players it was introduced to need its new port)
                     break
         if c is None:   # a new player
@@ -626,7 +771,7 @@ class Lobby:
                 return None
             c = Client(at, nonce, ip, name, part, now, self.o, wire)
             c.build, c.code, c.code_key = build, room, (wire.name, room)
-            self.by_addr[wire, at], self.by_ip[ip] = c, c
+            self.by_addr[wire.port, at], self.by_ip[ip] = c, c
             self.parts.setdefault(part, set()).add(c)
             self.code_players[c.code_key] += 1
             self.pending += 1
@@ -671,25 +816,15 @@ class Lobby:
                 self.sync(c, now, again=True)
         elif kind == SU_LEAVE:
             self.drop(c, "left")
-        elif kind in (SU_LIST, SU_ROOMS):
+        elif kind == SU_LIST:
             if len(p) < 16:
                 return
             if not c.lists.take(now):
                 self.drops["list rate"] += 1
                 return
-            if kind == SU_LIST:   # (flags 1: the rooms of every build of its lobby code)
-                self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))
-            else:
-                self.on_rooms(c, p[12:16], now)
-        elif kind == SU_MATCH:
-            if len(p) < 17:
-                return
-            if not c.match_asks.take(now):
-                self.drops["match rate"] += 1
-                return
-            self.on_match(c, p[12], struct.unpack_from(">I", p, 13)[0], now)
-        elif kind == SU_RB:
-            self.on_rb(c, p, now)
+            self.on_list(c, p[12:16], now, len(p) > 16 and bool(p[16] & 1))   # (flags 1: the rooms of every build of its lobby code)
+        elif kind in (SU_ROOMS, SU_MATCH, SU_RB):
+            self.on_extra(c, kind, p, now)
 
     def su_join(self, p, at, c, now):
         """JOIN: nonce, lobby code, name, build, LAN address and port, flags (1: direct connections),
@@ -717,35 +852,43 @@ class Lobby:
         """The rooms this player's Rooms List shows: open ones first, fuller ones first, then the
         ones whose host is closest to the lobby (in 100 ms steps, taken when the room opened: the
         list must not reorder under the player's cursor from one scan to the next), then the oldest.
-        every (SU): the rooms of every build of its lobby code, its own build's first, each LISTING
-        ending with its host's build. A player matchmaking paired sees its host's room first."""
+        every (SU, SN 3): the rooms of every build (SN 3: every key) of its lobby code, its own first,
+        each LISTING ending with its host's build (SN 3: and simulation version and mod set). A player
+        matchmaking paired sees its host's room first."""
         pool = self.code_rooms.get(c.code_key, ()) if every else self.part_rooms.get(c.part, ())
         host = c.match.host if c.match is not None and c.match.guest is c else None   # (the host it was matched with first)
         rooms = sorted((r for r in pool if r.owner is not c and now - r.updated <= self.o.listed_for),
                        key=lambda r: (r.owner is not host, r.owner.part != c.part, *self.room_order(r)))[:LIST_MAX]
         su = c.wire is self.su
         for r in rooms:
-            self.to(c, (su_header(SU_LISTING) if su else header(LISTING)) + seq + struct.pack(">I", r.owner.ip) + r.info +
-                    (r.owner.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") if every else b""))
-        self.to(c, (su_header(SU_LIST_END) if su else header(LIST_END)) + seq + bytes((len(rooms),)))
+            tail = r.owner.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") if every else b""
+            if every and not su:
+                tail += struct.pack(">I", r.owner.sim) + r.owner.mods
+            self.to(c, (su_header(SU_LISTING) if su else (c.wire or self.sn).header(LISTING)) + seq + struct.pack(">I", r.owner.ip) +
+                    r.info + tail)
+        self.to(c, (su_header(SU_LIST_END) if su else (c.wire or self.sn).header(LIST_END)) + seq + bytes((len(rooms),)))
 
     @staticmethod
     def room_order(r):
         return not r.open, -r.count, 10 if r.distance is None else r.distance, r.created
 
     def on_rooms(self, c, seq, now):
-        """(SU) The room browser: every room of its lobby code, its own build's first, then as a
-        Rooms List; each with its host's address and name, players, build and mods, and flags
-        (1 open, 2 its own, 4 its host's game says its mods)."""
+        """(SU, SN 3) The room browser: every room of its lobby code, its own build's (key's) first,
+        then as a Rooms List; each with its host's address and name, players, build (SN 3: and
+        simulation version) and mods, and flags (1 open, 2 its own, 4 its host's game says its
+        mods; SN 3: 8 of its key, one it can join)."""
         rooms = sorted((r for r in self.code_rooms.get(c.code_key, ()) if now - r.updated <= self.o.listed_for),
                        key=lambda r: (r.owner.part != c.part, *self.room_order(r)))[:ROOMS_MAX]
+        su, wire = c.wire is self.su, c.wire or self.sn
         for r in rooms:
             h = r.owner
             flags = (1 if r.open else 0) | (2 if h is c else 0) | (4 if h.mods is not None else 0)
-            self.to(c, su_header(SU_ROOM_INFO) + seq + struct.pack(">IBBB", h.ip, r.count, r.info[NI_NODE_MAX], flags) +
+            if not su and h.part == c.part:
+                flags |= 8
+            self.to(c, wire.header(ROOM_INFO) + seq + struct.pack(">IBBB", h.ip, r.count, r.info[NI_NODE_MAX], flags) +
                     h.name.encode()[:NAME_LEN].ljust(NAME_LEN, b"\0") + h.build[:BUILD_LEN].ljust(BUILD_LEN, b"\0") +
-                    (h.mods or b"\0"))
-        self.to(c, su_header(SU_ROOMS_END) + seq + bytes((len(rooms),)))
+                    (b"" if su else struct.pack(">I", h.sim)) + (h.mods or b"\0"))
+        self.to(c, wire.header(ROOMS_END) + seq + bytes((len(rooms),)))
 
     def on_ldn(self, c, p, dst, sport, dport, now):
         """Local wireless's own messages: only the ones its protocol has, between the players they
@@ -888,7 +1031,7 @@ class Lobby:
                 self.to(m, out)
                 self.counts["game relayed"] += 1
 
-    # ---- matchmaking (SU) ---------------------------------------------------------------
+    # ---- matchmaking (SU, SN 3) -----------------------------------------------------------
     def on_match(self, c, op, sid, now):
         """MATCH: op 1 (or 2: for a rollback match) searches, sent again every 2 s while it waits or
         is matched (the answer says how it stands); op 0 cancels. sid: the search's id."""
@@ -939,16 +1082,16 @@ class Lobby:
             self.match_room(m, m.host.listing, now)
 
     def on_rb(self, c, p, now):
-        """A rollback message: to a player of its build and lobby code, or (destination 0, on a private
-        code only) to all of them. On the public code, only to the player of its rollback match or a
-        player of its room. Once one went each way between the two of a rollback match, they are
-        together."""
+        """A rollback message: to a player of its build and lobby code (SN 3: its key), or (destination
+        0, on a private code only) to all of them. On the public code (SU's "public", SN's "smash"),
+        only to the player of its rollback match or a player of its room. Once one went each way
+        between the two of a rollback match, they are together."""
         if not 16 < len(p) <= RB_MAX:
             self.drops["bad rollback"] += 1
             return
         dst = struct.unpack_from(">I", p, 12)[0]
         m = self.by_ip.get(dst) if dst else None
-        if c.code == SU_PUBLIC:
+        if c.code == (SU_PUBLIC if c.wire is self.su else V3_PUBLIC):
             room = self.network_of(c)
             if m is None or (m is not c.rb_peer and (room is None or m not in self.members(room))):
                 self.drops["rollback stranger"] += 1
@@ -963,7 +1106,7 @@ class Lobby:
         if not c.packets.take(now, len(to)) or not c.bytes.take(now, len(p) * len(to)):   # (every copy counts)
             self.drops["rate"] += 1
             return
-        out = su_header(SU_RB) + struct.pack(">I", c.ip) + p[16:]
+        out = (c.wire or self.sn).header(RB) + struct.pack(">I", c.ip) + p[16:]
         for x in to:
             self.to(x, out)
         self.counts["rollback relayed"] += len(to)
@@ -1011,8 +1154,8 @@ class Lobby:
 
     def match_send(self, c, now):
         """MATCH_STATE: search id u32, state u8, role u8, flags u8 (1: the host's room is open), the
-        other player's address u32 and name[32], then of its build and lobby code: players
-        searching u16, players u16; and the seconds waited u16."""
+        other player's address u32 and name[32], then of its build and lobby code (SN 3: its key):
+        players searching u16, players u16; and the seconds waited u16."""
         m, sid, role, flags, peer, name = c.match, c.search_id or 0, 0, 0, 0, b""
         if m is not None:
             o = m.other(c)
@@ -1028,7 +1171,7 @@ class Lobby:
             state = MS_IDLE
         since = m.at if m is not None else c.search_since
         waited = 0 if since is None else min(int(now - since), 0xFFFF)
-        self.to(c, su_header(SU_MATCH_STATE) + struct.pack(">IBBBI", sid & 0xFFFFFFFF, state, role, flags, peer) +
+        self.to(c, (c.wire or self.sn).header(MATCH_STATE) + struct.pack(">IBBBI", sid & 0xFFFFFFFF, state, role, flags, peer) +
                 name[:NAME_LEN].ljust(NAME_LEN, b"\0") +
                 struct.pack(">HHH", min(len(self.searching.get(c.part, ())), 0xFFFF), min(len(self.parts.get(c.part, ())), 0xFFFF), waited))
 
@@ -1106,7 +1249,7 @@ class Lobby:
 
     def sync(self, c, now, again=False):
         """Send c the players of its room (none: an empty list), when they changed (or again)."""
-        if not c.ext or self.by_addr.get((c.wire, c.at)) is not c:
+        if not c.ext or self.by_addr.get(((c.wire or self.sn).port, c.at)) is not c:
             return
         listing = self.network_of(c)
         peers = sorted((m for m in self.members(listing) if m is not c), key=lambda m: m.ip) if listing else []
@@ -1140,14 +1283,14 @@ class Lobby:
         if su:
             self.to(c, su_header(SU_PEERS) + struct.pack(">IB", c.peers_version, introduced) + entries)
         else:
-            self.to(c, header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
+            self.to(c, (c.wire or self.sn).header(PEERS) + struct.pack(">QIB", c.cookie, c.peers_version, len(peers)) + entries)
 
     # ---- the status page ----------------------------------------------------------------
     def status_json(self, now):
         """Counts only: never an address, a name, a lobby code or a build."""
         return json.dumps({"up": True, "players": len(self.by_addr) - self.pending, "rooms": len(self.listings),
                            "searching": sum(len(w) for w in self.searching.values()),
-                           "version": f"{LOBBY_VERSION} (protocols SN {PROTOCOL}, SU {SU_PROTOCOL})",
+                           "version": f"{LOBBY_VERSION} (protocols SN {PROTOCOL} and {V3}, SU {SU_PROTOCOL})",
                            "uptime_s": int(now - self.started)})
 
     async def status(self, reader, writer):
@@ -1206,7 +1349,8 @@ class Lobby:
         paths = sum(p.introduced_count for p in self.by_addr.values())
         direct = sum(min(p.direct_count, p.introduced_count) for p in self.by_addr.values())
         su = sum(1 for p in self.by_addr.values() if p.wire is self.su)
-        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {su} on SU) in {len(self.parts)} "
+        v3 = sum(1 for p in self.by_addr.values() if p.wire is self.sn3)
+        self.say(f"{n} player{'' if n == 1 else 's'} ({self.pending} connecting, {v3} on SN {V3}, {su} on SU) in {len(self.parts)} "
                  f"lobb{'y' if len(self.parts) == 1 else 'ies'}, {len(self.listings)} room{'' if len(self.listings) == 1 else 's'}, "
                  f"{sum(len(w) for w in self.searching.values())} searching, {len(self.matches)} matched; "
                  f"in {c['in packets'] / secs:.0f}/s {c['in bytes'] / secs / 1024:.1f} KB/s, "
