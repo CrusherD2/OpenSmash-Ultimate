@@ -143,7 +143,7 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
 #endif
     else wdp("  lock %s: free\n", name);
 }
-unsigned long nvn_front_present_tid(void);         /* nvn_gl.c */
+unsigned long nvn_front_present_tid(void);         /* nvn_front.c */
 static void wd_dump(double stall_s, LONG64 tries_since) {
     static struct { DWORD tid; ULONGLONG cpu0, cpu1, born; int prio, nfr; uint64_t pc[28]; } th[400];
     char path[2 * MAX_PATH], tb[48], ab[400];
@@ -284,7 +284,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
  * presents and the render thread, 10 return addresses each; the line is written when the next frame arrives, with the
  * length, where the render thread was in its present, whether a fight was near, the workers' queues, the page faults
  * and the CPU time of the process during the gap. Gaps while the window is minimised are not written. */
-unsigned long nvn_front_present_tid(void);         /* nvn_gl.c */
+unsigned long nvn_front_present_tid(void);         /* nvn_front.c */
 #ifndef _WIN32
 static void wd_stall_sample(char *out, size_t cap) { snprintf(out, cap, "    (no call stacks in the Linux build)\n"); }
 #else
@@ -388,7 +388,7 @@ static void wd_start(void) {
     if (g_wd_thread) SetThreadPriority(g_wd_thread, THREAD_PRIORITY_ABOVE_NORMAL);
     printf("nvn_vk_watchdog: on: a report of every thread (locks, waits, call stacks) is written to the log and to <exe>_freeze.txt when no frame reaches the window for %.0f s (SSBU_VK_WATCHDOG=<seconds>, 0 = off; SSBU_MINIDUMP=freeze: also a minidump from 5 s)\n", limit);
 }
-/* Session 13, TEST ONLY (SSBU_STACKS_AT=<seconds>, read in nvn_gl.c): the report of every thread once, with either renderer
+/* Session 13, TEST ONLY (SSBU_STACKS_AT=<seconds>, read in nvn_front.c): the report of every thread once, with either renderer
  * (found with it: why SSBU_RENDERER=gl stood still at its start). The Vulkan fields of the report are zero under OpenGL. */
 static DWORD WINAPI wd_once(void *a) { Sleep((DWORD)(uintptr_t)a * 1000); wd_dump(0, 0); return 0; }
 void nvn_vk_stacks_at(int seconds) { HANDLE h = CreateThread(NULL, 0, wd_once, (void *)(uintptr_t)seconds, 0, NULL); if (h) CloseHandle(h); }

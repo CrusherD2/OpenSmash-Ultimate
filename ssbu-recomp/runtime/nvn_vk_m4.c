@@ -2058,7 +2058,7 @@ static int cont_range_empty(uint64_t above, uint64_t control) {      /* 1: reada
     }
     return 1;
 }
-static int cont_stage(uint64_t control, uint64_t data, SSrc *o) {      /* as nvnProgramSetShaders reads a stage (nvn_gl.c prog_set_shaders): 0 vertex, 1 fragment, 2 compute, -1 none, -2 a stage this back end does not take */
+static int cont_stage(uint64_t control, uint64_t data, SSrc *o) {      /* as nvnProgramSetShaders reads a stage (nvn_front.c prog_set_shaders): 0 vertex, 1 fragment, 2 compute, -1 none, -2 a stage this back end does not take */
     static const int8_t stage_of_type[16] = {-1, 0, 3, 4, 2, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     uint32_t ctl[8];
     memset(o, 0, sizeof *o);
