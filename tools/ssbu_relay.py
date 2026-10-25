@@ -13,8 +13,9 @@ of its own for a private room (launchers\\Host SSBU Netplay.bat).
 
 ssbu-recomp's games join the same lobby on a port of their own (--su-port, 39500): their protocol
 is "SU" version 1 (ssbu-recomp/runtime/net_relay.c), with its own numbers and layouts, and the
-same rooms, limits, rates and timeouts. Players of the two protocols never share a room. Theirs
-also have a room browser, matchmaking and a rollback relay here. --status-port serves GET /status
+same rooms, limits, rates and timeouts (but datagrams as large as ssbu-recomp's lobby took:
+--su-max-data). Players of the two protocols never share a room. ssbu-recomp's games also have a
+room browser, matchmaking and a rollback relay here. --status-port serves GET /status
 (counts only: players, rooms, players searching) for the project's site.
 
     python3 ssbu_relay.py [--port 39420] [--su-port 39500] [--bind 0.0.0.0] [--verbose] [--banlist FILE]
@@ -293,7 +294,7 @@ def options(**overrides):
     port, the status page's (None: not served, 0: any free port)."""
     o = argparse.Namespace(port=DEFAULT_PORT, su_port=None, bind="0.0.0.0", verbose=False, banlist=None,
                            max_clients=2000, max_pending=1000, per_ip=8, gate_rate=5.0, gate_burst=20,
-                           packet_rate=600.0, byte_rate=400_000.0, max_data=1500,
+                           packet_rate=600.0, byte_rate=400_000.0, max_data=1500, su_max_data=1500 + NI_SIZE,
                            client_timeout=10.0, pending_timeout=3.0, listed_for=3.5, listing_timeout=10.0,
                            search_for=120.0, match_for=180.0, status_port=None, status_bind="127.0.0.1",
                            tick=1.0, stats=60.0)
@@ -565,7 +566,7 @@ class Lobby:
             return False
         c.seen = now
         size = len(p) - at - 12
-        if size > self.o.max_data:
+        if size > (self.o.su_max_data if c.wire is self.su else self.o.max_data):
             self.drops["too big"] += 1
             return False
         self.max_data = max(self.max_data, size)
@@ -1356,6 +1357,9 @@ def parse_args(argv=None, **defaults):
     a.add_argument("--packet-rate", type=float, default=d.packet_rate, help="a player's packets a second (default %(default)s)")
     a.add_argument("--byte-rate", type=float, default=d.byte_rate, help="a player's bytes a second (default %(default)s)")
     a.add_argument("--max-data", type=int, default=d.max_data, help="largest game datagram (default %(default)s)")
+    a.add_argument("--su-max-data", type=int, default=d.su_max_data,
+                   help="largest game datagram on SU: its LDN messages may carry a room's NetworkInfo "
+                        "(ssbu-recomp's lobby took that much; default %(default)s)")
     a.add_argument("--search-secs", dest="search_for", type=float, default=d.search_for,
                    help="matchmaking: a search without an opponent ends after this (default %(default)s)")
     a.add_argument("--match-secs", dest="match_for", type=float, default=d.match_for,

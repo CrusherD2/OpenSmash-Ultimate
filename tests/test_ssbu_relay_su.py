@@ -378,10 +378,16 @@ class Limits(SuTest):
         self.assertGreater(len(got), 10)
 
     def test_too_big_dropped(self):
+        """As in ssbu-recomp's lobby: a body (past its addresses and ports) of 1500 bytes and a
+        NetworkInfo at most, for LDN messages that carry one."""
+        self.assertEqual(self.server.lobby.o.su_max_data, 2652)
         host, session, (guest,) = self.room(1)
-        guest.data(host.ip, bytes(self.server.lobby.o.max_data + 1))
-        guest.data(host.ip, bytes(self.server.lobby.o.max_data))
-        self.assertEqual([len(p) for *_, p in host.datas()], [self.server.lobby.o.max_data])
+        guest.data(host.ip, bytes(2653))
+        guest.data(host.ip, bytes(2652))
+        self.assertEqual([len(p) for *_, p in host.datas()], [2652])
+        guest.bcast([], bytes(2653))
+        guest.bcast([], bytes(2652))
+        self.assertEqual([len(p) for *_, p in host.datas()], [2652])
 
 
 class Banning(SuTest):
@@ -814,6 +820,7 @@ class Rollback(SuTest):
         self.assertEqual(other.rbs() + a.rbs(0), [])
 
     def test_size_and_rate(self):
+        self.assertEqual(R.RB_MAX, 1500)   # (ssbu-recomp's lobby: 16 < length <= 1500, its header included)
         self.server.lobby.o.packet_rate = 20.0
         a, b = self.player(code="friends"), self.player(code="friends")
         a.send(R.SU_RB, struct.pack(">QI", a.cookie, b.ip))   # (no message)
@@ -842,6 +849,23 @@ class BothProtocols(SuTest):
         self.assertEqual(sn.datas(0.3), [])
         self.assertEqual(struct.unpack_from(">HH", sn.ping(), 12), (1, 1))   # (one player and one room here)
         self.assertEqual(struct.unpack_from(">HH", su.ping(), 12), (1, 0))
+
+    def test_data_caps(self):
+        """SU's larger cap is SU's only: WindowSmash's games keep 1500 bytes."""
+        host, guest = Player(self.server, name="Host").join(), Player(self.server, name="Guest").join()
+        self.addCleanup(host.close)
+        self.addCleanup(guest.close)
+        session = secrets.token_bytes(16)
+        host.advertise(session)
+        self.assertTrue(self.listed(session))
+        guest.ldn(host.ip, R.LM_JOIN, session + b"Guest".ljust(32, b"\0") + b"\0\0")
+        self.assertTrue(any(src == guest.ip for src, *_ in host.datas()), "the JOIN did not reach the host")
+        host.advertise(session, [guest.ip])
+        host.ldn(guest.ip, R.LM_ACCEPT, info_of(session, host.ip, [guest.ip]))
+        guest.recv(0.2)
+        guest.data(host.ip, bytes(1501))
+        guest.data(host.ip, bytes(1500))
+        self.assertEqual([len(p) for *_, p in host.datas()], [1500])
 
 
 class Status(SuTest):
