@@ -444,7 +444,7 @@ class RebuildTests(unittest.TestCase):
         self.assertEqual(files, {'game': None, 'keys': None, 'firmware': None, 'name': 'Me'})
 
     def test_online_name_in_config_folder(self):
-        """online_name.txt where the game reads it (runtime/config.h): config/ once the game has made it
+        """online_name.txt where the game reads it (runtime/config_folder.h): config/ once the game has made it
         (config/version.ini), else the folder itself; online_server.txt stays the folder's own."""
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(il, 'ROOT', tmp), \
                 unittest.mock.patch.object(il, 'detected_folders', lambda: {'game': None, 'keys': None, 'firmware': None}), \
@@ -603,7 +603,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('Playing offline (no lobby in online_server.txt).', r.stdout)
 
     def test_online_files_in_config_folder(self):
-        """Once the game has made config/ (runtime/config.h: its version.ini), online_name.txt is read
+        """Once the game has made config/ (runtime/config_folder.h: its version.ini), online_name.txt is read
         there; online_server.txt stays the port's own until there is one there."""
         (self.top / 'online_server.txt').write_text('lobby.example:39421 FRIENDS\n', newline='\n')
         (self.top / 'online_name.txt').write_text('Old Name\n', newline='\n')

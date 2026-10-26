@@ -17,7 +17,7 @@
 #include <string.h>
 
 #include "host.h"
-#include "config.h"
+#include "config_folder.h"
 #include "display.h"
 #include "gpu_menu.h"
 #include "gpu_overlay.h"

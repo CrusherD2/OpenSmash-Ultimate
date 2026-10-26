@@ -71,7 +71,7 @@ typedef int SOCKET;
 #include <stdlib.h>
 #include <string.h>
 
-#include "config.h"
+#include "config_folder.h"
 #include "host.h"
 #include "net.h"
 #include "settings.h"
@@ -931,7 +931,7 @@ static void printable(char *out, const u8 *p, int n) {   /* (out: n + 1 bytes) *
     for (int k = 0; k < n; k++) out[k] = p[k] && p[k] < 0x20 ? '?' : (char)p[k];
     out[n] = 0;
 }
-static void list_add(char *out, size_t n, const char *what) {   /* (", " between) */
+static void names_add(char *out, size_t n, const char *what) {   /* (", " between) */
     size_t t = strlen(out);
     snprintf(out + t, n - t, "%s%s", t ? ", " : "", what);
 }
@@ -976,13 +976,13 @@ static void room_why(const char *b, u32 sim, const Mod *m, int nm, char *out, si
     for (int i = 0; i < nm; i++) {
         int found = -1;
         for (int k = 0; k < no && found < 0; k++) if (!_stricmp(m[i].name, own[k].name)) found = k;
-        if (found < 0) list_add(missing, sizeof missing, m[i].name);
-        else if (own[found].hash != m[i].hash) list_add(other, sizeof other, m[i].name);
+        if (found < 0) names_add(missing, sizeof missing, m[i].name);
+        else if (own[found].hash != m[i].hash) names_add(other, sizeof other, m[i].name);
     }
     for (int k = 0; k < no; k++) {
         int found = 0;
         for (int i = 0; i < nm && !found; i++) found = !_stricmp(m[i].name, own[k].name);
-        if (!found) list_add(extra, sizeof extra, own[k].name);
+        if (!found) names_add(extra, sizeof extra, own[k].name);
     }
     line_add(out, n, "Mods you don't have: ", missing, "");
     line_add(out, n, "Another copy of: ", other, " (yours differs from the room's)");
@@ -1027,7 +1027,7 @@ static void rooms_info(const u8 *p, int n) {   /* (client thread) a ROOM_INFO's 
     int at = 11 + NAME_LEN + BUILD_LEN + 4, nm = mods_read(p + at, n - at, m, MODS_MAX);
     if (nm < 0) snprintf(r->mods, sizeof r->mods, "(unreadable)");
     r->nmods = nm < 0 ? 0 : nm;
-    for (int i = 0; i < r->nmods; i++) list_add(r->mods, sizeof r->mods, m[i].name);
+    for (int i = 0; i < r->nmods; i++) names_add(r->mods, sizeof r->mods, m[i].name);
     if (!r->joinable) room_why(r->build, r->sim, m, r->nmods, r->why, sizeof r->why);
 }
 

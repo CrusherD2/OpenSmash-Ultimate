@@ -412,7 +412,7 @@ class InstallerDecisionTests(unittest.TestCase):
             self.assertEqual(got[k].replace('\r\n', '\n'), want, k)
 
     def test_config_path(self):
-        """online_name.txt where the game reads it (runtime/config.h): config\\ once the game has made it."""
+        """online_name.txt where the game reads it (runtime/config_folder.h): config\\ once the game has made it."""
         with tempfile.TemporaryDirectory() as tmp:
             expr = (f"$r = '{tmp}'; @(foreach ($n in 'online_name.txt', 'online_server.txt') "
                     "{ (Get-ConfigPath $r $n).Substring($r.Length) })")
