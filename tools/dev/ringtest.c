@@ -136,7 +136,14 @@ static int as_at(u64 frame, char *why, size_t n) {
     KernelRange now[64];
     u32 k = kernel_writable_ranges(now, 64);
     if (s->frame != frame) { snprintf(why, n, "no bytes kept for frame %llu", (unsigned long long)frame); return 0; }
-    if (k != s->n || memcmp(now, s->r, k * sizeof *now)) { snprintf(why, n, "the memory map differs (%u ranges, %u then)", k, s->n); return 0; }
+    if (k != s->n) { snprintf(why, n, "the memory map differs (%u ranges, %u then)", k, s->n); return 0; }
+    /* (field by field: a KernelRange ends in padding no one sets, which memcmp would compare too) */
+    for (u32 i = 0; i < k; i++)
+        if (now[i].lo != s->r[i].lo || now[i].hi != s->r[i].hi || now[i].watched != s->r[i].watched) {
+            snprintf(why, n, "range %u is [%#llx, %#llx) watched %d, then [%#llx, %#llx) watched %d", i, (unsigned long long)now[i].lo,
+                     (unsigned long long)now[i].hi, now[i].watched, (unsigned long long)s->r[i].lo, (unsigned long long)s->r[i].hi, s->r[i].watched);
+            return 0;
+        }
     u64 at = 0;
     for (u32 i = 0; i < s->n; i++) {
         u64 size = s->r[i].hi - s->r[i].lo;
