@@ -566,5 +566,3 @@ void nvn_vk_selftest_hook(void) {
     fflush(stdout);
     ExitProcess(g_vk_errors || g_vk_skipped ? 1 : 0);
 }
-
-#include "nvn_vk_draw.c"                                   /* everything that draws (session 2): not a build unit of its own */

@@ -1,6 +1,6 @@
-/* What the files of the Vulkan back end share across translation units. nvn_vk.c is still one unit with the files it
- * includes (nvn_vk_draw.c, which includes nvn_vk_m4.c and the others); a file that is a unit of its own reaches them
- * through this header, which the unit includes where that file used to be included. */
+/* What the files of the Vulkan back end share. nvn_vk.c, nvn_vk_draw.c, nvn_vk_m4.c (with nvn_vk_prewarm.h), nvn_vk_menu.c,
+ * nvn_vk_flash.c, nvn_vk_wd.c and nvn_vk_store.c are each a build unit of their own: what one of them defines and another
+ * uses is declared here, everything else of a file is static. */
 #ifndef NVN_VK_INT_H
 #define NVN_VK_INT_H
 #include <stddef.h>

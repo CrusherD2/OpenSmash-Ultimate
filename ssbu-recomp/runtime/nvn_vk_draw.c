@@ -1,5 +1,5 @@
-/* NVN on Vulkan, the drawing part (session 2; design: plan\phases\V1_vulkan.md). Included at the end of nvn_vk.c: it uses
- * that file's device (V), loader functions and error helpers. Render thread only.
+/* NVN on Vulkan, the drawing part (session 2; design: plan\phases\V1_vulkan.md). A build unit of its own: it uses
+ * nvn_vk.c's device (V), loader functions and error helpers (nvn_vk_int.h). Render thread only.
  *
  * What is here: device features, a block allocator, the stream ring (guest memory -> one mapped buffer, at most one copy
  * of a range per batch), images and views made at first use from the front end's texture source, samplers, translated
@@ -9,6 +9,12 @@
  *
  * Debug: SSBU_VK_DEBUG=1 turns on the checks that stand in for the validation layer that is not installed (image used
  * after destroy, barrier inside a pass, a view of an image in an unexpected layout) and prints every new pipeline. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+#include "gfx_options.h"
+#include "nvn_vk_int.h"
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
