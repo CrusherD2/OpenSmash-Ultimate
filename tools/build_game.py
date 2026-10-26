@@ -48,7 +48,9 @@ the game files made is cleared first (reset_game_files); the save and the settin
   9. build     build/ssbu.exe (tools/recomp.py all), unless it is newer than everything it is
                made from and compiled for today's instruction set (tools/isa.py: avx2, or
                x86-64-v2 on a processor without AVX2; step 1 says which); --jobs defaults to what
-               the installed RAM allows: 4 under 16 GB, 8 with 16 GB, 16 with 32 GB or more
+               the installed RAM allows: 4 under 16 GB, 8 with 16 GB, 16 with 32 GB or more;
+               --game-dll links the game's modules into a library of their own beside the
+               program (build/ssbu_game.dll; tools/game_dll.py), which the program loads
 
 On Linux (what install-windowsmash.sh runs), step 1 checks clang, lld, bison and flex, the parts
 tools/linux/toolchain.py names, and a test link with SDL2, libopus and libvpx; step 9 builds
@@ -955,13 +957,23 @@ def write_version():
     log(f"  game version {data} (version.txt)")
 
 
-def build_is_current():
+def game_library():
+    """--game-dll's library, beside EXE (on macOS in the app's Frameworks): tools/game_dll.py."""
+    if MACOS:
+        return os.path.join(os.path.dirname(os.path.dirname(EXE)), "Frameworks", "ssbu_game.dylib")
+    return os.path.join(os.path.dirname(EXE), "ssbu_game.so" if LINUX else "ssbu_game.dll")
+
+
+def build_is_current(dll=False):
     """build/ssbu.exe is newer than the runtime, the tools and the modules it is built from, and
     has SDL3.dll beside it if SDL3 is there to build with (on Linux: build-linux/ssbu, also newer
     than the Linux runtime and tools; on macOS: build-mac/WindowSmash.app's program, also newer
     than the platform layers it is made with and the macOS tools, with SDL3.framework in the app). Not
-    on Windows and Linux when it was compiled for another instruction set than today's (tools/isa.py)."""
-    if not os.path.isfile(EXE):
+    on Windows and Linux when it was compiled for another instruction set than today's (tools/isa.py).
+    dll (--game-dll): with game_library(), which is newer than all of that too; without it, with
+    none (the builds remove it when they link the game into the program)."""
+    library = game_library()
+    if not os.path.isfile(EXE) or os.path.isfile(library) != dll:
         return False
     if not MACOS:
         import isa
@@ -986,7 +998,8 @@ def build_is_current():
     inputs += [os.path.join(EXEFS, n) for n in os.listdir(EXEFS)]
     nro = os.path.join(DUMP, "nro")
     inputs += [os.path.join(nro, n) for n in os.listdir(nro) if n.endswith(".nro")] if os.path.isdir(nro) else []
-    return os.path.getmtime(EXE) > max(os.path.getmtime(p) for p in inputs if os.path.isfile(p))
+    newest = max(os.path.getmtime(p) for p in inputs if os.path.isfile(p))
+    return os.path.getmtime(EXE) > newest and (not dll or os.path.getmtime(library) > newest)
 
 
 def installed_ram_gb():
@@ -1169,7 +1182,8 @@ def build(a):
     if a.prepare_only:
         log("  not now (--prepare-only): everything the build needs is ready")
         return
-    if build_is_current():
+    dll = getattr(a, "game_dll", False)
+    if build_is_current(dll):
         log(f"  {exe} is newer than everything it is built from: nothing to do (delete it to build again)")
     else:
         if in_use(EXE):
@@ -1182,9 +1196,9 @@ def build(a):
             jobs = jobs_for_ram(gb) if gb else 4
             log(f"  {jobs} jobs at a time, for {gb:.0f} GB of RAM" if gb else f"  {jobs} jobs at a time (the RAM size is unknown)")
         if LINUX:
-            build_linux_program(jobs)
+            build_linux_program(jobs, dll)
         elif MACOS:
-            build_mac_program(jobs)
+            build_mac_program(jobs, dll)
         else:
             import cc
             if not cc.SDL3_DLL:
@@ -1192,7 +1206,7 @@ def build(a):
             log("  the first build takes from 30 minutes to a few hours, later ones minutes unless the compiler, its flags or "
                 "runtime/recomp.h changed; if it stops, run this again to carry on")
             run([sys.executable, os.path.join("tools", "recomp.py"), "all", os.path.join("dump", "exefs"),
-                 "--out", "build", "--jobs", str(jobs)],
+                 "--out", "build", "--jobs", str(jobs), *(["--game-dll"] if dll else [])],
                 "The build failed (see above). If the PC ran out of memory, build with fewer jobs at a time: open "
                 "PowerShell in this folder and run  & \".\\launchers\\Build WindowSmash.bat\" --jobs 4")
     if LINUX:
@@ -1203,8 +1217,8 @@ def build(a):
         log("\nDone: build\\ssbu.exe is ready. Start the game with Play SSBU.bat.")
 
 
-def build_linux_program(jobs):
-    """build-linux/ssbu: the game's C generated into build/, then compiled and linked for Linux."""
+def build_linux_program(jobs, dll=False):
+    """build-linux/ssbu: the game's C generated into build/, then compiled and linked for Linux (dll: --game-dll)."""
     retry = (f"If the PC ran out of memory, build with fewer jobs at a time: bash install-windowsmash.sh --jobs "
              f"{max(1, jobs // 2)}")
     log("  the first build takes one to a few hours, later ones minutes unless the compiler, its flags or "
@@ -1224,13 +1238,14 @@ def build_linux_program(jobs):
             "vkd3d-shader could not be built (see above).")
     log("  compiling it for Linux:")
     run([sys.executable, os.path.join("tools", "linux", "build_linux.py"), "--port", ROOT, "--out", "build-linux",
-         "--jobs", str(jobs)],
+         "--jobs", str(jobs), *(["--game-dll"] if dll else [])],
         "The build failed (see above). " + retry)
 
 
-def build_mac_program(jobs):
+def build_mac_program(jobs, dll=False):
     """build-mac/WindowSmash.app: the game's C generated into build/, then compiled and linked for
-    macOS, with the Mac kept from sleeping while this runs (an idle Mac would stop the build)."""
+    macOS, with the Mac kept from sleeping while this runs (an idle Mac would stop the build). dll:
+    --game-dll."""
     rebuild = '"launchers/Build WindowSmash.command"'
     if not os.path.isfile(os.path.join(ROOT, "launchers", "Build WindowSmash.command")):
         rebuild = (os.path.relpath(sys.executable, ROOT) if sys.executable.startswith(ROOT + os.sep) else sys.executable) + \
@@ -1248,7 +1263,8 @@ def build_mac_program(jobs):
          "--jobs", str(jobs), "--generate-only"],
         "The game's code could not be turned into C (see above). " + retry)
     log("  compiling it for macOS:")
-    run([sys.executable, os.path.join("tools", "mac", "build_mac.py"), "--port", ROOT, "--jobs", str(jobs)],
+    run([sys.executable, os.path.join("tools", "mac", "build_mac.py"), "--port", ROOT, "--jobs", str(jobs),
+         *(["--game-dll"] if dll else [])],
         "The build failed (see above). " + retry)
 
 
@@ -1265,6 +1281,9 @@ def main():
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
+    ap.add_argument("--game-dll", action="store_true",
+                    help="link the game's modules into a library of their own beside the program, which the program "
+                         "loads at start, rather than into the program (tools/game_dll.py)")
     ap.add_argument("--check-ready", action="store_true",
                     help="only say (exit status 0) whether steps 3 to 8 are done, so that no game files are needed")
     a = ap.parse_args()
