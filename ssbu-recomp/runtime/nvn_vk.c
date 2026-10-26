@@ -30,9 +30,6 @@
 #endif
 #include "nvn_front.h"
 #include "gfx_options.h"
-static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
-static void vkd_init(void);
-static void vkd_shutdown(void);
 
 typedef char vk_min_check_properties[sizeof(VkPhysicalDeviceProperties) == 824 ? 1 : -1];
 typedef char vk_min_check_caps[sizeof(VkSurfaceCapabilitiesKHR) == 52 ? 1 : -1];
@@ -55,10 +52,10 @@ static void (VKAPI_PTR *vkDestroyDebugUtilsMessengerEXT)(VkInstance, VkDebugUtil
 
 /* ---------------------------------------------------------------- state (render thread only, except the counters) */
 struct VDevice V;                                       /* the members: nvn_vk_int.h */
-static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
+volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors; static volatile LONG64 g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
 
-static const char *vk_result_name(VkResult r) {
+const char *vk_result_name(VkResult r) {
     static char buf[32];
     switch (r) {
     case VK_SUCCESS: return "VK_SUCCESS"; case VK_NOT_READY: return "VK_NOT_READY"; case VK_TIMEOUT: return "VK_TIMEOUT"; case VK_INCOMPLETE: return "VK_INCOMPLETE";
@@ -69,9 +66,8 @@ static const char *vk_result_name(VkResult r) {
     snprintf(buf, sizeof buf, "VkResult %d", (int)r);
     return buf;
 }
-static void vkd_lost_report(void);                                    /* nvn_vk_draw.c (PR #32): what the driver and the markers say about the loss */
 static void vk_unavailable(void);
-static void vk_fatal(const char *what, VkResult r) {
+void vk_fatal(const char *what, VkResult r) {
     printf("nvn_vk: %s failed: %s\n", what, vk_result_name(r));
     fflush(stdout);
     if (r == VK_ERROR_DEVICE_LOST && V.device) vkd_lost_report();
@@ -87,7 +83,7 @@ static void vk_fatal(const char *what, VkResult r) {
     ExitProcess(5);
 }
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */
-static int vk_ok(const char *what, VkResult r) {
+int vk_ok(const char *what, VkResult r) {
     if (r == VK_SUCCESS) return 1;
     if (InterlockedIncrement64(&g_vk_errors) <= 20) { printf("nvn_vk: %s: %s\n", what, vk_result_name(r)); fflush(stdout); }
     return 0;
@@ -119,16 +115,15 @@ static VkBool32 VKAPI_PTR vk_debug_cb(VkFlags severity, VkFlags types, const VkD
     return VK_FALSE;
 }
 
-static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name) {
+int has_name(const VkExtensionProperties *e, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1;
     return 0;
 }
 
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
-static void menu_vk_views_drop(void);                  /* U1 (nvn_vk_menu.c): its views of the swapchain images */
-static int g_mu_shot_src;                               /* U1: the swapchain images can be read back (SSBU_MENU_TEST only) */
-static void swapchain_destroy(void) {
+int g_mu_shot_src;                                      /* U1: the swapchain images can be read back (SSBU_MENU_TEST only) */
+void swapchain_destroy(void) {
     if (!V.swapchain) return;
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
@@ -137,7 +132,7 @@ static void swapchain_destroy(void) {
     V.swapchain = NULL; V.image_count = 0;
 }
 /* Returns 0 when there is nothing to present to (a minimised window has a zero-sized surface). */
-static int swapchain_create(void) {
+int swapchain_create(void) {
     VkSurfaceCapabilitiesKHR caps;
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
@@ -181,7 +176,7 @@ static int swapchain_create(void) {
 }
 
 /* ---------------------------------------------------------------- start */
-static void *vk_sym(const char *name) {
+void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
     if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;

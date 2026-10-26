@@ -25,7 +25,7 @@ static struct {
 } g_mu;
 
 const char *nvn_vk_device_name(void) { return V.props.deviceName; }
-static void menu_vk_views_drop(void) {             /* nvn_vk.c swapchain_destroy: the device is idle, the swapchain is about to go */
+void menu_vk_views_drop(void) {                    /* nvn_vk.c swapchain_destroy: the device is idle, the swapchain is about to go */
     for (int i = 0; i < 16; i++) if (g_mu.views[i]) { vkDestroyImageView(V.device, g_mu.views[i], NULL); g_mu.views[i] = NULL; }
     g_mu.views_sc = NULL;
 }
@@ -169,7 +169,7 @@ static void mu_shot_write(void) {
     vkDestroyBuffer(V.device, g_mu.shot, NULL); vmem_free(g_mu.shot_mem); g_mu.shot = NULL;
     menu_shot_done(g_mu.shot_path, w, h, ok);
 }
-static void menu_vk_draw(uint32_t index) {
+void menu_vk_draw(uint32_t index) {
     if (!menu_enabled() || g_mu.failed) return;
     mu_shot_write();
     MenuDraw d;

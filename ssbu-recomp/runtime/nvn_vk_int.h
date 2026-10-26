@@ -285,6 +285,7 @@ extern struct VRender {
     LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
 } R;
 #define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fatal(#call, r_); } while (0)
+void ckpt_op(const char *what, uint64_t obj, int a, int b, int c);             /* PR #32, device loss report: a marker before a command that is not a draw */
 #define CKPT_OP(what, obj, a, b, c) do { if (D.has_ckpt) ckpt_op(what, (uint64_t)(uintptr_t)(obj), (int)(a), (int)(b), (int)(c)); } while (0)
 /* V_novids (2026-10-21): a GPU without VK_EXT_vertex_input_dynamic_state keeps its own pipeline list: its keys name a
  * vertex layout (nvk_vl_*), those of the other GPUs do not (the layout of pipes.bin and its keys are unchanged there).
@@ -330,6 +331,8 @@ typedef struct {
     VkPipelineVertexInputDivisorStateCreateInfoEXT di;
     VkPipelineVertexInputStateCreateInfo vi;
 } NvkVi;
+void nvk_vi_pipe(const void *key, VkDynamicState *dyn, VkGraphicsPipelineCreateInfo *gi, NvkVi *s);
+int nvk_vl_rec_ok(const void *key);                /* a key of the pipeline list whose layout is known (else it is not prewarmed) */
 #define NVK_VI_PIPE(k, dyn, gi) NvkVi nvk_vi_; nvk_vi_pipe(k, dyn, gi, &nvk_vi_);
 /* ---------------------------------------------------------------- nvn_vk_m4.c
  * The stages and the pipelines the workers make (VStage, PKey, Pipe), the freeze watchdog's wait registry (WdWait),
@@ -350,4 +353,116 @@ enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; PKEY_VI } PKey;
 typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+/* ---------------------------------------------------------------- what one file defines and the others use
+ * Each file's other functions and objects stay static. Under the name of the file that defines them, in its order. */
+/* nvn_vk.c */
+extern volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors;
+const char *vk_result_name(VkResult r);
+void vk_fatal(const char *what, VkResult r);
+int vk_ok(const char *what, VkResult r);
+void nvn_vk_missing(const char *what);
+int has_name(const VkExtensionProperties *e, uint32_t n, const char *name);
+extern int g_mu_shot_src;                               /* U1: the swapchain images can be read back (SSBU_MENU_TEST only) */
+void swapchain_destroy(void);
+int swapchain_create(void);
+void *vk_sym(const char *name);
+int nvn_vk_init(void *hwnd);
+void nvn_vk_report(FILE *out);
+/* nvn_vk_draw.c */
+void vkd_fail(const char *fmt, ...);
+int vk_gpl_mode(void);
+void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);
+VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls);
+void vmem_free(VMem m);
+VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem);
+extern LONG64 g_tm[12];
+extern LONG64 g_battle_frames;
+extern LONG64 g_fu_fr_n, g_fu_fr_linked, g_fu_fr_made, g_fu_fr_tk, g_fu_fr_newsig;
+VkFlags fmt_aspect(VkFormat f);
+extern LONG64 g_rs_stages, g_rs_fcs, g_rs_tf;
+float rs_scale(void);
+void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkImageLayout to);
+extern LONG64 g_ovl_presents, g_ovl_frames;             /* extra presents of a held loading screen; normal frames drawn with the thin bar */
+void vkd_lost_report(void);                             /* PR #32 (nvn_vk.c vk_fatal): what the driver and the markers say about the loss */
+void compute_pipe_make(VStage *v);
+int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth);
+void pkey_targets(PKey *k);
+void present_progress(float frac);                      /* session 11: the held loading screen presented again with the progress bar */
+void vkd_init(void);
+void vkd_shutdown(void);
+/* nvn_vk_m4.c, with nvn_vk_prewarm.h */
+extern CRITICAL_SECTION g_sh_lock;
+extern CONDITION_VARIABLE g_jq_cv;
+extern WdWait g_wd_wait[64];
+extern volatile LONG64 g_wd_beat;
+extern volatile LONG g_wd_where;
+extern volatile LONG g_pcsave_want;
+extern volatile LONG64 g_wd_try;
+extern VkPipelineCache g_pcache;
+extern LONG64 g_pipe_miss;
+VkResult pw_compute(const VkComputePipelineCreateInfo *info, VkPipeline *out);
+extern VStage *g_vstage[4096];
+extern uint32_t g_vstage_ids;
+extern LONG64 g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
+void hold_note(int what, LONG64 ticks);
+int holdlog_on(void);
+extern volatile LONG g_in_fight;
+extern volatile LONG64 g_fight_last;
+int fight_recent(void);
+extern LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
+const char *vkc_file(const char *name);
+extern uint64_t g_spv_unused;
+extern int g_offline;
+VkShaderModule module_from_glsl(int stage, const char *glsl, const char *what, uint64_t *spv_hash);
+extern LONG64 g_skip_frames, g_skip_fr_n;
+extern int g_skip_flag;
+VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo);
+extern Pipe *g_pipes[1024];
+VkBlendFactor blend_factor(unsigned f);
+VkBlendOp blend_op(unsigned e);
+extern CRITICAL_SECTION g_gpl_lock;
+extern DWORD g_vk_render_tid;
+extern LONG64 g_gpl_dlink;
+extern VkDescriptorSetLayout g_udl[2];
+void gpl_destroy(void);
+void piperec_append(const PKey *k, VStage *vs, VStage *fs, int compute);
+extern LONG64 g_pq_queued, g_pq_done, g_pq_running;
+extern int g_prep_state;
+extern HANDLE g_prep_thread;
+extern volatile LONG g_prep_urgent;
+extern LONG64 g_prep_fight_frames;
+extern int g_prep_nfiles, g_prep_read;
+extern int g_scan_on;
+extern struct VRtLog { int w, h, ncol, cf, df, lv; long long n, fight, first; } g_rtlog[256];      /* SSBU_VK_RTLOG=1: render-target sizes */
+extern int g_rtlog_n;
+Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs);
+int compute_pipe_ensure(VStage *v);
+extern HANDLE g_pw_thread[16];
+extern int g_pw_nthread;
+extern LONG64 g_bar_n, g_bar_timeout;
+void m4_barrier(LONG64 frame, LONG64 draws);
+void nvn_vk_program_set(Prog *prog);
+void prewarm_start(void);
+void scan_begin(Scan *s);
+void scan_list(uint64_t handle, int depth, Scan *s);
+void prewarm_wait(void);
+void m4_report(void);
+void m4_stop(void);
+extern char g_prep_marker[240];
+extern volatile LONG64 g_gap_prev, g_gap_max;
+extern int g_prep_limited;
+void pcache_save_at(int where, int marker);
+void pcache_save(void);
+extern int g_prep_marked;
+extern int g_prep_loadall;
+/* nvn_vk_menu.c */
+void menu_vk_views_drop(void);                          /* U1: its views of the swapchain images */
+void menu_vk_draw(uint32_t index);                      /* U1: the settings menu */
+/* nvn_vk_flash.c (session 13: the white-flash detector) */
+void fl_pass(int w, int h, int fmt, int win, int ncol, int depth);
+void fl_capture(VTex *vt, const int *s4, LONG64 frame, int layout_before);
+void fl_shutdown(void);
+/* nvn_vk_wd.c (session 12: the freeze watchdog) */
+void wd_start(void);
+void wd_stop(void);
 #endif

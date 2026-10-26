@@ -24,7 +24,6 @@ static PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
 static PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
-static void ckpt_op(const char *what, uint64_t obj, int a, int b, int c);      /* PR #32, device loss report: a marker before a command that is not a draw */
 
 struct VFeatures D;                                     /* the members: nvn_vk_int.h */
 static PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT;
@@ -37,7 +36,7 @@ static PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT;
 static PFN_vkCmdSetAlphaToCoverageEnableEXT vkCmdSetAlphaToCoverageEnableEXT;
 static PFN_vkCmdSetDepthClampEnableEXT vkCmdSetDepthClampEnableEXT;
 static PFN_vkCmdSetSampleMaskEXT vkCmdSetSampleMaskEXT;
-static void vkd_fail(const char *fmt, ...) {
+void vkd_fail(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); ExitProcess(6);
 }
 #define DBG_ASSERT(c, ...) do { if (D.debug && !(c)) vkd_fail(__VA_ARGS__); } while (0)
@@ -46,7 +45,7 @@ static void vkd_fail(const char *fmt, ...) {
 #ifndef VK_GPL_DEFAULT
 #define VK_GPL_DEFAULT 2                           /* session 11: on by default where the driver has the extension (validation run s11v3 and the first-run table of V1_vulkan.md "Session 11"); -DVK_GPL_DEFAULT=0 or SSBU_VK_GPL=0 for the old path */
 #endif
-static int vk_gpl_mode(void) {
+int vk_gpl_mode(void) {
     static int m = -1;
     if (m < 0) {
         const char *e = getenv("SSBU_VK_GPL");
@@ -60,7 +59,7 @@ static int vk_gpl_mode(void) {
 }
 
 /* ---------------------------------------------------------------- device features */
-static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
+void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext) {
     void **tail;
     vkGetPhysicalDeviceFeatures2 = vk_sym("vkGetPhysicalDeviceFeatures2");
     vkGetPhysicalDeviceFormatProperties = vk_sym("vkGetPhysicalDeviceFormatProperties");
@@ -141,7 +140,7 @@ typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; in
 static VBlock *g_blk[2048];
 static int g_nblk;
 static LONG64 g_mem_total, g_mem_leak;
-static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
+VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
     for (uint32_t i = 0; i < D.mp.memoryTypeCount && type == 32; i++) if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & want) == want) type = i;
@@ -182,7 +181,7 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     vkd_fail("allocation of %llu bytes failed in a fresh block", (unsigned long long)rq.size);
     return m;
 }
-static void vmem_free(VMem m) {
+void vmem_free(VMem m) {
     if (m.block < 0) return;
     VBlock *k = g_blk[m.block];
     if (--k->used == 0 && k->cls >= 100) { vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (LONG64)k->size; free(k); g_blk[m.block] = NULL; return; }
@@ -194,7 +193,7 @@ static void vmem_free(VMem m) {
     memmove(&k->fr[i + 1], &k->fr[i], sizeof k->fr[0] * (size_t)(k->nfree - i)); k->nfree++;
     k->fr[i].off = m.off; k->fr[i].size = m.size;
 }
-static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
+VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     VkBuffer b;
     VkMemoryRequirements rq;
@@ -230,7 +229,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 struct VRender R;                                       /* the members: nvn_vk_int.h */
 
 static void pass_end(void) { if (R.in_pass) { vkCmdEndRendering(R.cmd); R.in_pass = 0; CKPT_OP("pass end (w, h)", 0, R.pass_w, R.pass_h, 0); } }
-static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
+LONG64 g_tm[12];                                 /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* Session 5, SSBU_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
  * read when the buffer has finished; "nvn_vk_gpu:" line every 300 frames. The span of a buffer includes the time the GPU
@@ -244,7 +243,7 @@ static LONG64 g_ts_n;
 #define FRSTAT_N 40000
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_fight[FRSTAT_N];
-static LONG64 g_cur_frame, g_battle_frames;
+static LONG64 g_cur_frame; LONG64 g_battle_frames;
 /* Round 16 (P3 section 15), all test / switch code:
  * SSBU_VK_PASSTIME=1 (with SSBU_VK_GPUTIME=1): a timestamp at the start of every pass (and of every run of compute
  *   dispatches, and of the present blit); the time to the next mark of the same command buffer is that segment's GPU time.
@@ -267,7 +266,7 @@ static struct { int n, fight, last_what; uint8_t kind[PT_MAX]; LONG64 d0; } g_pt
  * pass signature) is drawn for the FIRST time is counted with what that cost; SSBU_VK_FIRSTLOG=1 prints a line per such
  * frame ("nvn_vk_first:"); the sums are printed at exit in any case. linked = made at this draw by a link of ready stage
  * libraries; made = compiled at the draw or waited for; newsig = the pass signature (render-target formats) was new. */
-static LONG64 g_fu_fr_n, g_fu_fr_linked, g_fu_fr_made, g_fu_fr_tk, g_fu_fr_newsig;
+LONG64 g_fu_fr_n, g_fu_fr_linked, g_fu_fr_made, g_fu_fr_tk, g_fu_fr_newsig;
 static LONG64 g_fu_frames, g_fu_total, g_fu_linked, g_fu_made, g_fu_newsig, g_fu_tk, g_fu_slow, g_fu_fight_frames, g_fu_fight_slow, g_fu_slow_tex;
 #define VK_SPLIT_DEFAULT 0
 static LONG64 g_tl_t0, g_tl_first, g_tl_last, g_tl_sum[8], g_tl_n;      /* sums: 0 first submission, 1 last submission, 2 present job, 3 fence waits (count), 4 fence wait ticks, 5 end of a fence wait after the batch start */
@@ -326,7 +325,6 @@ static void cmd_begin(void) {
     g_cmd_draws = 0;
     garbage_collect();
 }
-static volatile LONG g_in_fight;
 /* SSBU_VK_PASSTIME: a mark in the command buffer being recorded (see the comment at PT_MAX). */
 static void pt_mark(int w, int h, int ncol, int cf, int depth, int win, int what) {
     if (g_pt_on <= 0 || !R.recording) return;
@@ -424,7 +422,7 @@ static VkFormat tex_vkfmt(int nf, int *expand, int *decode) {
     }
     return VK_FORMAT_UNDEFINED;
 }
-static VkFlags fmt_aspect(VkFormat f) {
+VkFlags fmt_aspect(VkFormat f) {
     switch (f) {
     case VK_FORMAT_D16_UNORM: case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_D32_SFLOAT: return VK_IMAGE_ASPECT_DEPTH_BIT;
     case VK_FORMAT_S8_UINT: return VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -473,10 +471,10 @@ static VkFormat vertex_vkfmt(int nf) {
  * reads keep the game's sizes. Fragment stages are translated with MxIn.screen_scale (another hash: ssrc_hb). At 1.0 none
  * of this runs: every branch is behind RS_ON or VTex.rs / R.pass_rs, which are then 0. */
 static float g_rs = -1.0f;
-static LONG64 g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, g_rs_blits;
+static LONG64 g_rs_images; LONG64 g_rs_stages, g_rs_fcs, g_rs_tf; static LONG64 g_rs_up, g_rs_down, g_rs_blits;
 static LONG64 g_rs_bytes;                          /* PR #8 review: device memory taken by the scaled images made (reported at exit: what a scale above 1.0 costs) */
 #define RS_MAX 2.0f                                /* PR #8 (stephenjayakar): the upper limit of resolution_scale / SSBU_VK_SCALE (was 1.0; the PR's 4.0 capped at 2.0) */
-static float rs_scale(void) {
+float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SSBU_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
@@ -513,7 +511,7 @@ static VkFlags layout_access(VkImageLayout l) {
     default: return 0;
     }
 }
-static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkImageLayout to) {
+void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     DBG_ASSERT(!R.in_pass, "debug: an image layout change inside a render pass");
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = img;
@@ -711,7 +709,6 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 /* Session 8: textures made and read AHEAD of their first draw (tex_ahead, below), and what is still made at a draw. */
 static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_fight_n, g_late_fight_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
-static volatile LONG g_in_fight;                   /* nvn_vk_m4.c (included further down) */
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
@@ -796,10 +793,7 @@ static VTex *vt_get(Tex *t) { return vt_get2(t, 1); }
  * very large one can exceed it): the loading screen absorbs the work. Only compressed formats: they cannot be render
  * targets, so nothing the GPU is about to write is touched; if the game fills the memory later, the draw sees the change
  * (nvn_front_tex_changed) and reads it again, as before. SSBU_VK_TEXAHEAD=0 = as before (everything at the first draw). */
-static int fight_recent(void);                     /* nvn_vk_m4.c */
-static void present_progress(float frac);          /* session 11: the held loading screen presented again with the progress bar (defined above vk_present) */
-static LONG64 g_ovl_presents, g_ovl_frames;        /* extra presents of a held loading screen; normal frames drawn with the thin bar */
-static int holdlog_on(void);
+LONG64 g_ovl_presents, g_ovl_frames;               /* extra presents of a held loading screen; normal frames drawn with the thin bar */
 static void tex_ahead(LONG64 frame) {
     static int on = -1;
     static Tex *done_head;
@@ -952,8 +946,6 @@ static VkSampler sampler_get(const SamplerParams *p) {
     return s;
 }
 
-static void nvk_vi_pipe(const void *key, VkDynamicState *dyn, VkGraphicsPipelineCreateInfo *gi, NvkVi *s);
-static int nvk_vl_rec_ok(const void *key);         /* a key of the pipeline list whose layout is known (else it is not prewarmed) */
 #include "nvn_vk_m4.c"                             /* session 4: stages, pipelines, workers (M4) */
 #ifndef __APPLE__
 /* The layout table: 8192 slots, open addressing by number. Filled only by the render thread (vi_key) and at start
@@ -1007,12 +999,12 @@ static uint32_t nvk_vl_id(const NvkVl *l) {        /* render thread: the number 
     nvn_vk_missing("more than 6144 distinct vertex layouts without VK_EXT_vertex_input_dynamic_state");
     return 0;
 }
-static int nvk_vl_rec_ok(const void *key) { uint32_t id = nvk_vl_get(key); return D.has_vids || !id || nvk_vl_find(id) != NULL; }
+int nvk_vl_rec_ok(const void *key) { uint32_t id = nvk_vl_get(key); return D.has_vids || !id || nvk_vl_find(id) != NULL; }
 #else
-static int nvk_vl_rec_ok(const void *key) { (void)key; return 1; }
+int nvk_vl_rec_ok(const void *key) { (void)key; return 1; }
 #endif
 /* pipe_make without dynamic vertex input: the key's layout becomes the pipeline's; the strides come with the buffers */
-static void nvk_vi_pipe(const void *key, VkDynamicState *dyn, VkGraphicsPipelineCreateInfo *gi, NvkVi *s) {
+void nvk_vi_pipe(const void *key, VkDynamicState *dyn, VkGraphicsPipelineCreateInfo *gi, NvkVi *s) {
     static const NvkVl empty;
     uint32_t nvdd = 0;
     if (D.has_vids) return;
@@ -1332,7 +1324,6 @@ static VkImageView target_view(const TargetRef *r, VTex *vt) {
     if ((r->view.set & 0x84) == 0x84 && r->view.format) e.format = r->view.format;
     return vt_view(vt, &e, -1, 1);
 }
-static void fl_pass(int w, int h, int fmt, int win, int ncol, int depth);      /* nvn_vk_flash.c (session 13) */
 static int g_vk_test;                              /* session 13, TEST ONLY: SSBU_VK_TEST (see the dynamic state) */
 static int pass_begin(void) {
     VkRenderingAttachmentInfo ca[8], da;
@@ -1460,7 +1451,7 @@ static void ckpt_mark(int kind, unsigned prim, uint32_t count, uint32_t inst, ui
     } else d->prog = R.prog[5] ? R.prog[5]->serial : -1;
     vkCmdSetCheckpointNV(R.cmd, (void *)(uintptr_t)seq);
 }
-static void ckpt_op(const char *what, uint64_t obj, int a, int b, int c) {      /* through CKPT_OP (D.has_ckpt) */
+void ckpt_op(const char *what, uint64_t obj, int a, int b, int c) {             /* through CKPT_OP (D.has_ckpt) */
     if (!R.cmd) return;
     uint32_t seq = ++g_drec_seq;
     DrawRec *d = &g_drec[seq % DREC_N];
@@ -1481,7 +1472,7 @@ static void drec_print(const char *tag, uint32_t seq) {
     }
     printf("\n");
 }
-static void vkd_lost_report(void) {                /* nvn_vk.c vk_fatal: once, whichever thread lost the device first */
+void vkd_lost_report(void) {                       /* nvn_vk.c vk_fatal: once, whichever thread lost the device first */
     static volatile LONG once;
     if (InterlockedExchange(&once, 1)) return;
     printf("nvn_vk_lost: the device is lost; submissions made %llu, seen finished %llu\n", (unsigned long long)R.serial, (unsigned long long)R.done);
@@ -2334,7 +2325,6 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
     b->off = ring_put(addr, size); b->buf = R.ring;      /* in this order: a ring wrap submits */
     return 0;
 }
-static void compute_pipe_make(VStage *v);
 static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uint32_t gy, uint32_t gz);
 static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     Prog *p = R.prog[5];
@@ -2359,7 +2349,7 @@ static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     compute_dispatch_run(p, st, v, gx, gy, gz);
 }
-static void compute_pipe_make(VStage *v) {         /* any thread */
+void compute_pipe_make(VStage *v) {                /* any thread */
     {
         VkDescriptorSetLayoutBinding b0[40], b1[64];
         int n0 = 0, n1 = 0;
@@ -2714,7 +2704,7 @@ static int draw_prepare(unsigned prim) {
 
 /* The pass formats of a target set as the pipeline key holds them (also used by the look-ahead of nvn_vk_m4.c on targets
  * that are not bound yet). Returns 0 when one of the images does not exist yet. */
-static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth) {
+int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth) {
     int all = 1;
     k->ncolor = (uint8_t)ncol; k->samples = 1;
     for (int i = 0; i < ncol; i++) {
@@ -2729,7 +2719,7 @@ static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const Target
     if (depth->tex) { VTex *vt = depth->tex->vk; if (!vt) all = 0; else { k->dfmt = (int32_t)vt->fmt; k->samples = (uint8_t)vt->samples; } }
     return all;
 }
-static void pkey_targets(PKey *k) { pkey_targets_of(k, R.ncol, R.col, &R.depth); }
+void pkey_targets(PKey *k) { pkey_targets_of(k, R.ncol, R.col, &R.depth); }
 #if 0   /* session 3's form */
 static void pkey_targets(PKey *k) {
     k->ncolor = (uint8_t)R.ncol; k->samples = 1;
@@ -3260,7 +3250,6 @@ static void replay(uint64_t handle, int depth) {
 }
 
 /* ---------------------------------------------------------------- the RBackend members */
-static void prewarm_wait(void);
 static void vk_submit(void *arg) {
     SubmitJob *j = arg;
     if (!V.alive) return;                          /* after the shutdown at exit: the device is gone */
@@ -3466,7 +3455,6 @@ static void osk_draw(uint32_t index) {
     b.dstOffsets[0].x = d4[0]; b.dstOffsets[0].y = d4[1]; b.dstOffsets[1].x = d4[0] + d4[2]; b.dstOffsets[1].y = d4[1] + d4[3]; b.dstOffsets[1].z = 1;
     vkCmdBlitImage(R.cmd, g_osk.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
 }
-static void menu_vk_draw(uint32_t index);          /* U1: the settings menu (nvn_vk_menu.c, included below) */
 static void overlay_draw(uint32_t index) {
     osk_draw(index);
     menu_vk_draw(index);                           /* U1: over the keyboard; returns at once unless SSBU_MENU / graphics.ini menu = on */
@@ -3521,7 +3509,6 @@ static void vk_present2(void *arg, int progress);
  * made again at the next present (not in the middle of a frame's commands). */
 int display_present_defer(void); int display_present_due(void); void display_present_flushed(void); void display_present_done(int fight);      /* display.c */
 static struct { int on, suboptimal, fight, recreate; VkSwapchainKHR sc; uint32_t index; VkSemaphore rend; } g_pend;
-static volatile LONG64 g_gap_prev, g_gap_max, g_wd_beat;
 static void present_flush(void) {
     if (!g_pend.on) return;
     g_pend.on = 0;
@@ -3539,7 +3526,7 @@ void nvn_vk_present_flush_job(void *arg) { (void)arg; if (V.alive) present_flush
 #include "nvn_vk_menu.c"                          /* U1: the settings menu over the picture (menu.cpp builds it) */
 #include "nvn_vk_flash.c"                         /* session 13: the white-flash detector (fl_pass, fl_capture, fl_shutdown) */
 /* nvn_vk_m4.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
-static void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
+void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
 /* Session 14, THE FIRST-RUN PREPARATION (the owner's order: "all at the first launch, then never again, with a percentage").
  * graphics.ini shader_prepare = first_run (default) | background | off; SSBU_VK_PREPARE=<the same words> wins.
  * At the game's FIRST present of a start without the preparation's marker (first start on this GPU + driver + version of
@@ -4071,7 +4058,7 @@ static void pcache_save(void) {
 }
 #endif
 #include "nvn_vk_wd.c"                             /* session 12: the freeze watchdog (wd_start / wd_stop) */
-static void vkd_init(void) {
+void vkd_init(void) {
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)
 #undef X
@@ -4179,7 +4166,7 @@ static void frstat_report(void) {
         }
     }
 }
-static void vkd_shutdown(void) {
+void vkd_shutdown(void) {
     wd_stop();
     if (!R.ring) return;
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);

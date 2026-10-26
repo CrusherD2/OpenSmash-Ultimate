@@ -378,7 +378,7 @@ static DWORD WINAPI wd_main(void *arg) {
     }
     return 0;
 }
-static void wd_start(void) {
+void wd_start(void) {
     static double limit = 1.0;                      /* session 13: was 5 s; the owner's freezes left no report */
     const char *e = getenv("SSBU_VK_WATCHDOG");
     if (e) limit = atof(e);
@@ -392,7 +392,7 @@ static void wd_start(void) {
  * (found with it: why SSBU_RENDERER=gl stood still at its start). The Vulkan fields of the report are zero under OpenGL. */
 static DWORD WINAPI wd_once(void *a) { Sleep((DWORD)(uintptr_t)a * 1000); wd_dump(0, 0); return 0; }
 void nvn_vk_stacks_at(int seconds) { HANDLE h = CreateThread(NULL, 0, wd_once, (void *)(uintptr_t)seconds, 0, NULL); if (h) CloseHandle(h); }
-static void wd_stop(void) {
+void wd_stop(void) {
     g_wd_quit = 1;
     if (g_wd_thread) { WaitForSingleObject(g_wd_thread, 3000); CloseHandle(g_wd_thread); g_wd_thread = NULL; }
 }
