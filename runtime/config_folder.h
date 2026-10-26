@@ -21,6 +21,7 @@ enum ConfigFile {
     CONFIG_ONLINE_SERVER,   /* online_server.txt: config/'s once there is one, else the port's own */
     CONFIG_ONLINE_NAME,     /* online_name.txt */
     CONFIG_ONLINE_DIRECT,   /* online_direct.txt */
+    CONFIG_ONLINE_PROTOCOL, /* online_protocol.txt (net_relay.c: the netplay version) */
     CONFIG_FILES
 };
 
