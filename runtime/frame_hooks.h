@@ -23,8 +23,10 @@
 enum { FRAME_HOOK_END, FRAME_HOOK_LINE, FRAME_HOOK_POINTS };
 enum { FRAME_HOOKS_MAX = 8 };   /* registrations a point holds */
 
-/* The orders in use, lowest outermost. */
-enum { FRAME_ORDER_FIGHT_TEST = 200 };   /* (hle_fight_test.c) */
+/* The orders in use, lowest outermost. The rollback ring is outside the fight test, so that it
+ * saves the frame end's report as SSBU_DETERMINISTIC leaves it. */
+enum { FRAME_ORDER_ROLLBACK = 100,     /* (hle_rollback_ring.c) */
+       FRAME_ORDER_FIGHT_TEST = 200 };   /* (hle_fight_test.c) */
 
 typedef void FrameHookFn(Cpu *c, const u64 args[8], void *ctx);
 
