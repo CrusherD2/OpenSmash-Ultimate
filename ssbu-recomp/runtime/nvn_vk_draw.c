@@ -946,7 +946,6 @@ static VkSampler sampler_get(const SamplerParams *p) {
     return s;
 }
 
-#include "nvn_vk_m4.c"                             /* session 4: stages, pipelines, workers (M4) */
 #ifndef __APPLE__
 /* The layout table: 8192 slots, open addressing by number. Filled only by the render thread (vi_key) and at start
  * (nvk_vl_load); the workers read it (nvk_vi_pipe): a layout is written before its number, and a number reaches a worker

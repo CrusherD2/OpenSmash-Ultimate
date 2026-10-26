@@ -1,5 +1,5 @@
 /* Track V, session 4 (M4, design section 5): stages, pipelines and the worker threads that make them AHEAD of the draw.
- * Included by nvn_vk_draw.c (not a build unit of its own); replaces that file's "stages" and "pipelines" sections and its
+ * A build unit of its own; replaces nvn_vk_draw.c's "stages" and "pipelines" sections and its
  * start-up workers of session 3.
  *
  *   - nvnProgramSetShaders (guest thread) -> nvn_vk_program_set: a copy of the program's machine code goes to the worker
@@ -13,6 +13,12 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+#include "gfx_options.h"
+#include "nvn_vk_int.h"
 #define MX_VK_VERSION 6u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
@@ -2296,7 +2302,6 @@ char g_prep_marker[240];
 int g_prep_marked;
 int g_prep_loadall;                                 /* shader_load = start on a marked start: every container into memory before the first frame */
 volatile int g_store_pct;
-#include "nvn_vk_int.h"                           /* session 11: the container store made by the host from data.arc (nvn_vk_store.c) */
 static int prepfile_cmp(const void *a, const void *b) { const PrepFile *x = a, *y = b; return x->size < y->size ? 1 : x->size > y->size ? -1 : strcmp(x->name, y->name); }
 static void prep_line(const char *what) {
     PROCESS_MEMORY_COUNTERS_EX pm;
