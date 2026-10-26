@@ -59,6 +59,14 @@ void kernel_dump_threads(void);
 _Noreturn void rt_fatal(const char *fmt, ...);         /* message + guest backtrace, then exit */
 extern int rt_trace;
 extern const char *rt_data_dir;                        /* where the module images (and romfs.cfg) live */
+/* The game's three boot modules. The game's C defines them const; a --game-dll build
+ * (SSBU_GAME_DLL) has them in a library of its own, and host.c holds copies of its tables,
+ * filled in at load. */
+#ifdef SSBU_GAME_DLL
+extern RtModule rt_module_main, rt_module_subsdk0, rt_module_sdk;
+#else
+extern const RtModule rt_module_main, rt_module_subsdk0, rt_module_sdk;
+#endif
 u64 rt_load_nro(Cpu *c, u64 image);                     /* load the recompiled NRO; 0 if none matches */
 void account_save_id(u64 uid[2]);                       /* (hle_env.c) the id naming a user's save folder */
 
