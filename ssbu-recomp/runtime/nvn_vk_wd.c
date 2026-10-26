@@ -1,4 +1,4 @@
-/* nvn_vk_wd.c (session 12; included at the end of nvn_vk_draw.c: not a build unit of its own).
+/* nvn_vk_wd.c (session 12; a build unit of its own: what it shares with the rest of the back end is in nvn_vk_int.h).
  *
  * THE FREEZE WATCHDOG. On by default in the Vulkan renderer (SSBU_VK_WATCHDOG=0 off, =<seconds> another limit; default 5).
  * A thread looks twice a second at the time of the last frame that reached the window. When no frame was presented for the
@@ -15,6 +15,14 @@
  * to that folder instead of next to the exe.
  * It only reads: nothing is unblocked or killed. Threads are suspended one at a time for the few microseconds of the unwind;
  * nothing is printed or allocated while one is suspended. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <windows.h>
+#include <psapi.h>
+#include "hostrt.h"
+#include "nvn_vk_int.h"
 #include <tlhelp32.h>
 #ifndef _WIN32
 #include <dirent.h>
