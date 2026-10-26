@@ -13,17 +13,6 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
-typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
-typedef struct VStage {
-    uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
-    int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
-    uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly, temp;      /* fragonly (session 9): handed over by a program without a vertex stage */
-    VkPipeline cp; VkPipelineLayout cl; VkDescriptorSetLayout cdl[2];      /* compute stage: its pipeline */
-    uint32_t local[3];
-    VSmp smp[64];
-    VkShaderModule mod; struct VStage *next, *next_h;
-    VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
-} VStage;
 #define MX_VK_VERSION 6u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
@@ -33,7 +22,6 @@ static CRITICAL_SECTION g_sh_lock;
 static CONDITION_VARIABLE g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
 /* ---- Session 12: the freeze watchdog's wait registry (nvn_vk_wd.c writes the report). Every wait of ours that has no
  * time-out, and the long ones, are entered here with the function and line that waits; the report names them. */
-typedef struct { volatile LONG tid; const char *fn; int line; LONG64 since; } WdWait;
 static WdWait g_wd_wait[64];
 static volatile LONG64 g_wd_beat;                  /* QueryPerformanceCounter of the last present (normal or progress bar) */
 static volatile LONG g_wd_where;                   /* the render thread's place in a present (1 barrier, 2 acquire, 4 present) */
@@ -55,7 +43,6 @@ static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
 static uint32_t g_vstage_ids;
 static int (*g_glsl_to_spirv)(int, const char *, uint32_t **, size_t *, char *, size_t);
 static void (*g_spirv_free)(uint32_t *);
-enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
 static LONG64 g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
 static LONG64 g_w_progs, g_w_stages, g_w_pipes, g_pred_made, g_pred_used, g_set_held, g_set_held_tk;
 static void hold_note(int what, LONG64 ticks) { g_hold_n[what]++; g_hold_tk[what] += ticks; if (ticks > g_hold_max) g_hold_max = ticks; }
@@ -93,13 +80,6 @@ static const char *vkc_file(const char *name) { static char p[4][260]; static LO
 static void compute_pipe_make(VStage *v);
 static uint64_t g_spv_unused;
 static int g_offline;                              /* --prepare-shaders: stages are translated and written to ..\cache\vk, no Vulkan device exists */
-static PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT;
-static PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT;
-static PFN_vkCmdSetColorWriteMaskEXT vkCmdSetColorWriteMaskEXT;
-static PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT;
-static PFN_vkCmdSetAlphaToCoverageEnableEXT vkCmdSetAlphaToCoverageEnableEXT;
-static PFN_vkCmdSetDepthClampEnableEXT vkCmdSetDepthClampEnableEXT;
-static PFN_vkCmdSetSampleMaskEXT vkCmdSetSampleMaskEXT;
 
 /* ---------------------------------------------------------------- stages: machine code -> Vulkan GLSL -> SPIR-V -> module */
 static int ssrc_of(SSrc *o, const Prog *p, int s) {
@@ -336,8 +316,6 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
 }
 
 /* ---------------------------------------------------------------- pipelines */
-typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; PKEY_VI } PKey;
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static void pkey_targets(PKey *k);
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth);
@@ -1688,7 +1666,6 @@ static void prewarm_start(void) {
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a fight) is spread over all cores instead of done one by one at the draws.
  * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);

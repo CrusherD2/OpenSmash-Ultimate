@@ -30,7 +30,6 @@
 #endif
 #include "nvn_front.h"
 #include "gfx_options.h"
-#define P(a) ((void *)(uintptr_t)(a))                     /* guest addresses are host addresses (as in nvn_gl.c) */
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
 static void vkd_init(void);
 static void vkd_shutdown(void);

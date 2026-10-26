@@ -24,25 +24,19 @@ static PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
 static PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
-#define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fatal(#call, r_); } while (0)
 static void ckpt_op(const char *what, uint64_t obj, int a, int b, int c);      /* PR #32, device loss report: a marker before a command that is not a draw */
-#define CKPT_OP(what, obj, a, b, c) do { if (D.has_ckpt) ckpt_op(what, (uint64_t)(uintptr_t)(obj), (int)(a), (int)(b), (int)(c)); } while (0)
 
 struct VFeatures D;                                     /* the members: nvn_vk_int.h */
-/* V_novids (2026-10-21): a GPU without VK_EXT_vertex_input_dynamic_state keeps its own pipeline list: its keys name a
- * vertex layout (nvk_vl_*), those of the other GPUs do not (the layout of pipes.bin and its keys are unchanged there).
- * macOS keeps the layout inside the key (MAC2) and its pipes.bin. */
-#ifdef __APPLE__
-#define VK_PIPES_NOVI "pipes.bin"
-#define VK_VL_FILE "the keys themselves"
-#else
-#define VK_PIPES_NOVI "pipes_novi.bin"
-#define VK_VL_FILE "vi_layouts.bin"
-#endif
-#define VK_PIPES_BIN (D.has_vids ? "pipes.bin" : VK_PIPES_NOVI)
 static PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT;
 static PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV;
 static PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV;
+static PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT;
+static PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT;
+static PFN_vkCmdSetColorWriteMaskEXT vkCmdSetColorWriteMaskEXT;
+static PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT;
+static PFN_vkCmdSetAlphaToCoverageEnableEXT vkCmdSetAlphaToCoverageEnableEXT;
+static PFN_vkCmdSetDepthClampEnableEXT vkCmdSetDepthClampEnableEXT;
+static PFN_vkCmdSetSampleMaskEXT vkCmdSetSampleMaskEXT;
 static void vkd_fail(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); ExitProcess(6);
 }
@@ -471,14 +465,6 @@ static VkFormat vertex_vkfmt(int nf) {
 }
 
 /* ---------------------------------------------------------------- images */
-typedef struct VView { EView e; int vtype, attach; VkImageView view; struct VView *next; } VView;
-struct VTex {
-    uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
-    int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
-    int rs; float sx, sy;                          /* track O: rs = 1 when the image is scaled from the game's texture, smaller or larger (w, h are the image's; sx, sy = image / game; PR #8) */
-    VView *views; VTex *next, *prev;
-    VTex *shadow; int shadow_ok;                   /* 2026-10-21 (AMD render bugs): a copy of this depth target for the shaders that sample it while it is bound (depth_copy_on) */
-};
 /* ---- Track O: internal resolution scale (graphics.ini resolution_scale; SSBU_VK_SCALE wins; plan\phases\O1_options.md, session 7).
  * A texture of the screen class (2D, one layer, attachable, the game's size exactly 1920x1080 >> k, k = 0..6) gets an image
  * of round(size * scale); everything the game says in ITS pixels about such an image is converted where it is used:
@@ -503,7 +489,6 @@ static float rs_scale(void) {
     }
     return g_rs;
 }
-#define RS_ON (rs_scale() != 1.0f)
 static int rs_screen_class(int w, int h) { for (int k = 0; k < 7; k++) if (w == 1920 >> k && h == 1080 >> k) return 1; return 0; }
 /* A coordinate of the game's grid on a scaled image (nearest image texel edge, inside 0..max). */
 static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s + 0.5f); return r < 0 ? 0 : r > max ? max : r; }
@@ -880,7 +865,6 @@ static void eview_of(Tex *t, VTex *vt, const View *v, EView *e) {
     if (e->target == 8 && e->nlay != 6) e->target = e->nlay == 1 ? 1 : 4;
     if (e->target == 9 && e->nlay % 6) e->target = 4;
 }
-enum { DIM_1D, DIM_2D, DIM_3D, DIM_CUBE, DIM_1DA, DIM_2DA, DIM_CUBEA };
 static const VkImageViewType k_vtype[7] = {VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_VIEW_TYPE_1D_ARRAY, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY};
 static int target_dim(int target) { static const int m[10] = {DIM_1D, DIM_2D, DIM_3D, DIM_1DA, DIM_2DA, DIM_2D, DIM_2DA, DIM_2D, DIM_CUBE, DIM_CUBEA}; return target >= 0 && target < 10 ? m[target] : DIM_2D; }
 /* dim < 0: an attachment view (one level, one layer, both aspects, no swizzle). */
@@ -968,32 +952,8 @@ static VkSampler sampler_get(const SamplerParams *p) {
     return s;
 }
 
-/* MAC2 / V_novids (2026-10-21). A GPU without VK_EXT_vertex_input_dynamic_state (MoltenVK; an RX 550 / Polaris on AMD's
- * Windows driver): the vertex layout of a draw (per location: format, binding, offset; per binding: instance rate,
- * divisor) is part of the pipeline, the strides stay dynamic (VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, Vulkan 1.3).
- * Where the layout lives in the key:
- *   - macOS: inside it (PKEY_VI = NvkVl vi: the MAC2 fields under one name, the same bytes), in pipes.bin as before;
- *   - elsewhere: the three pad bytes of the key hold the NUMBER of the layout (nvk_vl_id: 24 bits of a hash of the
- *     layout, the next free number on a collision), the layouts are in ../cache/vk/vi_layouts.bin, the keys in
- *     pipes_novi.bin. On a GPU that has the extension the pad bytes stay zero: PKey, pipes.bin and the prepared markers
- *     are those of before, to the byte. nvn_vk_m4.c only names PKEY_VI / NVK_VI_PIPE / VK_PIPES_BIN / nvk_vl_rec_ok on
- *     lines it already had (its WD_SLEEP uses __LINE__). */
-typedef struct { uint32_t na, nb, rate; uint32_t loc[16], fmt[16], bind[16], off[16], div[17]; } NvkVl;
-#ifdef __APPLE__
-#define PKEY_VI NvkVl vi;
-#else
-#define PKEY_VI
-#endif
-typedef struct {
-    VkVertexInputBindingDescription b[17];
-    VkVertexInputAttributeDescription a[16];
-    VkVertexInputBindingDivisorDescriptionEXT dd[17];
-    VkPipelineVertexInputDivisorStateCreateInfoEXT di;
-    VkPipelineVertexInputStateCreateInfo vi;
-} NvkVi;
 static void nvk_vi_pipe(const void *key, VkDynamicState *dyn, VkGraphicsPipelineCreateInfo *gi, NvkVi *s);
 static int nvk_vl_rec_ok(const void *key);         /* a key of the pipeline list whose layout is known (else it is not prewarmed) */
-#define NVK_VI_PIPE(k, dyn, gi) NvkVi nvk_vi_; nvk_vi_pipe(k, dyn, gi, &nvk_vi_);
 #include "nvn_vk_m4.c"                             /* session 4: stages, pipelines, workers (M4) */
 #ifndef __APPLE__
 /* The layout table: 8192 slots, open addressing by number. Filled only by the render thread (vi_key) and at start

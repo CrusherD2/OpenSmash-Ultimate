@@ -229,6 +229,7 @@ extern struct VDevice {
     VkFence fence;
     int fence_pending, alive, validate;
 } V;
+#define P(a) ((void *)(uintptr_t)(a))                     /* guest addresses are host addresses (as in nvn_gl.c) */
 /* ---------------------------------------------------------------- nvn_vk_draw.c
  * D: the features and extensions of the device (vkd_device_info). R: the drawing part's state: the command buffers in
  * flight, the stream ring, the pass, the NVN state as the commands so far left it. */
@@ -283,4 +284,70 @@ extern struct VRender {
     LONG64 sets_reused, tset_collisions, dummy_kind;
     LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
 } R;
+#define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fatal(#call, r_); } while (0)
+#define CKPT_OP(what, obj, a, b, c) do { if (D.has_ckpt) ckpt_op(what, (uint64_t)(uintptr_t)(obj), (int)(a), (int)(b), (int)(c)); } while (0)
+/* V_novids (2026-10-21): a GPU without VK_EXT_vertex_input_dynamic_state keeps its own pipeline list: its keys name a
+ * vertex layout (nvk_vl_*), those of the other GPUs do not (the layout of pipes.bin and its keys are unchanged there).
+ * macOS keeps the layout inside the key (MAC2) and its pipes.bin. */
+#ifdef __APPLE__
+#define VK_PIPES_NOVI "pipes.bin"
+#define VK_VL_FILE "the keys themselves"
+#else
+#define VK_PIPES_NOVI "pipes_novi.bin"
+#define VK_VL_FILE "vi_layouts.bin"
+#endif
+#define VK_PIPES_BIN (D.has_vids ? "pipes.bin" : VK_PIPES_NOVI)
+typedef struct VView { EView e; int vtype, attach; VkImageView view; struct VView *next; } VView;
+struct VTex {
+    uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
+    int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
+    int rs; float sx, sy;                          /* track O: rs = 1 when the image is scaled from the game's texture, smaller or larger (w, h are the image's; sx, sy = image / game; PR #8) */
+    VView *views; VTex *next, *prev;
+    VTex *shadow; int shadow_ok;                   /* 2026-10-21 (AMD render bugs): a copy of this depth target for the shaders that sample it while it is bound (depth_copy_on) */
+};
+#define RS_ON (rs_scale() != 1.0f)
+enum { DIM_1D, DIM_2D, DIM_3D, DIM_CUBE, DIM_1DA, DIM_2DA, DIM_CUBEA };
+/* MAC2 / V_novids (2026-10-21). A GPU without VK_EXT_vertex_input_dynamic_state (MoltenVK; an RX 550 / Polaris on AMD's
+ * Windows driver): the vertex layout of a draw (per location: format, binding, offset; per binding: instance rate,
+ * divisor) is part of the pipeline, the strides stay dynamic (VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, Vulkan 1.3).
+ * Where the layout lives in the key:
+ *   - macOS: inside it (PKEY_VI = NvkVl vi: the MAC2 fields under one name, the same bytes), in pipes.bin as before;
+ *   - elsewhere: the three pad bytes of the key hold the NUMBER of the layout (nvk_vl_id: 24 bits of a hash of the
+ *     layout, the next free number on a collision), the layouts are in ../cache/vk/vi_layouts.bin, the keys in
+ *     pipes_novi.bin. On a GPU that has the extension the pad bytes stay zero: PKey, pipes.bin and the prepared markers
+ *     are those of before, to the byte. nvn_vk_m4.c only names PKEY_VI / NVK_VI_PIPE / VK_PIPES_BIN / nvk_vl_rec_ok on
+ *     lines it already had (its WD_SLEEP uses __LINE__). */
+typedef struct { uint32_t na, nb, rate; uint32_t loc[16], fmt[16], bind[16], off[16], div[17]; } NvkVl;
+#ifdef __APPLE__
+#define PKEY_VI NvkVl vi;
+#else
+#define PKEY_VI
+#endif
+typedef struct {
+    VkVertexInputBindingDescription b[17];
+    VkVertexInputAttributeDescription a[16];
+    VkVertexInputBindingDivisorDescriptionEXT dd[17];
+    VkPipelineVertexInputDivisorStateCreateInfoEXT di;
+    VkPipelineVertexInputStateCreateInfo vi;
+} NvkVi;
+#define NVK_VI_PIPE(k, dyn, gi) NvkVi nvk_vi_; nvk_vi_pipe(k, dyn, gi, &nvk_vi_);
+/* ---------------------------------------------------------------- nvn_vk_m4.c
+ * The stages and the pipelines the workers make (VStage, PKey, Pipe), the freeze watchdog's wait registry (WdWait),
+ * the kinds of hold (H_*) and the look-ahead over a command list (Scan). */
+typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
+typedef struct VStage {
+    uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
+    int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
+    uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly, temp;      /* fragonly (session 9): handed over by a program without a vertex stage */
+    VkPipeline cp; VkPipelineLayout cl; VkDescriptorSetLayout cdl[2];      /* compute stage: its pipeline */
+    uint32_t local[3];
+    VSmp smp[64];
+    VkShaderModule mod; struct VStage *next, *next_h;
+    VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
+} VStage;
+typedef struct { volatile LONG tid; const char *fn; int line; LONG64 since; } WdWait;
+enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
+typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; PKEY_VI } PKey;
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
 #endif
