@@ -37,15 +37,15 @@
  * then send the room's traffic straight to each other where their routers let them (UDP hole
  * punching), through the lobby where not. See "direct connections" below.
  *
- * Protocol 3 (SSBU_NET_PROTOCOL=3, net.h), the online lobby's: version 2 and more, on the same
- * port; tools/ssbu_relay.py's comment has every message. The client's JOIN adds this game's
- * simulation version (sim_version.h) and mod set; WELCOME's flags say what the lobby has (4 the
- * room browser, 8 matchmaking, 16 rollback); PONG adds two counts. Every packet of the client is
- * then of version 3, to the lobby and to the other players alike (two games of version 3 talk in
- * version 3: a lobby of version 3 puts players of version 2 and 3 in rooms of their own). A lobby
- * or relay of version 2 answers a JOIN of version 3 with REJECT reason 2: the client then joins it
- * in version 2, as a game of version 2 does. A private room's relay (below) speaks version 2 only,
- * so the host's own game joins it in version 2. */
+ * Protocol 3 (SSBU_NET_PROTOCOL=3 or online_protocol.txt, net.h), the online lobby's: version 2
+ * and more, on the same port; tools/ssbu_relay.py's comment has every message. The client's JOIN
+ * adds this game's simulation version (sim_version.h) and mod set; WELCOME's flags say what the
+ * lobby has (4 the room browser, 8 matchmaking, 16 rollback); PONG adds two counts. Every packet
+ * of the client is then of version 3, to the lobby and to the other players alike (two games of
+ * version 3 talk in version 3: a lobby of version 3 puts players of version 2 and 3 in rooms of
+ * their own). A lobby or relay of version 2 answers a JOIN of version 3 with REJECT reason 2: the
+ * client then joins it in version 2, as a game of version 2 does. A private room's relay (below)
+ * speaks version 2 only, so the host's own game joins it in version 2. */
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_RAND_S
 #define COBJMACROS
@@ -187,6 +187,16 @@ static void configure_from_files(void) {
     if (!getenv("SSBU_NET_DIRECT") && settings_line_read(config_path(CONFIG_ONLINE_DIRECT), line, sizeof line) && !_strnicmp(line, "off", 3)) direct_ok = 0;
 }
 
+/* online_protocol.txt (the settings menu's Online > Netplay version): 3 or 2, the version to ask for
+ * first; anything else, or no file: otherwise. Read with any lobby, as SSBU_NET_PROTOCOL is: the
+ * macOS and Linux launchers name the lobby in SSBU_NET_RELAY. */
+static int protocol_from_file(int otherwise) {
+    char line[16];
+    if (!settings_line_read(config_path(CONFIG_ONLINE_PROTOCOL), line, sizeof line)) return otherwise;
+    int v = atoi(line);
+    return v == NET_PROTOCOL || v == NET_PROTOCOL_V3 ? v : otherwise;
+}
+
 static void configure(void) {
     if (configured >= 0) return;
     const char *h = getenv("SSBU_NET_HOST"), *r = getenv("SSBU_NET_RELAY"), *v;
@@ -196,10 +206,6 @@ static void configure(void) {
     if ((v = getenv("SSBU_NET_NAME")) && *v) snprintf(name, sizeof name, "%s", v);
     if ((v = getenv("SSBU_NET_LOG"))) logging = atoi(v) > 0 ? atoi(v) : 1;
     if ((v = getenv("SSBU_NET_DIRECT")) && !strcmp(v, "0")) direct_ok = 0;
-    proto_wanted = NET_PROTOCOL_DEFAULT;   /* SSBU_NET_PROTOCOL=2|3; hosting: its own relay's, 2 */
-    if ((v = getenv("SSBU_NET_PROTOCOL")) && (atoi(v) == NET_PROTOCOL || atoi(v) == NET_PROTOCOL_V3)) proto_wanted = atoi(v);
-    if (hosting) proto_wanted = NET_PROTOCOL;
-    proto = proto_wanted;
     /* (tests) SSBU_NET_TEST_NAT=1: let in direct packets only from addresses sent to lately, as a
      * router does; SSBU_NET_TEST_BLOCK=<seconds after the game started>: drop every direct packet
      * from then on, as if a firewall closed the path (0: from the start, as a symmetric NAT) */
@@ -212,6 +218,11 @@ static void configure(void) {
     else if (r && *r) { if (_stricmp(r, "off")) snprintf(relay_text, sizeof relay_text, "%s", r); }
     else if (settings_online()) configure_from_files();
     configured = hosting || relay_text[0];
+    proto_wanted = NET_PROTOCOL_DEFAULT;   /* SSBU_NET_PROTOCOL=2|3, else online_protocol.txt's; hosting: its own relay's, 2 */
+    if ((v = getenv("SSBU_NET_PROTOCOL")) && (atoi(v) == NET_PROTOCOL || atoi(v) == NET_PROTOCOL_V3)) proto_wanted = atoi(v);
+    else if (configured && !hosting) proto_wanted = protocol_from_file(proto_wanted);
+    if (hosting) proto_wanted = NET_PROTOCOL;
+    proto = proto_wanted;
 }
 
 static void start(void);
@@ -503,6 +514,8 @@ static int fell_back;                                     /* a relay of version 
 static char reject_text[80], member_names[ROOM_MEMBERS][NAME_LEN + 1];
 
 u32 net_local_ip(void) { start(); return joined ? my_ip : 0; }
+int net_protocol_wanted(void) { configure(); return proto_wanted; }
+int net_protocol_spoken(void) { start(); return joined ? (int)proto : 0; }
 int net_unreachable(void) { start(); return configured && !joined && now_ms() - unjoined_since > UNREACHABLE_MS; }
 int net_lobby(void) { start(); return joined && lobby; }
 
@@ -960,10 +973,12 @@ static int mods_read(const u8 *p, int n, Mod *out, int max) {
 }
 
 /* Why this game cannot join a room whose game is of build b, simulation version sim and mods m:
- * the first that differs of the build, the simulation version and the mods (by name). */
-static void room_why(const char *b, u32 sim, const Mod *m, int nm, char *out, size_t n) {
+ * the first that differs of the build, the simulation version and the mods (by name); which one
+ * in *kind (NET_WHY_*). */
+static void room_why(const char *b, u32 sim, const Mod *m, int nm, char *out, size_t n, int *kind) {
     const char *mine = rt_module_main.build_id ? rt_module_main.build_id : "";
     out[0] = 0;
+    *kind = _stricmp(b, mine) ? NET_WHY_BUILD : sim != SIM_VERSION ? NET_WHY_SIM : NET_WHY_MODS;
     if (_stricmp(b, mine)) { snprintf(out, n, "Another version of the game: this room's is build %.8s, yours %.8s", b, mine); return; }
     if (sim != SIM_VERSION) {
         snprintf(out, n, "Another version of WindowSmash: this room's simulation version is %u, yours %u (the older one needs updating)",
@@ -1028,7 +1043,7 @@ static void rooms_info(const u8 *p, int n) {   /* (client thread) a ROOM_INFO's 
     if (nm < 0) snprintf(r->mods, sizeof r->mods, "(unreadable)");
     r->nmods = nm < 0 ? 0 : nm;
     for (int i = 0; i < r->nmods; i++) names_add(r->mods, sizeof r->mods, m[i].name);
-    if (!r->joinable) room_why(r->build, r->sim, m, r->nmods, r->why, sizeof r->why);
+    if (!r->joinable) room_why(r->build, r->sim, m, r->nmods, r->why, sizeof r->why, &r->why_kind);
 }
 
 static void rooms_end(const u8 *p, int n) {   /* (client thread) a ROOMS_END's body */
