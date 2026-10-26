@@ -36,8 +36,10 @@ static HANDLE g_wd_thread;
 static FILE *g_wd_fp;
 static DWORD g_wd_main_tid;
 typedef struct { uint32_t rva; char name[68]; } WdSym;
+#ifdef _WIN32                                      /* the exe's map: only the Windows report reads it (wd_map_load) */
 static WdSym *g_wd_sym;
 static int g_wd_nsym, g_wd_map_tried;
+#endif
 static void wdp(const char *fmt, ...) {
     char b[1400];
     va_list ap;

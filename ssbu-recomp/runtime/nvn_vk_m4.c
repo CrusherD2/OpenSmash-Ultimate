@@ -383,7 +383,7 @@ static void fb_note(int kind, const FbRec *f, LONG64 ticks) {
 static struct { PKey k; VkPipeline lib; } g_olib[128];
 static int g_nolib;
 static VkPipeline g_vilib[3];
-static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max; LONG64 g_gpl_dlink; static LONG64 g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_fight;
+static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk; LONG64 g_gpl_dlink; static LONG64 g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_fight;
 DWORD g_vk_render_tid;
 static uint32_t pipe_dyn_list(VkDynamicState *dyn) {
     static const VkDynamicState base[20] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
