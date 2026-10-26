@@ -15,6 +15,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS                       /* VK_KHR_portability_subset (MoltenVK) is declared in vulkan_beta.h */
 #endif
 #include <vulkan/vulkan.h>
+#include "nvn_front.h"                                  /* R holds the front end's records (TexPool, Prog, Range, TargetRef) */
 LONG64 tk(void);                                        /* nvn_vk_draw.c: performance counter ticks */
 uint64_t fnv(uint64_t h, const void *p, size_t n);      /* nvn_vk_m4.c */
 extern int g_m4_quit;                                   /* nvn_vk_m4.c: the game is closing */
@@ -203,4 +204,83 @@ VKD(X)
 #define vkGetPipelineCacheData pfn_vkGetPipelineCacheData
 #define vkDestroyPipelineCache pfn_vkDestroyPipelineCache
 #define vkCmdCopyBuffer pfn_vkCmdCopyBuffer
+/* ---------------------------------------------------------------- nvn_vk.c
+ * V: the instance, the device and its queue, the surface, the swapchain and its images. */
+extern struct VDevice {
+    HWND hwnd;
+    HMODULE loader;
+    VkInstance instance;
+    VkDebugUtilsMessengerEXT messenger;
+    VkPhysicalDevice gpu;
+    VkPhysicalDeviceProperties props;
+    uint32_t family;
+    VkDevice device;
+    VkQueue queue;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkSurfaceFormatKHR format;
+    VkPresentModeKHR mode;
+    VkExtent2D extent;
+    VkImage images[16];
+    uint32_t image_count;
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkSemaphore acquired, rendered;
+    VkFence fence;
+    int fence_pending, alive, validate;
+} V;
+/* ---------------------------------------------------------------- nvn_vk_draw.c
+ * D: the features and extensions of the device (vkd_device_info). R: the drawing part's state: the command buffers in
+ * flight, the stream ring, the pass, the NVN state as the commands so far left it. */
+extern struct VFeatures {
+    VkPhysicalDeviceFeatures2 f2; VkPhysicalDeviceVulkan11Features f11; VkPhysicalDeviceVulkan12Features f12; VkPhysicalDeviceVulkan13Features f13;
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids; VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc; VkPhysicalDeviceProvokingVertexFeaturesEXT pv;
+    VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8; VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT plr; VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3;
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
+    VkPhysicalDeviceFaultFeaturesEXT fault;
+#ifdef VK_KHR_portability_subset
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR port; int has_port;
+#endif
+    const char *exts[16]; uint32_t next;
+    int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug;
+    int has_gpl, ext_gpl, ext_so, has_fault, has_ckpt;
+    VkPhysicalDeviceMemoryProperties mp;
+} D;
+typedef struct { int block; uint64_t off, size; void *map; VkDeviceMemory mem; } VMem;
+#define NSLOT 8
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; } Slot;
+typedef struct VTex VTex;
+extern struct VRender {
+    Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
+    VkCommandBuffer cmd;
+    /* stream ring */
+    VkBuffer ring; VMem ring_mem; uint64_t ring_pos, ring_size; uint32_t gen;
+    struct { uint64_t addr, size, off; uint32_t gen; } acache[8192];
+    VkBuffer zero; VMem zero_mem;
+    /* pass */
+    int in_pass, pass_w, pass_h;
+    int pass_rs; float pass_sx, pass_sy;           /* track O: the pass draws into scaled images (pass_w, pass_h are the images'; sx, sy = image / game) */
+    /* NVN state as left by the commands executed so far */
+    TexPool *tpool; SamplerPool *spool;
+    Prog *prog[6];
+    Range ubo[6][16], ssbo[6][32], vbuf[32];
+    uint64_t nvn_tex[6][32], c2[6][112];
+    uint32_t tex_int[6], tex_sint[6];
+    uint32_t vattr[32]; int nattr;
+    struct { uint32_t stride, divisor; } vstream[32];
+    uint64_t ds; uint32_t chanmask, sample_mask;
+    int sref[2], svmask[2], swmask[2];
+    float alpha_ref; int alpha_func;
+    uint8_t blend[8][8], blend_on, logic, poly[4], ms[24];
+    float viewport[4], drange[2], blendc[4], point_size, line_width, polyoff[3];
+    int scissor[4], have_viewport, have_scissor, rast_discard, depth_clamp, restart, render_off;
+    int ncol; TargetRef col[8], depth; int have_targets;
+    int64_t row_stride, image_stride;
+    int dyn_dirty, vi_dirty, dyn3_dirty, dyn3_samples;      /* dyn3: the extended-dynamic-state-3 group (blend, masks, polygon mode, multisample) */
+    void *pipe_bound;
+    LONG64 frame_draws, frame_skipped, frame_clears, pipelines, modules, uploads, upload_bytes, images, images_live, views, ring_wraps, feedback, flushes, sets;
+    LONG64 sets_reused, tset_collisions, dummy_kind;
+    LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
+} R;
 #endif

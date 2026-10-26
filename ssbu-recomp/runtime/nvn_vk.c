@@ -55,29 +55,7 @@ static VkResult (VKAPI_PTR *vkCreateDebugUtilsMessengerEXT)(VkInstance, const Vk
 static void (VKAPI_PTR *vkDestroyDebugUtilsMessengerEXT)(VkInstance, VkDebugUtilsMessengerEXT, const VkAllocationCallbacks *);
 
 /* ---------------------------------------------------------------- state (render thread only, except the counters) */
-static struct {
-    HWND hwnd;
-    HMODULE loader;
-    VkInstance instance;
-    VkDebugUtilsMessengerEXT messenger;
-    VkPhysicalDevice gpu;
-    VkPhysicalDeviceProperties props;
-    uint32_t family;
-    VkDevice device;
-    VkQueue queue;
-    VkSurfaceKHR surface;
-    VkSwapchainKHR swapchain;
-    VkSurfaceFormatKHR format;
-    VkPresentModeKHR mode;
-    VkExtent2D extent;
-    VkImage images[16];
-    uint32_t image_count;
-    VkCommandPool pool;
-    VkCommandBuffer cmd;
-    VkSemaphore acquired, rendered;
-    VkFence fence;
-    int fence_pending, alive, validate;
-} V;
+struct VDevice V;                                       /* the members: nvn_vk_int.h */
 static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
 
