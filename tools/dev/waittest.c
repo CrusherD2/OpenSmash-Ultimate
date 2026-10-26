@@ -16,10 +16,27 @@
  *       report's states; then a stress run of each, with timeouts down to a millisecond, for lost
  *       wake-ups (a timeout of 5 s that passes, or a wait 2 s late, is one). After each part no
  *       thread is left in a queue, and every queue made is free again.
+ *       Thread priorities and core masks as before (any value taken, no mask kept, processor 0),
+ *       or with SSBU_CORE_MASKS=1 kept and checked as on the console, GetCurrentProcessorNumber
+ *       after them; the queues' order with SSBU_PRIORITY_QUEUES on and off, and with
+ *       SSBU_HOST_PRIORITIES each host priority call the kernel makes (seen here, then made) and
+ *       what the host thread then has - these two parts set their switch themselves. Run with
+ *       the switches set in the environment, the other parts must pass too.
  *
  * Exit code 0 when every check passes. tests/test_kernel_waits.py builds and runs it. */
+#define _CRT_SECURE_NO_WARNINGS
 #include <stdarg.h>
+#include "../../runtime/host.h"   /* (first, so that only the kernel's own SetThreadPriority calls are renamed) */
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#elif !defined _WIN32
+#include <errno.h>
+#include <sys/resource.h>
+#endif
+static BOOL seen_set_priority(HANDLE thread, int priority);
+#define SetThreadPriority seen_set_priority
 #include "../../runtime/kernel.c"
+#undef SetThreadPriority
 #include "../../runtime/clock.h"
 
 /* ---- what kernel.c needs from the rest of the runtime ---------------------------------- */
@@ -46,6 +63,15 @@ void gpu_memory_unmapping(u64 addr, u64 size) { (void)addr; (void)size; }
 #ifdef __APPLE__
 void rt_upnp_remove(void) {}
 #endif
+
+/* the kernel's host priority calls (SSBU_HOST_PRIORITIES): seen, then made */
+static struct { DWORD tid; int band; } host_calls[256];
+static u32 nhost_calls;
+static BOOL seen_set_priority(HANDLE thread, int priority) {
+    u32 i = __atomic_fetch_add(&nhost_calls, 1, __ATOMIC_SEQ_CST);
+    if (i < 256) { host_calls[i].tid = GetCurrentThreadId(); host_calls[i].band = priority; }
+    return SetThreadPriority(thread, priority);
+}
 
 static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); fflush(stdout); } } while (0)
@@ -75,6 +101,11 @@ static int failures, checks;
 #define F_HELD 28      /* 1 if it held the mutex when its condition wait ended */
 #define F_TYPE 32      /* (the address arbiter) the wait's type, or (ping-pong) 1 for the thread that starts */
 #define F_VALUE 36     /* (the address arbiter) the value, or how many turns */
+#define F_ROUND 40     /* (priorities) how many times it has reported */
+#define F_CORE 44      /* ... its GetCurrentProcessorNumber at the last */
+#define F_HOST 48      /* ... 1 if its host priority was then F_WANT's */
+#define F_WANT 52      /* ... a host priority band (THREAD_PRIORITY_*) */
+#define F_START 56     /* ... 1 if it had F_WANT's at its start, before any system call */
 #define F_HANDLES 64   /* its handles, up to 16 */
 #define SECOND 1000000000ll
 #define MS 1000000ll
@@ -88,12 +119,13 @@ static u32 wait_on(Cpu *c, u64 array, u32 h, i64 timeout) {
     return svc(c, 0x18);
 }
 static u32 wait_many(Cpu *c, u64 array, u32 count, i64 timeout) { c->x[1] = array; c->x[2] = count; c->x[3] = (u64)timeout; return svc(c, 0x18); }
-static u32 create(Cpu *c, GuestFn *fn, u64 arg, u32 *h) {
-    c->x[1] = (u64)(uintptr_t)fn; c->x[2] = arg; c->x[3] = 0; c->x[4] = 44; c->x[5] = 0;
+static u32 create_at(Cpu *c, GuestFn *fn, u64 arg, i32 priority, i32 core, u32 *h) {
+    c->x[1] = (u64)(uintptr_t)fn; c->x[2] = arg; c->x[3] = 0; c->x[4] = (u64)(i64)priority; c->x[5] = (u64)(i64)core;
     u32 r = svc(c, 0x08);
     *h = (u32)c->x[1];
     return r;
 }
+static u32 create(Cpu *c, GuestFn *fn, u64 arg, u32 *h) { return create_at(c, fn, arg, 44, 0, h); }
 static u32 start(Cpu *c, u32 h) { c->x[0] = h; return svc(c, 0x09); }
 static u32 close_h(Cpu *c, u32 h) { c->x[0] = h; return svc(c, 0x16); }
 static u32 new_event(Cpu *c) { svc(c, 0x45); return (u32)c->x[1]; }
@@ -106,6 +138,11 @@ static void cv_signal(Cpu *c, i32 count) { c->x[0] = CV; c->x[1] = (u64)(i64)cou
 static u32 wait_address(Cpu *c, u64 a, u32 type, i32 value, i64 timeout) { c->x[0] = a; c->x[1] = type; c->x[2] = (u64)(i64)value; c->x[3] = (u64)timeout; return svc(c, 0x34); }
 static u32 signal_address(Cpu *c, u64 a, u32 type, i32 value, i32 count) { c->x[0] = a; c->x[1] = type; c->x[2] = (u64)(i64)value; c->x[3] = (u64)(i64)count; return svc(c, 0x35); }
 static void yield(Cpu *c) { c->x[0] = 0; rt_svc(c, 0x0B); }
+static u32 get_priority(Cpu *c, u32 h, i32 *p) { c->x[1] = h; u32 r = svc(c, 0x0C); *p = (i32)c->x[1]; return r; }
+static u32 set_priority(Cpu *c, u32 h, i32 p) { c->x[0] = h; c->x[1] = (u64)(i64)p; return svc(c, 0x0D); }
+static u32 get_mask(Cpu *c, u32 h, i32 *core, u64 *mask) { c->x[2] = h; u32 r = svc(c, 0x0E); *core = (i32)c->x[1]; *mask = c->x[2]; return r; }
+static u32 set_mask(Cpu *c, u32 h, i32 core, u64 mask) { c->x[0] = h; c->x[1] = (u64)(i64)core; c->x[2] = mask; return svc(c, 0x0F); }
+static u32 processor(Cpu *c) { rt_svc(c, 0x10); return (u32)c->x[0]; }
 
 /* userspace mutexes as the SDK's work: the word holds the owner's handle, the kernel queues
  * the others (svcArbitrateLock) and hands the mutex over (svcArbitrateUnlock) */
@@ -205,6 +242,17 @@ static int join(Cpu *c, u32 h) { return wait_on(c, MAIN_ARRAY, h, 10 * SECOND) =
 static int order_is(u32 n) {   /* threads 0 to n - 1 got through in that order */
     if (ld32(PASSED) != n) return 0;
     for (u32 i = 0; i < n; i++) if (ld32(ORDER + 4 * i) != i) return 0;
+    return 1;
+}
+static int order_was(const int *ids, u32 n) {   /* those threads got through, in that order */
+    if (ld32(PASSED) != n) return 0;
+    for (u32 i = 0; i < n; i++) if (ld32(ORDER + 4 * i) != (u32)ids[i]) return 0;
+    return 1;
+}
+static int queue_is(int kind, u64 key, KThread **t, const int *ids, u32 n) {   /* (kind, key)'s queue holds those threads, in that order */
+    KThread *q[16];
+    if (key_queue(kind, key, q, 16) != n) return 0;
+    for (u32 i = 0; i < n; i++) if (q[i] != t[ids[i]]) return 0;
     return 1;
 }
 static void after(const char *part) {
@@ -704,6 +752,393 @@ static void states(Cpu *c, u32 main_handle) {
     after("the freeze report");
 }
 
+/* ---- priorities and cores ---------------------------------------------------------------- */
+/* the calling thread's host priority is what `band` makes it here (linux/win32.c's mapping) */
+static int host_has(int band) {
+#ifdef _WIN32
+    return GetThreadPriority(GetCurrentThread()) == band;
+#elif defined __APPLE__
+    qos_class_t want = band <= THREAD_PRIORITY_LOWEST ? QOS_CLASS_UTILITY : band == THREAD_PRIORITY_BELOW_NORMAL ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE;
+    return qos_class_self() == want;
+#else
+    int want = band <= THREAD_PRIORITY_LOWEST ? 5 : band == THREAD_PRIORITY_BELOW_NORMAL ? 2 : 0;
+    errno = 0;
+    return getpriority(PRIO_PROCESS, (id_t)GetCurrentThreadId()) == want && !errno;
+#endif
+}
+/* (Linux without privileges: a thread lowered stays low, so a raise is checked as a call, not by its effect) */
+#ifdef __linux__
+#define RAISE_STICKS (!nice_reversible())
+#else
+#define RAISE_STICKS 0
+#endif
+
+static void g_report(Cpu *c) {   /* at each signal of its event: its processor number and host priority, a round more; until F_COUNT says stop */
+    u64 rec = c->x[0];
+    u32 ev = ld32(rec + F_HANDLES);
+    st32(rec + F_START, (u32)host_has((i32)ld32(rec + F_WANT)));
+    for (;;) {
+        if (wait_on(c, rec + 0x80, ev, 10 * SECOND) != R_OK) bad();
+        clear_event(c, ev);
+        if (ld32(rec + F_COUNT)) break;
+        st32(rec + F_CORE, processor(c));
+        st32(rec + F_HOST, (u32)host_has((i32)ld32(rec + F_WANT)));
+        __atomic_fetch_add((u32 *)G2H(rec + F_ROUND), 1, __ATOMIC_SEQ_CST);
+    }
+    done(rec, R_OK);
+}
+static void g_self(Cpu *c) {   /* sets its own priority to F_VALUE: its host priority F_WANT's as the call returns */
+    u64 rec = c->x[0];
+    u32 r = set_priority(c, CUR_THREAD, (i32)ld32(rec + F_VALUE));
+    st32(rec + F_HOST, (u32)host_has((i32)ld32(rec + F_WANT)));
+    done(rec, r);
+}
+struct round { int i; u32 n; };
+static int round_done(void *p) { struct round *r = p; return __atomic_load_n((u32 *)G2H(REC(r->i) + F_ROUND), __ATOMIC_SEQ_CST) == r->n; }
+/* thread i (g_report, on event ev) reports once more, its host priority looked at against `band` */
+static int report_once(Cpu *c, int i, u32 ev, int band) {
+    struct round r = {i, ld32(REC(i) + F_ROUND) + 1};
+    st32(REC(i) + F_WANT, (u32)band);
+    signal_event(c, ev);
+    return until(round_done, &r);
+}
+static u32 reporter(Cpu *c, int i, i32 priority, i32 core, u32 ev, KThread **kt) {   /* (F_WANT: the band it should start in) */
+    u32 h;
+    st32(REC(i) + F_WANT, (u32)(host_priorities ? host_band(priority) : THREAD_PRIORITY_NORMAL));
+    st32(REC(i) + F_HANDLES, ev);
+    st32(REC(i) + F_COUNT, 0);
+    st32(REC(i) + F_ROUND, 0);
+    st32(REC(i) + F_DONE, 0);
+    CHECK(create_at(c, g_report, REC(i), priority, core, &h) == R_OK, "CreateThread at priority %d, core %d", priority, core);
+    *kt = thread_of(h);
+    CHECK(start(c, h) == R_OK, "StartThread");
+    CHECK(until_waits(*kt, WAIT_OBJECTS), "the reporter never waited");   /* (it has read F_WANT for its start) */
+    return h;
+}
+static int stop_reporter(Cpu *c, int i, u32 h, u32 ev) {
+    st32(REC(i) + F_COUNT, 1);
+    signal_event(c, ev);
+    return until_done(i) && join(c, h);
+}
+/* the host priority calls thread t made (with a thread id: those its host thread made), the last one's band in *last */
+static u32 calls_of(DWORD tid, int *last) {
+    u32 n = 0, all = __atomic_load_n(&nhost_calls, __ATOMIC_SEQ_CST);
+    for (u32 i = 0; i < all && i < 256; i++)
+        if (host_calls[i].tid == tid) { n++; *last = host_calls[i].band; }
+    return n;
+}
+
+static void band_checks(void) {
+    int bands = 1;
+    for (i32 q = 0; q < 64; q++)
+        bands &= host_band(q) == (q < 44 ? THREAD_PRIORITY_ABOVE_NORMAL : q == 44 ? THREAD_PRIORITY_NORMAL : q < 56 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
+    CHECK(bands && host_band(28) == THREAD_PRIORITY_ABOVE_NORMAL && host_band(43) == THREAD_PRIORITY_ABOVE_NORMAL && host_band(45) == THREAD_PRIORITY_BELOW_NORMAL &&
+          host_band(55) == THREAD_PRIORITY_BELOW_NORMAL && host_band(56) == THREAD_PRIORITY_LOWEST && host_band(59) == THREAD_PRIORITY_LOWEST, "the host priority bands");
+}
+
+/* SSBU_CORE_MASKS=1: the console's answers */
+static void console_answers(Cpu *c) {
+    u32 h, ev = new_event(c), n0;
+    i32 p, core;
+    u64 mask;
+    KThread *t;
+    /* a priority round trip; the console's range refused outside 28..59, the old value kept */
+    CHECK(get_priority(c, CUR_THREAD, &p) == R_OK && p == 44, "the main thread's priority %d", p);
+    h = reporter(c, 0, 30, 1, ev, &t);
+    CHECK(get_priority(c, h, &p) == R_OK && p == 30, "a new thread's priority %d", p);
+    static const i32 good[] = {28, 44, 59, 31}, wrong[] = {27, 60, 63, 64, -1, 0};
+    for (int i = 0; i < 4; i++) CHECK(set_priority(c, h, good[i]) == R_OK && get_priority(c, h, &p) == R_OK && p == good[i], "priority %d set, %d got", good[i], p);
+    for (int i = 0; i < 6; i++) CHECK(set_priority(c, h, wrong[i]) == R_INVALID_PRIORITY && get_priority(c, h, &p) == R_OK && p == 31, "priority %d: %d got", wrong[i], p);
+    CHECK(set_priority(c, 0x12345, 40) == R_INVALID_HANDLE && set_priority(c, 0x12345, 70) == R_INVALID_PRIORITY && get_priority(c, 0x12345, &p) == R_INVALID_HANDLE,
+          "a priority on a made-up handle (the priority looked at first)");
+    /* CreateThread's checks: the core first, then the priority; -2 the process's core 0 */
+    EnterCriticalSection(&klock);
+    n0 = nthreads;
+    LeaveCriticalSection(&klock);
+    u32 h2;
+    CHECK(create_at(c, g_report, 0, 27, 0, &h2) == R_INVALID_PRIORITY && create_at(c, g_report, 0, 60, 0, &h2) == R_INVALID_PRIORITY, "CreateThread at priority 27 or 60");
+    CHECK(create_at(c, g_report, 0, 44, 3, &h2) == R_INVALID_CORE && create_at(c, g_report, 0, 44, -1, &h2) == R_INVALID_CORE &&
+          create_at(c, g_report, 0, 44, -3, &h2) == R_INVALID_CORE && create_at(c, g_report, 0, 27, 3, &h2) == R_INVALID_CORE, "CreateThread on core 3, -1 or -3");
+    EnterCriticalSection(&klock);
+    CHECK(nthreads == n0, "a refused CreateThread made a thread");
+    LeaveCriticalSection(&klock);
+    CHECK(create_at(c, g_report, 0, 44, -2, &h2) == R_OK && get_mask(c, h2, &core, &mask) == R_OK && core == 0 && mask == 1, "a thread on core -2: ideal %d, mask %#llx", core,
+          (unsigned long long)mask);
+    close_h(c, h2);   /* (never started) */
+
+    /* core masks: a new thread's is its core; kept as set; its processor number its ideal core, or the first of its mask */
+    CHECK(get_mask(c, h, &core, &mask) == R_OK && core == 1 && mask == 2, "a thread made on core 1: ideal %d, mask %#llx", core, (unsigned long long)mask);
+    CHECK(report_once(c, 0, ev, 0) && ld32(REC(0) + F_CORE) == 1, "its processor number %u", ld32(REC(0) + F_CORE));
+    static const struct { i32 core; u64 mask; u32 result; i32 ideal; u64 kept; u32 processor; } rules[] = {
+        {2, 0x6, R_OK, 2, 0x6, 2},
+        {-1, 0x3, R_OK, -1, 0x3, 0},                 /* no ideal core */
+        {-3, 0x4, R_OK, -1, 0x4, 2},                 /* none kept */
+        {1, 0x7, R_OK, 1, 0x7, 1},
+        {-3, 0x5, R_INVALID_COMBINATION, 1, 0x7, 1},  /* the kept ideal core not in the mask */
+        {-3, 0x6, R_OK, 1, 0x6, 1},
+        {-2, 0, R_OK, 0, 0x1, 0},                     /* the process's core, the mask not looked at */
+        {0, 0x8, R_INVALID_CORE, 0, 0x1, 0},          /* a core the process has not */
+        {0, 0xF, R_INVALID_CORE, 0, 0x1, 0},
+        {3, 0x8, R_INVALID_CORE, 0, 0x1, 0},          /* (the mask looked at first) */
+        {0, 0, R_INVALID_COMBINATION, 0, 0x1, 0},     /* an empty mask */
+        {-1, 0, R_INVALID_COMBINATION, 0, 0x1, 0},
+        {0, 0x6, R_INVALID_COMBINATION, 0, 0x1, 0},   /* the ideal core not in the mask */
+        {3, 0x7, R_INVALID_COMBINATION, 0, 0x1, 0},
+        {4, 0x7, R_INVALID_CORE, 0, 0x1, 0},
+        {-4, 0x7, R_INVALID_CORE, 0, 0x1, 0},
+        {2, 0x4, R_OK, 2, 0x4, 2},
+    };
+    for (u32 i = 0; i < sizeof rules / sizeof *rules; i++) {
+        u32 r = set_mask(c, h, rules[i].core, rules[i].mask);
+        CHECK(r == rules[i].result && get_mask(c, h, &core, &mask) == R_OK && core == rules[i].ideal && mask == rules[i].kept,
+              "SetThreadCoreMask(%d, %#llx): %#x, then ideal %d, mask %#llx", rules[i].core, (unsigned long long)rules[i].mask, r, core, (unsigned long long)mask);
+        if (r == R_OK) CHECK(report_once(c, 0, ev, 0) && ld32(REC(0) + F_CORE) == rules[i].processor, "SetThreadCoreMask(%d, %#llx): processor number %u", rules[i].core,
+                             (unsigned long long)rules[i].mask, ld32(REC(0) + F_CORE));
+    }
+    CHECK(set_mask(c, 0x12345, 0, 1) == (recycle ? R_INVALID_HANDLE : R_OK) && set_mask(c, 0x12345, 0, 0) == R_INVALID_COMBINATION, "SetThreadCoreMask on a made-up handle");
+    CHECK(get_mask(c, 0x12345, &core, &mask) == R_INVALID_HANDLE, "GetThreadCoreMask on a made-up handle");
+    CHECK(set_mask(c, CUR_THREAD, 2, 4) == R_OK && processor(c) == 2 && get_mask(c, CUR_THREAD, &core, &mask) == R_OK && core == 2 && mask == 4, "the main thread's own mask");
+    CHECK(set_mask(c, CUR_THREAD, -2, 0) == R_OK && processor(c) == 0 && get_mask(c, CUR_THREAD, &core, &mask) == R_OK && core == 0 && mask == 1,
+          "the main thread back on core 0");
+    CHECK(stop_reporter(c, 0, h, ev), "the thread did not end");
+    close_event(c, ev);
+    after("the console's priorities and cores");
+}
+
+/* without SSBU_CORE_MASKS: the answers as before - any priority and core taken, no mask kept,
+ * GetThreadCoreMask's mask 0x7, processor number 0 */
+static void old_answers(Cpu *c) {
+    u32 h, h2, ev = new_event(c);
+    i32 p, core;
+    u64 mask;
+    KThread *t;
+    CHECK(get_priority(c, CUR_THREAD, &p) == R_OK && p == 44, "the main thread's priority %d", p);
+    h = reporter(c, 0, 30, 1, ev, &t);
+    CHECK(get_priority(c, h, &p) == R_OK && p == 30, "a new thread's priority %d", p);
+    static const i32 any[] = {28, 59, 27, 60, 63, 64, -1, 0, 99};
+    for (int i = 0; i < 9; i++) CHECK(set_priority(c, h, any[i]) == R_OK && get_priority(c, h, &p) == R_OK && p == any[i], "priority %d set, %d got", any[i], p);
+    CHECK(set_priority(c, 0x12345, 70) == R_INVALID_HANDLE && get_priority(c, 0x12345, &p) == R_INVALID_HANDLE, "a priority on a made-up handle");
+    CHECK(create_at(c, g_report, 0, 70, 5, &h2) == R_OK && get_priority(c, h2, &p) == R_OK && p == 70 && get_mask(c, h2, &core, &mask) == R_OK && core == 5 && mask == 7,
+          "CreateThread at priority 70 on core 5: priority %d, core %d, mask %#llx", p, core, (unsigned long long)mask);
+    close_h(c, h2);   /* (never started) */
+    CHECK(create_at(c, g_report, 0, 44, -2, &h2) == R_OK && get_mask(c, h2, &core, &mask) == R_OK && core == -2 && mask == 7, "a thread on core -2: core %d, mask %#llx", core,
+          (unsigned long long)mask);
+    close_h(c, h2);
+    CHECK(get_mask(c, h, &core, &mask) == R_OK && core == 1 && mask == 7, "a thread made on core 1: core %d, mask %#llx", core, (unsigned long long)mask);
+    CHECK(report_once(c, 0, ev, 0) && ld32(REC(0) + F_CORE) == 0, "its processor number %u", ld32(REC(0) + F_CORE));
+    static const struct { i32 core; u64 mask; } masks[] = {{2, 0x4}, {-1, 0x3}, {-3, 0x5}, {0, 0}, {3, 0x8}, {9, 0}, {-2, 0xF}};
+    for (u32 i = 0; i < sizeof masks / sizeof *masks; i++)
+        CHECK(set_mask(c, h, masks[i].core, masks[i].mask) == R_OK && get_mask(c, h, &core, &mask) == R_OK && core == 1 && mask == 7,
+              "SetThreadCoreMask(%d, %#llx) refused, or kept: core %d, mask %#llx", masks[i].core, (unsigned long long)masks[i].mask, core, (unsigned long long)mask);
+    CHECK(report_once(c, 0, ev, 0) && ld32(REC(0) + F_CORE) == 0, "its processor number after SetThreadCoreMask %u", ld32(REC(0) + F_CORE));
+    CHECK(set_mask(c, 0x12345, 9, 0) == (recycle ? R_INVALID_HANDLE : R_OK) && get_mask(c, 0x12345, &core, &mask) == R_INVALID_HANDLE, "core masks on a made-up handle");
+    CHECK(set_mask(c, CUR_THREAD, 2, 4) == R_OK && processor(c) == 0 && get_mask(c, CUR_THREAD, &core, &mask) == R_OK && core == 0 && mask == 7, "the main thread's own mask");
+    CHECK(stop_reporter(c, 0, h, ev), "the thread did not end");
+    close_event(c, ev);
+    after("priorities and cores as before");
+}
+
+static void priority_checks(Cpu *c) {
+    band_checks();
+    if (core_masks) console_answers(c);
+    else old_answers(c);
+}
+
+/* lockers at these priorities queue on the main thread's mutex, then two change priority while they wait */
+static void priority_mutex(Cpu *c, u32 main_handle) {
+    static const i32 prio[6] = {50, 40, 50, 30, 40, 59};
+    static const int queued1[6] = {3, 1, 4, 0, 2, 5}, queued2[6] = {3, 1, 4, 5, 0, 2}, queued3[6] = {1, 4, 5, 0, 2, 3};
+    KThread *t[6];
+    u32 h[6];
+    st32(MUTEX, 0);
+    st32(PASSED, 0);
+    guest_lock(c, MUTEX, main_handle);
+    for (int i = 0; i < 6; i++) {
+        st32(REC(i) + F_ID, (u32)i); st32(REC(i) + F_DONE, 0); st32(REC(i) + F_COUNT, 0);
+        CHECK(create_at(c, g_lock, REC(i), prio[i], 0, &h[i]) == R_OK && start(c, h[i]) == R_OK, "locker %d", i);
+        t[i] = thread_of(h[i]);
+        CHECK(until_waits(t[i], WAIT_MUTEX), "locker %d never waited", i);
+    }
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, queued1, 6), "the mutex's queue by priority, then arrival");
+    set_priority(c, h[5], 40);
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, queued2, 6), "a waiter from 59 to 40: behind the others at 40");
+    set_priority(c, h[3], 50);
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, queued3, 6), "a waiter from 30 to 50: behind the others at 50");
+    guest_unlock(c, MUTEX, main_handle);
+    for (int i = 0; i < 6; i++) CHECK(until_done(i), "locker %d never got through", i);
+    CHECK(order_was(queued3, 6) && ld32(MUTEX) == 0, "the hand-over order by priority, or the word %#x", ld32(MUTEX));
+    for (int i = 0; i < 6; i++) CHECK(join(c, h[i]), "joining locker %d", i);
+}
+
+static void priority_queues_on(Cpu *c, u32 main_handle) {
+    KThread *t[6];
+    u32 h[6];
+    priority_queues = 1;
+    priority_mutex(c, main_handle);
+    /* a condition variable: by priority there, and again in the mutex's queue it is moved to */
+    static const i32 cprio[4] = {50, 30, 59, 30};
+    static const int cv1[4] = {1, 3, 0, 2}, cv2[4] = {2, 1, 3, 0}, cv3[3] = {1, 3, 0};
+    st32(MUTEX, 0);
+    st32(CV, 0);
+    st32(PASSED, 0);
+    for (int i = 0; i < 4; i++) {
+        st32(REC(i) + F_ID, (u32)i); st32(REC(i) + F_DONE, 0); st64(REC(i) + F_TIMEOUT, 10 * SECOND);
+        CHECK(create_at(c, g_condition, REC(i), cprio[i], 0, &h[i]) == R_OK && start(c, h[i]) == R_OK, "waiter %d", i);
+        t[i] = thread_of(h[i]);
+        CHECK(until_waits(t[i], WAIT_CONDITION), "waiter %d never waited", i);
+    }
+    CHECK(queue_is(WAIT_CONDITION, CV, t, cv1, 4), "the condition variable's queue by priority");
+    set_priority(c, h[2], 28);
+    CHECK(queue_is(WAIT_CONDITION, CV, t, cv2, 4), "a waiter from 59 to 28: first");
+    guest_lock(c, MUTEX, main_handle);
+    cv_signal(c, 1);
+    CHECK(state_of(t[2]) == WAIT_MUTEX && queue_is(WAIT_CONDITION, CV, t, cv3, 3), "a signal of one: the highest");
+    cv_signal(c, -1);
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, cv2, 4), "the mutex's queue after a signal of all");
+    guest_unlock(c, MUTEX, main_handle);
+    for (int i = 0; i < 4; i++) CHECK(until_done(i) && result_of(i) == R_OK, "waiter %d: %#x", i, result_of(i));
+    CHECK(order_was(cv2, 4), "the order through the mutex");
+    for (int i = 0; i < 4; i++) CHECK(join(c, h[i]), "joining waiter %d", i);
+    /* an address: a signal of one wakes the highest */
+    static const i32 aprio[4] = {45, 59, 28, 45};
+    static const int a1[4] = {2, 0, 3, 1};
+    st32(WORD, 0);
+    st32(PASSED, 0);
+    for (int i = 0; i < 4; i++) {
+        st32(REC(i) + F_ID, (u32)i); st32(REC(i) + F_DONE, 0);
+        st32(REC(i) + F_TYPE, 2); st32(REC(i) + F_VALUE, 0); st64(REC(i) + F_TIMEOUT, 10 * SECOND);
+        CHECK(create_at(c, g_address, REC(i), aprio[i], 0, &h[i]) == R_OK && start(c, h[i]) == R_OK, "address waiter %d", i);
+        t[i] = thread_of(h[i]);
+        CHECK(until_waits(t[i], WAIT_ADDRESS), "address waiter %d never waited", i);
+    }
+    CHECK(queue_is(WAIT_ADDRESS, WORD, t, a1, 4), "the address's queue by priority");
+    for (int k = 0; k < 4; k++) {
+        CHECK(signal_address(c, WORD, 0, 0, 1) == R_OK && until_done(a1[k]), "a signal of one: waiter %d not woken", a1[k]);
+        for (int j = k + 1; j < 4; j++) CHECK(!done_now(a1[j]), "a signal of one woke waiter %d too", a1[j]);
+    }
+    CHECK(order_was(a1, 4), "the address's order");
+    for (int i = 0; i < 4; i++) CHECK(join(c, h[i]), "joining address waiter %d", i);
+    /* an object's queue stays first come first served: a signal wakes all of it */
+    u32 ev = new_event(c);
+    KThread *q[4];
+    static const i32 oprio[3] = {59, 28, 44};
+    for (int i = 0; i < 3; i++) {
+        objects_record(i, 1, &ev, 10 * SECOND);
+        st32(REC(i) + F_DONE, 0);
+        CHECK(create_at(c, g_objects, REC(i), oprio[i], 0, &h[i]) == R_OK && start(c, h[i]) == R_OK, "object waiter %d", i);
+        t[i] = thread_of(h[i]);
+        CHECK(until_waits(t[i], WAIT_OBJECTS), "object waiter %d never waited", i);
+    }
+    CHECK(object_queue(ev, q, 4) == 3 && q[0] == t[0] && q[1] == t[1] && q[2] == t[2], "an event's queue reordered");
+    signal_event(c, ev);
+    for (int i = 0; i < 3; i++) CHECK(until_done(i) && result_of(i) == R_OK && join(c, h[i]), "object waiter %d", i);
+    close_event(c, ev);
+    priority_queues = 0;
+    after("queues by priority");
+}
+
+static void priority_queues_off(Cpu *c, u32 main_handle) {   /* first come first served whatever the priorities */
+    static const i32 prio[3] = {50, 30, 59};
+    static const int fifo[3] = {0, 1, 2};
+    KThread *t[3];
+    u32 h[3];
+    st32(MUTEX, 0);
+    st32(PASSED, 0);
+    guest_lock(c, MUTEX, main_handle);
+    for (int i = 0; i < 3; i++) {
+        st32(REC(i) + F_ID, (u32)i); st32(REC(i) + F_DONE, 0); st32(REC(i) + F_COUNT, 0);
+        CHECK(create_at(c, g_lock, REC(i), prio[i], 0, &h[i]) == R_OK && start(c, h[i]) == R_OK, "locker %d", i);
+        t[i] = thread_of(h[i]);
+        CHECK(until_waits(t[i], WAIT_MUTEX), "locker %d never waited", i);
+    }
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, fifo, 3), "without the switch, the mutex's queue not in arrival order");
+    set_priority(c, h[0], 28);
+    set_priority(c, h[2], 28);
+    CHECK(queue_is(WAIT_MUTEX, MUTEX, t, fifo, 3), "without the switch, a priority change moved a waiter");
+    guest_unlock(c, MUTEX, main_handle);
+    for (int i = 0; i < 3; i++) CHECK(until_done(i), "locker %d never got through", i);
+    CHECK(order_was(fifo, 3), "without the switch, the hand-over order");
+    for (int i = 0; i < 3; i++) CHECK(join(c, h[i]), "joining locker %d", i);
+    after("queues first come first served");
+}
+
+/* SSBU_HOST_PRIORITIES: each thread sets its own host priority, at its start and as it leaves a
+ * system call after a change - only when its band changes */
+static void host_priority_checks(Cpu *c) {
+    KThread *t[4];
+    u32 h[4], ev[4];
+    int last = 0;
+    for (int i = 0; i < 4; i++) ev[i] = new_event(c);
+    host_priorities = 1;
+    __atomic_store_n(&nhost_calls, 0, __ATOMIC_SEQ_CST);
+    static const i32 prio[3] = {59, 44, 30};
+    static const int band[3] = {THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL};
+    for (int i = 0; i < 3; i++) {
+        h[i] = reporter(c, i, prio[i], 0, ev[i], &t[i]);
+        CHECK(report_once(c, i, ev[i], band[i]) && ld32(REC(i) + F_START) && ld32(REC(i) + F_HOST), "a thread started at priority %d: not in its host band (at its start %u)", prio[i],
+              ld32(REC(i) + F_START));
+    }
+    DWORD tid[3];
+    for (int i = 0; i < 3; i++) tid[i] = GetThreadId(t[i]->host);
+    CHECK(calls_of(tid[0], &last) == 1 && last == THREAD_PRIORITY_LOWEST, "a thread started at 59: %u calls, the last %d", calls_of(tid[0], &last), last);
+    CHECK(calls_of(tid[1], &last) == 0, "a thread started at 44 made a host priority call");
+    CHECK(calls_of(tid[2], &last) == 1 && last == THREAD_PRIORITY_ABOVE_NORMAL, "a thread started at 30: %u calls, the last %d", calls_of(tid[2], &last), last);
+    /* changed by another thread while it waits: set by the thread itself as its wait returns */
+    set_priority(c, h[1], 50);
+    Sleep(20);
+    CHECK(calls_of(tid[1], &last) == 0, "a waiting thread's host priority set before it ran");
+    CHECK(report_once(c, 1, ev[1], THREAD_PRIORITY_BELOW_NORMAL) && ld32(REC(1) + F_HOST) && calls_of(tid[1], &last) == 1 && last == THREAD_PRIORITY_BELOW_NORMAL,
+          "from 44 to 50: host %u, %u calls, the last %d", ld32(REC(1) + F_HOST), calls_of(tid[1], &last), last);
+    set_priority(c, h[1], 52);
+    CHECK(report_once(c, 1, ev[1], THREAD_PRIORITY_BELOW_NORMAL) && calls_of(tid[1], &last) == 1, "from 50 to 52, the same band: a call made");
+    set_priority(c, h[1], 59);
+    CHECK(report_once(c, 1, ev[1], THREAD_PRIORITY_LOWEST) && ld32(REC(1) + F_HOST) && calls_of(tid[1], &last) == 2 && last == THREAD_PRIORITY_LOWEST,
+          "from 52 to 59: host %u, the last call %d", ld32(REC(1) + F_HOST), last);
+    set_priority(c, h[1], 44);
+    CHECK(report_once(c, 1, ev[1], THREAD_PRIORITY_NORMAL) && (ld32(REC(1) + F_HOST) || RAISE_STICKS) && calls_of(tid[1], &last) == 3 && last == THREAD_PRIORITY_NORMAL,
+          "from 59 back to 44: host %u, the last call %d", ld32(REC(1) + F_HOST), last);
+    set_priority(c, h[0], 30);
+    CHECK(report_once(c, 0, ev[0], THREAD_PRIORITY_ABOVE_NORMAL) && (ld32(REC(0) + F_HOST) || RAISE_STICKS) && calls_of(tid[0], &last) == 2 &&
+          last == THREAD_PRIORITY_ABOVE_NORMAL, "from 59 to 30: host %u, the last call %d", ld32(REC(0) + F_HOST), last);
+    /* its own change: set as the call returns */
+    st32(REC(3) + F_DONE, 0);
+    st32(REC(3) + F_VALUE, 56);
+    st32(REC(3) + F_WANT, (u32)THREAD_PRIORITY_LOWEST);
+    CHECK(create(c, g_self, REC(3), &h[3]) == R_OK && start(c, h[3]) == R_OK, "the thread that sets its own");
+    CHECK(until_done(3) && result_of(3) == R_OK && ld32(REC(3) + F_HOST), "its own priority to 56: host %u", ld32(REC(3) + F_HOST));
+    CHECK(calls_of(GetThreadId(thread_of(h[3])->host), &last) == 1 && last == THREAD_PRIORITY_LOWEST, "its own priority to 56: the call");
+    CHECK(join(c, h[3]), "joining it");
+    CHECK(calls_of(GetCurrentThreadId(), &last) == 0, "the main thread, at 44, made a host priority call");
+    for (int i = 0; i < 3; i++) CHECK(stop_reporter(c, i, h[i], ev[i]), "reporter %d did not end", i);
+    /* without the switch: no call */
+    host_priorities = 0;
+    u32 before = __atomic_load_n(&nhost_calls, __ATOMIC_SEQ_CST);
+    h[0] = reporter(c, 0, 59, 0, ev[0], &t[0]);
+    CHECK(report_once(c, 0, ev[0], THREAD_PRIORITY_NORMAL) && ld32(REC(0) + F_START) && ld32(REC(0) + F_HOST), "without the switch, a thread at 59 not in the normal band");
+    set_priority(c, h[0], 30);
+    CHECK(report_once(c, 0, ev[0], THREAD_PRIORITY_NORMAL) && __atomic_load_n(&nhost_calls, __ATOMIC_SEQ_CST) == before, "without the switch, a host priority call made");
+    CHECK(stop_reporter(c, 0, h[0], ev[0]), "the reporter did not end");
+    for (int i = 0; i < 4; i++) close_event(c, ev[i]);
+    after("host priorities");
+}
+
+static void priorities(Cpu *c, u32 main_handle) {
+    int was[2] = {priority_queues, host_priorities};   /* (as the environment set them; SSBU_CORE_MASKS's stays) */
+    priority_queues = host_priorities = 0;
+    priority_checks(c);
+    priority_queues_on(c, main_handle);
+    priority_queues_off(c, main_handle);
+    host_priority_checks(c);
+#ifdef __linux__
+    struct rlimit r;   /* (last: it cannot be undone) */
+    if (geteuid() != 0 && getrlimit(RLIMIT_NICE, &r) == 0) {
+        r.rlim_cur = 0;
+        CHECK(setrlimit(RLIMIT_NICE, &r) == 0 && !nice_reversible(), "RLIMIT_NICE 0 not seen as leaving a thread lowered for good");
+    }
+#endif
+    priority_queues = was[0]; host_priorities = was[1];
+}
+
 /* ---- stress: lost wake-ups --------------------------------------------------------------- */
 static void g_ring(Cpu *c) {   /* its turns round a ring of threads: the mutex, the condition variable, all woken at each turn
                                 * (with the mutex held, or every other turn after it is let go: the woken take it themselves) */
@@ -934,6 +1369,7 @@ int main(void) {
     c->x[1] = 16 << 20;
     CHECK(svc(c, 0x01) == R_OK, "svcSetHeapSize");
     printf("thread recycling %s\n", recycle ? "on" : "off");
+    printf("queues by priority %s, host priorities %s, core masks %s\n", priority_queues ? "on" : "off", host_priorities ? "on" : "off", core_masks ? "the console's" : "as before");
     u64 t0 = rt_clock_ns();
     objects_basics(c);
     objects_many(c);
@@ -945,6 +1381,7 @@ int main(void) {
     conditions(c, main_handle);
     addresses(c);
     states(c, main_handle);
+    priorities(c, main_handle);
     stress(c);
     printf("%u queues made\n%.1f s\n%d checks, %d failed\n", queues_made, (double)(rt_clock_ns() - t0) / 1e9, checks, failures);
     return failures ? 1 : 0;

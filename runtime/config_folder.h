@@ -8,7 +8,10 @@
  * was copied: the copy is made once. Where the folder cannot be made or written (a read-only
  * folder), the files stay where they were for that start, as before.
  *
- * SSBU_DISPLAY and SSBU_CONTROLLERS still name a file of their own (test runs). */
+ * SSBU_DISPLAY and SSBU_CONTROLLERS still name a file of their own (test runs).
+ *
+ * (Not config.h: the builds compile third-party sources with -I runtime, and vkd3d's include a
+ * config.h of their own, which this file would stand in for.) */
 #pragma once
 
 enum ConfigFile {

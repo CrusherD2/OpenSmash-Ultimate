@@ -1,4 +1,4 @@
-"""The settings folder (runtime/hle_config.c, config.h): config/ with its version.ini, made on the
+"""The settings folder (runtime/hle_config.c, config_folder.h): config/ with its version.ini, made on the
 first start from WindowSmash's files in the port's folder and an ssbu-recomp install's in its build
 folder, once; and controllers.ini read in either port's schema (hle_pad.c), rewritten from
 ssbu-recomp's in this port's terms. Through tools/dev/configtest.c, on made-up folders: a new

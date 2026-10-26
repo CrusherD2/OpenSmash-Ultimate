@@ -705,7 +705,7 @@ class TerminalTests(unittest.TestCase):
 
 
     def test_online_name_in_config_folder(self):
-        """online_name.txt where the game reads it (runtime/config.h): config/ once the game has made it
+        """online_name.txt where the game reads it (runtime/config_folder.h): config/ once the game has made it
         (config/version.ini), else the port's folder."""
         def files(**kw):
             with mock.patch.object(im, 'ROOT', self.top), mock.patch.object(im, 'Checks', StubChecks), \
@@ -1053,7 +1053,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertRegex((self.top / 'online_name.txt').read_text(), r'^Player\d{4}\n$')
 
     def test_online_files_in_config_folder(self):
-        """Once the game has made config/ (runtime/config.h: its version.ini), the name and the direct
+        """Once the game has made config/ (runtime/config_folder.h: its version.ini), the name and the direct
         setting are read and written there; online_server.txt stays the port's own until there is one there."""
         (self.top / 'online_server.txt').write_text('a.example:1\n')
         (self.top / 'online_name.txt').write_text('Old Name\n')

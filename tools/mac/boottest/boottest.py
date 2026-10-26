@@ -170,7 +170,7 @@ def start(how, tree, app, exe):
                 status = subprocess.run([exe, modules, "--status", "30"], cwd=tree, env=env, stdout=f, stderr=subprocess.STDOUT,
                                         stdin=subprocess.DEVNULL, timeout=60).returncode
         elif how == "open":
-            inis = [os.path.join(tree, "config", "display.ini"), os.path.join(tree, "display.ini")]   # (config/: runtime/config.h)
+            inis = [os.path.join(tree, "config", "display.ini"), os.path.join(tree, "display.ini")]   # (config/: runtime/config_folder.h)
             for ini in inis:
                 if os.path.exists(ini):
                     os.remove(ini)

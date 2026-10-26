@@ -208,7 +208,7 @@ function Merge-OnlineServer {
 }
 
 function Get-ConfigPath {
-    <# Where the game reads a settings file (runtime/config.h): config\ once the game has made it
+    <# Where the game reads a settings file (runtime/config_folder.h): config\ once the game has made it
        (config\version.ini), else the port's folder; online_server.txt is config\'s only once there
        is one there. (tools\launcher.ps1 has the same.) #>
     param([string]$Root, [string]$Name)
