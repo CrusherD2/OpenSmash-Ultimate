@@ -2,7 +2,7 @@
 """Build the game from your own files in one go: what launchers\\Build WindowSmash.bat runs.
 
 Usage:
-  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir>] [--jobs N] [--prepare-only]
+  build_game.py [--game <dir>] [--keys <dir>] [--firmware <dir> | --no-firmware] [--jobs N] [--prepare-only]
   build_game.py --check
 
 It does the setup guide's steps (docs/BUILDING.md) one after the other and stops at the first
@@ -22,7 +22,8 @@ the game files made is cleared first (reset_game_files); the save and the settin
                to 8 run (from the end of step 2: the packages), and waits for it at step 9
   2. packages  requirements.txt, installed with pip unless they are already
   3. folders   where the game files, keys and firmware are: asked (the answers are the defaults
-               next time, in dump/build_folders.txt) unless --game, --keys, --firmware say
+               next time, in dump/build_folders.txt) unless --game, --keys, --firmware say. The
+               firmware is optional: it is only for the fonts (step 5)
   4. program   the Program NCA among the game folder's files (tools/gamefiles.py: the guide's
                folder, an emulator's installed-content folder, an update .nsp; of base and
                update, the update's); its ExeFS into dump/exefs, checked to be 13.0.5's (the
@@ -30,7 +31,10 @@ the game files made is cleared first (reset_game_files); the save and the settin
                dump/game_source.txt - a later run with a game folder holding other files of the
                game stops rather than mix the two
   5. fonts     the .bfttf fonts of every firmware NCA into dump/fonts (or the six from a fonts
-               folder in the game folder)
+               folder in the game folder). Without a firmware (--no-firmware, or none answered):
+               nothing, the game uses the open fonts of third_party/fonts_open in their place
+               (runtime/hle_pl.c), and dump/fonts.none says so, so the firmware isn't asked for
+               again; --firmware later takes its fonts after all
   6. data      dump/modules/romfs.cfg: the game folder's romfs.bin, checked and set by
                tools/Configure-Game-Data.ps1; without one, the program NCA's own RomFS, read in
                place when it is decrypted (tools/nca.py romfs-cfg), else decrypted first into
@@ -91,6 +95,13 @@ EXEFS_FILES = ("main", "main.npdm", "rtld", "sdk", "subsdk0")
 FONT_FILES = ("nintendo_udsg-r_std_003.bfttf", "nintendo_udsg-r_org_zh-cn_003.bfttf",
               "nintendo_udsg-r_ext_zh-cn_003.bfttf", "nintendo_udjxh-db_zh-tw_003.bfttf",
               "nintendo_udsg-r_ko_003.bfttf", "nintendo_ext_003.bfttf")
+# the open fonts the game uses in place of each firmware font that isn't there (runtime/hle_pl.c, which
+# finds them from dump/modules: ../../third_party/fonts_open), and what they make of the game (their README.md)
+OPEN_FONTS = os.path.join(ROOT, "third_party", "fonts_open")
+OPEN_FONT_FILES = tuple(n[:-len(".bfttf")] + ".ttf" for n in FONT_FILES)
+WITH_OPEN_FONTS = ("Latin text is in Open Sans and Source Sans Pro instead of the console's typefaces; Chinese, Japanese "
+                   "and Korean text and most symbols are missing; the button icons come from yuzu's icon font. Fights are "
+                   "not affected.")
 PROGRAM = 0   # an NCA's content type (nca.py info's type=Program)
 
 
@@ -177,13 +188,19 @@ def aoc_done(modules=None):
     return os.path.exists(os.path.join(modules, "aoc.cfg")) or os.path.exists(os.path.join(modules, "aoc.none"))
 
 
+def fonts_done():
+    """The font step is done: the firmware's fonts are in dump/fonts, or there was no firmware and the
+    game uses the open fonts (dump/fonts.none)."""
+    return not missing_fonts(FONTS) or os.path.exists(FONTS + ".none")
+
+
 def prepared():
     """Everything step 3 to 8 make from the game files is there: the program (13.0.5's), the
-    fonts, the game data's cfg (and the files it reads) and the DLC step. Then the game files are
-    not asked for."""
+    fonts (or the open ones), the game data's cfg (and the files it reads) and the DLC step. Then
+    the game files are not asked for."""
     return (not [n for n in EXEFS_FILES if not os.path.isfile(os.path.join(EXEFS, n))]
             and old_folder_version() is None
-            and not missing_fonts(FONTS) and romfs_cfg_ok(os.path.join(MODULES, "romfs.cfg")) and aoc_done())
+            and fonts_done() and romfs_cfg_ok(os.path.join(MODULES, "romfs.cfg")) and aoc_done())
 
 
 def old_folder_version():
@@ -562,7 +579,9 @@ FOLDERS = {
              lambda p: None if os.path.isdir(p) else f"There is no folder {p}."),
     "keys": ("Folder with your keys", "~/MyKeys" if LINUX or MACOS else r"D:\MyKeys",
              lambda p: None if os.path.isfile(os.path.join(p, "prod.keys")) else f"There is no prod.keys in {p}."),
-    "firmware": ("Folder with your firmware", "~/MyFirmware" if LINUX or MACOS else r"D:\MyFirmware",
+    # (optional: "none", the default without last time's answer, is no firmware: the open fonts)
+    "firmware": ("Folder with your firmware, for your console's own fonts (optional; none: the open fonts, without "
+                 "Chinese, Japanese or Korean text)", "none",
                  lambda p: None if os.path.isdir(p) and any(f.lower().endswith(".nca") for f in os.listdir(p))
                  else f"There are no .nca files in {p}."),
 }
@@ -583,7 +602,8 @@ def typed_folder(text):
 
 
 def ask_folder(key, given, saved):
-    """A folder from the command line, or asked, with last time's answer as the default."""
+    """A folder from the command line, or asked, with last time's answer as the default. The
+    firmware's may be "none": None, no firmware."""
     label, default, check = FOLDERS[key]
     default = saved.get(key, default)
     while True:
@@ -599,6 +619,8 @@ def ask_folder(key, given, saved):
                 log()
                 answer = given = default
         answer = os.path.expanduser(answer)
+        if key == "firmware" and answer.strip().lower() == "none":
+            return None
         problem = check(answer)
         if not problem:
             saved[key] = os.path.abspath(answer)
@@ -775,6 +797,31 @@ def missing_fonts(folder):
     return [n for n in FONT_FILES if not os.path.isfile(os.path.join(folder, n))]
 
 
+def use_open_fonts():
+    """Step 5 without a firmware: the game uses the open fonts, which must be there (without a
+    font the game stops); dump/fonts.none records it (nothing goes into dump/fonts)."""
+    gone = [n for n in OPEN_FONT_FILES if not os.path.isfile(os.path.join(OPEN_FONTS, n))]
+    folder = shown(os.path.relpath(OPEN_FONTS, ROOT))
+    if gone:
+        raise Failed(f"Without your firmware the game uses the open fonts of {folder}, and these of them are not there: "
+                     f"{', '.join(gone)}. Restore that folder (run the installer again, or git), or give your firmware "
+                     "folder (--firmware).")
+    if os.path.exists(FONTS + ".none"):
+        log(f"  already done: no firmware, so the game uses the open fonts of {folder}")
+        return
+    again = ("run  bash install-windowsmash.sh --firmware <folder>" if LINUX else
+             "run Install WindowSmash.command again and choose it" if MACOS else
+             "run Install WindowSmash.bat again and fill it in")
+    log(f"  no firmware: the game uses the open fonts of {folder} in place of your console's "
+        f"({shown(os.path.join(folder, 'README.md'))})")
+    log(f"  {WITH_OPEN_FONTS}")
+    log(f"  For your console's own fonts, give your firmware's folder (its .nca files): {again}.")
+    os.makedirs(DUMP, exist_ok=True)
+    with open(FONTS + ".none", "w", newline="\n") as f:   # (so that the firmware is not asked for again for this)
+        f.write("no firmware was given: the game uses the open fonts of third_party/fonts_open; give --firmware to take "
+                "your firmware's\n")
+
+
 def program_problem(rec, game, main):
     """None when the main module at `main` (copied out of the program `rec`) is 13.0.5's, else
     what to say. A build id it doesn't know is named by the files' metadata, unless that says
@@ -834,7 +881,7 @@ def write_romfs_cfg(game, keys, the_program):
     if os.path.isfile(romfs_bin):
         run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
              os.path.join("tools", "Configure-Game-Data.ps1"), "-NonInteractive", "-RomfsPath", romfs_bin,
-             "-FontsDirectory", FONTS],
+             *(["-FontsDirectory", FONTS] if not missing_fonts(FONTS) else [])],   # (none: the open fonts, step 5)
             f"{romfs_bin} could not be used (see above): it must be the game's data, unencrypted and with "
             "the 13.0.5 update applied (setup guide part 2).")
         return
@@ -1021,11 +1068,21 @@ def build(a):
     if a.game or old or not (exefs_done and romfs_done and aoc_done()):
         game = ask_folder("game", a.game, saved)
     if missing_fonts(FONTS):
-        fonts_from = "game" if game and not missing_fonts(os.path.join(game, "fonts")) else "firmware"
-    if game or fonts_from == "firmware":
+        # (no firmware: --no-firmware (a.firmware ""), or none last time (dump/fonts.none) unless --firmware names one now)
+        if game and not missing_fonts(os.path.join(game, "fonts")):
+            fonts_from = "game"
+        elif a.firmware == "" or (a.firmware is None and os.path.exists(FONTS + ".none")):
+            fonts_from = "open"
+        else:
+            fonts_from = "firmware"
+    if game:
         keys = ask_folder("keys", a.keys, saved)
     if fonts_from == "firmware":
-        firmware = ask_folder("firmware", a.firmware, saved)
+        firmware = ask_folder("firmware", a.firmware, saved)   # (None: none, the open fonts)
+        if not firmware:
+            fonts_from = "open"
+        elif not keys:
+            keys = ask_folder("keys", a.keys, saved)
     if not keys:
         log("  none needed: the steps that read them are done")
 
@@ -1052,9 +1109,11 @@ def build(a):
         extract_exefs(the_program()[2], keys)
         check_program(the_program()[2], game)
 
-    log(shown("\n[5/9] Take the fonts out of your firmware (dump\\fonts)"))
+    log(shown("\n[5/9] The fonts: your firmware's (dump\\fonts), or the open ones without it"))
     if fonts_from is None:
         log("  already done")
+    elif fonts_from == "open":
+        use_open_fonts()
     elif fonts_from == "game":
         os.makedirs(FONTS, exist_ok=True)
         for n in FONT_FILES:
@@ -1066,7 +1125,10 @@ def build(a):
         if missing:
             raise Failed(f"These fonts were not in {firmware}: {', '.join(missing)}. Check that it holds all of "
                          "your firmware's .nca files, and that your keys are from after your Switch's latest "
-                         "system update.")
+                         "system update. Or leave the firmware out (in the installer, or --no-firmware here): the game "
+                         "then uses the open fonts of third_party/fonts_open, without Chinese, Japanese or Korean text.")
+    if fonts_from in ("game", "firmware") and os.path.exists(FONTS + ".none"):   # (the firmware's now, not the open ones)
+        os.remove(FONTS + ".none")
 
     log(shown("\n[6/9] Connect your game data (dump\\modules\\romfs.cfg)"))
     if romfs_done:
@@ -1195,7 +1257,11 @@ def main():
     ap = argparse.ArgumentParser(description=f"Build the game from your own files ({launcher}).")
     ap.add_argument("--game", help=f"the folder with the game's files (asked; default {FOLDERS['game'][1]})")
     ap.add_argument("--keys", help=f"the folder with prod.keys and title.keys (asked; default {FOLDERS['keys'][1]})")
-    ap.add_argument("--firmware", help=f"the folder with the firmware's .nca files (asked; default {FOLDERS['firmware'][1]})")
+    ap.add_argument("--firmware", help="the folder with the firmware's .nca files, for your console's own fonts "
+                                       "(optional: asked; without one the game uses the open fonts of third_party/fonts_open)")
+    ap.add_argument("--no-firmware", dest="firmware", action="store_const", const="",
+                    help="no firmware, and not asked for: the game uses the open fonts of third_party/fonts_open (no Chinese, "
+                         "Japanese or Korean text); fonts taken from a firmware before stay")
     ap.add_argument("--jobs", type=int, help="how many files to compile at a time (default: by the RAM)")
     ap.add_argument("--check", action="store_true", help="only check the tools (step 1) and stop")
     ap.add_argument("--prepare-only", action="store_true", help="do every step but the build itself (9)")
