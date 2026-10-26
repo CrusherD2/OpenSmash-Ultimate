@@ -387,13 +387,13 @@ typedef struct { VkStructureType sType; const void *pNext; FbRec *pPipelineCreat
 static volatile LONG64 g_pc_dirty, g_pc_dirty_saved;      /* session 14: creations the driver's cache did not answer (stage libraries by feedback; whole pipelines by their time, over 3 ms), and the count at the last read-out */
 static void pc_dirty_time(LONG64 t0) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); if ((tk() - t0) * 1000 > 3 * fq.QuadPart) InterlockedIncrement64(&g_pc_dirty); }
 static LONG64 g_fb_hit[2], g_fb_miss[2], g_fb_none[2], g_fb_fhit[2], g_fb_fmiss[2], g_fb_fmiss_tk[2], g_fb_fhit_tk[2], g_fb_miss_ns[2];
-static DWORD g_render_tid;
+static DWORD g_vk_render_tid;
 static void fb_note(int kind, const FbRec *f, LONG64 ticks) {
     int valid = f->flags & 1, hit = valid && (f->flags & 2);
     InterlockedIncrement64(!valid ? &g_fb_none[kind] : hit ? &g_fb_hit[kind] : &g_fb_miss[kind]);
     if (kind == 0 && !hit) InterlockedIncrement64(&g_pc_dirty);      /* session 14: a stage library the pipeline cache did not have: the file on disk is now older than the cache */
     if (valid && !hit) InterlockedAdd64(&g_fb_miss_ns[kind], (LONG64)f->duration);
-    if (GetCurrentThreadId() == g_render_tid && g_in_fight) {
+    if (GetCurrentThreadId() == g_vk_render_tid && g_in_fight) {
         static int nl;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
         if (hit) { g_fb_fhit[kind]++; g_fb_fhit_tk[kind] += ticks; } else { g_fb_fmiss[kind]++; g_fb_fmiss_tk[kind] += ticks; }
@@ -405,7 +405,7 @@ static struct { PKey k; VkPipeline lib; } g_olib[128];
 static int g_nolib;
 static VkPipeline g_vilib[3];
 static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_fight;
-static DWORD g_render_tid;
+static DWORD g_vk_render_tid;
 static uint32_t pipe_dyn_list(VkDynamicState *dyn) {
     static const VkDynamicState base[20] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
@@ -486,7 +486,7 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     l->state = 2;
     WakeAllConditionVariable(&g_sh_cv);
     LeaveCriticalSection(&g_sh_lock);
-    if (GetCurrentThreadId() == g_render_tid) {    /* compiled at a draw: the hold the libraries are there to remove */
+    if (GetCurrentThreadId() == g_vk_render_tid) {    /* compiled at a draw: the hold the libraries are there to remove */
         g_gpl_draw++; g_gpl_draw_tk += dt; if (dt > g_gpl_draw_max) g_gpl_draw_max = dt;
         if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): PAIR LIBRARY compiled at the draw, %.2f ms: vertex code %016llx (forced outputs %x), fragment code %016llx (%s)\n", (long long)nvn_front_frame_next(), g_in_fight ? "fight" : "no fight",
                                    (double)dt * 1000.0 / (double)fq.QuadPart, (unsigned long long)vs->hb, vs->fo, (unsigned long long)(fs ? fs->hb : 0), fs && fs->fragonly ? "a fragment stage of a program without a vertex stage" : "a program with both stages, or a pair the look-ahead met"); }
@@ -645,7 +645,7 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     *state = 2;
     WakeAllConditionVariable(&g_sh_cv);
     LeaveCriticalSection(&g_sh_lock);
-    if (GetCurrentThreadId() == g_render_tid) {
+    if (GetCurrentThreadId() == g_vk_render_tid) {
         g_gpl_draw++; g_gpl_draw_tk += dt; if (dt > g_gpl_draw_max) g_gpl_draw_max = dt;
         if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): STAGE LIBRARY compiled at the draw, %.2f ms: %s code %016llx (key %x %x %x %x, forced outputs %x)%s\n", (long long)nvn_front_frame_next(), g_in_fight ? "fight" : "no fight",
                                    (double)dt * 1000.0 / (double)fq.QuadPart, isfs ? "fragment" : "vertex", (unsigned long long)v->hb, v->key[0], v->key[1], v->key[2], v->key[3], v->fo, alone ? " (a vertex stage drawn without a fragment stage)" : ""); }
@@ -720,7 +720,7 @@ static double pipe_build(Pipe *p) {
         fb_note(1, &fb_all, dt);
         p->layout = g_ulayout; p->dl[0] = g_udl[0]; p->dl[1] = g_udl[1]; p->nb[0] = 66; p->nb[1] = 128; p->push0 = 0; p->libbed = 1; p->lib_how = (uint8_t)how;
         InterlockedIncrement64(&R.pipelines);
-        if (GetCurrentThreadId() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_fight) g_gpl_dlink_fight++; }
+        if (GetCurrentThreadId() == g_vk_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_fight) g_gpl_dlink_fight++; }
         else { InterlockedIncrement64(&g_gpl_link); InterlockedAdd64(&g_gpl_link_tk, dt); }
         EnterCriticalSection(&g_sh_lock);
         p->state = 2;
@@ -744,7 +744,7 @@ static double pipe_build(Pipe *p) {
         LONG64 dt = tk() - t1;
         p->layout = l->layout; p->dl[0] = l->dl[0]; p->dl[1] = l->dl[1]; p->nb[0] = l->nb[0]; p->nb[1] = l->nb[1]; p->push0 = l->push0; p->libbed = 1; p->lib_how = (uint8_t)how;
         InterlockedIncrement64(&R.pipelines);
-        if (GetCurrentThreadId() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_fight) g_gpl_dlink_fight++; }
+        if (GetCurrentThreadId() == g_vk_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_fight) g_gpl_dlink_fight++; }
         else { InterlockedIncrement64(&g_gpl_link); InterlockedAdd64(&g_gpl_link_tk, dt); }
         EnterCriticalSection(&g_sh_lock);
         p->state = 2;
@@ -994,7 +994,7 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
     }
     if (mine) {
         t0 = tk();
-        g_render_tid = GetCurrentThreadId();
+        g_vk_render_tid = GetCurrentThreadId();
         double ms = pipe_build(p);
         LONG64 dt = tk() - t0;
         g_tm[5] += dt;
@@ -1036,7 +1036,7 @@ static HANDLE g_pw_thread[16], g_pw_gate;
  * job at the lowest priority: every worker back to normal priority (each sets its own again at its next job). */
 static int g_pw_nthread;
 static void workers_boost(void) {
-    if (g_offline || GetCurrentThreadId() != g_render_tid) return;
+    if (g_offline || GetCurrentThreadId() != g_vk_render_tid) return;
     for (int i = 0; i < g_pw_nthread; i++) if (g_pw_thread[i]) SetThreadPriority(g_pw_thread[i], THREAD_PRIORITY_NORMAL);
     g_boosts++;
 }
