@@ -1,4 +1,4 @@
-/* Track V session 13: the FLASH DETECTOR (included by nvn_vk_draw.c, render thread only). The owner reported "sometimes
+/* Track V session 13: the FLASH DETECTOR (a build unit of its own, render thread only). The owner reported "sometimes
  * white flashes on screen" from real play. Every presented frame the window texture is blitted a second time into a
  * 16x9 image, copied into a small host-visible buffer, and read 8 presents later (the command buffer that wrote it has
  * been waited for by then: there are 8 in flight). Cost: one blit of 144 texels and one copy of 576 bytes per frame.
@@ -10,6 +10,12 @@
  * list of the passes (size, format, window texture or not, draws in it) and the 16x9 brightness map.
  * SSBU_VK_FLASHLOG=0 off; =2 also reports every jump to near white that does NOT come back within 3 frames (a scene
  * change to a white screen is the game's own; for diagnosis). Default 1. Nothing here changes what is drawn. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <windows.h>
+#include "nvn_vk_int.h"
 #define FL_W 16
 #define FL_H 9
 #define FL_RING 8

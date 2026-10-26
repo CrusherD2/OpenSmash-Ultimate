@@ -3524,7 +3524,6 @@ static void present_flush(void) {
 }
 void nvn_vk_present_flush_job(void *arg) { (void)arg; if (V.alive) present_flush(); }
 #include "nvn_vk_menu.c"                          /* U1: the settings menu over the picture (menu.cpp builds it) */
-#include "nvn_vk_flash.c"                         /* session 13: the white-flash detector (fl_pass, fl_capture, fl_shutdown) */
 /* nvn_vk_m4.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
 void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
 /* Session 14, THE FIRST-RUN PREPARATION (the owner's order: "all at the first launch, then never again, with a percentage").
