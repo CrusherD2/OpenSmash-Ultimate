@@ -23,15 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
-/* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
-#ifdef _WIN32
-#define VK_USE_PLATFORM_WIN32_KHR
-#endif
-#define VK_NO_PROTOTYPES
-#ifdef __APPLE__
-#define VK_ENABLE_BETA_EXTENSIONS                       /* VK_KHR_portability_subset (MoltenVK) is declared in vulkan_beta.h */
-#endif
-#include <vulkan/vulkan.h>
+#include "nvn_vk_int.h"                                /* the Khronos headers; what the files of this back end share */
 #ifndef _WIN32
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>                         /* Linux build: the window is an SDL window; SDL makes the surface */
@@ -55,53 +47,7 @@ int display_wait_refresh(void);
 void display_before_present(void);
 
 /* ---------------------------------------------------------------- the loader's functions */
-#ifdef _WIN32
-#define VKF_SURFACE(X) X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *))
-#else
-#define VKF_SURFACE(X)
-#endif
-#define VKF(X) \
-    X(VkResult, vkEnumerateInstanceLayerProperties, (uint32_t *, VkLayerProperties *)) \
-    X(VkResult, vkEnumerateInstanceExtensionProperties, (const char *, uint32_t *, VkExtensionProperties *)) \
-    X(VkResult, vkCreateInstance, (const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance *)) \
-    X(void, vkDestroyInstance, (VkInstance, const VkAllocationCallbacks *)) \
-    X(PFN_vkVoidFunction, vkGetInstanceProcAddr, (VkInstance, const char *)) \
-    X(VkResult, vkEnumeratePhysicalDevices, (VkInstance, uint32_t *, VkPhysicalDevice *)) \
-    X(void, vkGetPhysicalDeviceProperties, (VkPhysicalDevice, VkPhysicalDeviceProperties *)) \
-    X(void, vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *)) \
-    X(VkResult, vkEnumerateDeviceExtensionProperties, (VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *)) \
-    VKF_SURFACE(X) \
-    X(void, vkDestroySurfaceKHR, (VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)) \
-    X(VkResult, vkGetPhysicalDeviceSurfaceSupportKHR, (VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *)) \
-    X(VkResult, vkGetPhysicalDeviceSurfaceCapabilitiesKHR, (VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *)) \
-    X(VkResult, vkGetPhysicalDeviceSurfaceFormatsKHR, (VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkSurfaceFormatKHR *)) \
-    X(VkResult, vkGetPhysicalDeviceSurfacePresentModesKHR, (VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkPresentModeKHR *)) \
-    X(VkResult, vkCreateDevice, (VkPhysicalDevice, const VkDeviceCreateInfo *, const VkAllocationCallbacks *, VkDevice *)) \
-    X(void, vkDestroyDevice, (VkDevice, const VkAllocationCallbacks *)) \
-    X(void, vkGetDeviceQueue, (VkDevice, uint32_t, uint32_t, VkQueue *)) \
-    X(VkResult, vkDeviceWaitIdle, (VkDevice)) \
-    X(VkResult, vkCreateSwapchainKHR, (VkDevice, const VkSwapchainCreateInfoKHR *, const VkAllocationCallbacks *, VkSwapchainKHR *)) \
-    X(void, vkDestroySwapchainKHR, (VkDevice, VkSwapchainKHR, const VkAllocationCallbacks *)) \
-    X(VkResult, vkGetSwapchainImagesKHR, (VkDevice, VkSwapchainKHR, uint32_t *, VkImage *)) \
-    X(VkResult, vkAcquireNextImageKHR, (VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *)) \
-    X(VkResult, vkQueuePresentKHR, (VkQueue, const VkPresentInfoKHR *)) \
-    X(VkResult, vkQueueSubmit, (VkQueue, uint32_t, const VkSubmitInfo *, VkFence)) \
-    X(VkResult, vkCreateCommandPool, (VkDevice, const VkCommandPoolCreateInfo *, const VkAllocationCallbacks *, VkCommandPool *)) \
-    X(void, vkDestroyCommandPool, (VkDevice, VkCommandPool, const VkAllocationCallbacks *)) \
-    X(VkResult, vkAllocateCommandBuffers, (VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *)) \
-    X(VkResult, vkBeginCommandBuffer, (VkCommandBuffer, const VkCommandBufferBeginInfo *)) \
-    X(VkResult, vkEndCommandBuffer, (VkCommandBuffer)) \
-    X(VkResult, vkResetCommandBuffer, (VkCommandBuffer, VkFlags)) \
-    X(void, vkCmdPipelineBarrier, (VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const void *, uint32_t, const void *, uint32_t, const VkImageMemoryBarrier *)) \
-    X(void, vkCmdClearColorImage, (VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *, uint32_t, const VkImageSubresourceRange *)) \
-    X(void, vkCmdCopyImage, (VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageCopy *)) \
-    X(VkResult, vkCreateSemaphore, (VkDevice, const VkSemaphoreCreateInfo *, const VkAllocationCallbacks *, VkSemaphore *)) \
-    X(void, vkDestroySemaphore, (VkDevice, VkSemaphore, const VkAllocationCallbacks *)) \
-    X(VkResult, vkCreateFence, (VkDevice, const VkFenceCreateInfo *, const VkAllocationCallbacks *, VkFence *)) \
-    X(void, vkDestroyFence, (VkDevice, VkFence, const VkAllocationCallbacks *)) \
-    X(VkResult, vkWaitForFences, (VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t)) \
-    X(VkResult, vkResetFences, (VkDevice, uint32_t, const VkFence *))
-#define X(ret, name, args) static ret (VKAPI_PTR *name) args;
+#define X(ret, name, args) ret (VKAPI_PTR *pfn_##name) args;      /* VKF and the names its calls use: nvn_vk_int.h */
 VKF(X)
 #undef X
 static VkResult (VKAPI_PTR *vkEnumerateInstanceVersion)(uint32_t *);          /* absent from a Vulkan 1.0 loader */
