@@ -1746,11 +1746,10 @@ namespace OpenSmash.Launcher
         // Mod actions
         void AddMod()
         {
-            using var dlg = new FolderBrowserDialog { Description = "Pick a mod folder (copied into the mods folder)", ShowNewFolderButton = false };
-            if (dlg.ShowDialog() != DialogResult.OK) return;
-            string name = Path.GetFileName(dlg.SelectedPath);
+            if (!FolderPicker.Show(this, out string src, out bool asLink)) return;
+            string name = Path.GetFileName(src.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             string dst = Path.Combine(_modsDir, name);
-            if (Directory.Exists(dst))
+            if (Directory.Exists(dst) || File.Exists(dst))
             {
                 MessageBox.Show($"A mod called \"{name}\" is already installed.", "OpenSmash");
                 return;
@@ -1758,7 +1757,8 @@ namespace OpenSmash.Launcher
             try
             {
                 Directory.CreateDirectory(_modsDir);
-                CopyDirectory(dlg.SelectedPath, dst);
+                if (asLink) Directory.CreateSymbolicLink(dst, src);
+                else CopyDirectory(src, dst);
                 try { OsMods(new[] { "apply" }); } catch (Exception ex) { MessageBox.Show(ex.Message, "OpenSmash"); }
                 UpdateMods();
                 _ = PushInstalledState();
@@ -1766,7 +1766,7 @@ namespace OpenSmash.Launcher
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Could not copy: {ex.Message}", "OpenSmash-Ultimate");
+                MessageBox.Show(asLink ? $"Could not add the link: {ex.Message}" : $"Could not copy: {ex.Message}", "OpenSmash-Ultimate");
             }
         }
 

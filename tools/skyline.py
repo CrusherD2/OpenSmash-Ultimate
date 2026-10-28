@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -118,16 +119,61 @@ def recomp_stream(p, log, *args):
 
 
 def mod_slug(mod):
-    """A short module name from the mod's folder: "(Moveset) Kratos" -> kratos."""
+    """The character a mod folder names: "(Moveset) Kratos" -> kratos."""
     words = re.findall(r"[A-Za-z0-9]+", mod)
     name = (words[-1] if words else "plugin").lower()
     return name if name[0].isalpha() else "n_" + name
 
 
+def template_module(name):
+    return name == "smashline_test" or name.startswith("smashline_test_")
+
+
+def write_module_name(path, name):
+    """Smashline identifies a plugin by the length-prefixed name in front of MOD0, not by the
+    file name. That slot ends at MOD0, so a longer name stops there."""
+    from nso import Module
+    m = Module(path)
+    start = m.rodata.mem + 8
+    mod0 = bytes(m.image).find(b"MOD0", start)
+    if mod0 < 0:
+        return m.module_name()
+    raw = name.encode("ascii", "ignore")[:mod0 - start]
+    if not raw:
+        return m.module_name()
+    blob = struct.pack("<I", len(raw)) + raw + b"\0" * (mod0 - start - len(raw))
+    with open(path, "r+b") as f:
+        f.seek(m.rodata.mem + 4)
+        f.write(blob)
+    return raw.decode("ascii")
+
+
+def stamp_identity(path, prefer, p):
+    """A Skyline template leaves every moveset named smashline_test. Smashline then treats the
+    second one as the first, and its character never reaches the select screen. The name becomes
+    the character the mod folder names."""
+    from nso import Module
+    m = Module(path)
+    if not prefer or not template_module(m.module_name()):
+        return
+    taken = set()
+    bases = os.path.join(p.nro, "bases.txt")
+    if os.path.isfile(bases):
+        for line in open(bases, encoding="utf-8"):
+            row = line.split()
+            if len(row) == 4 and row[3] != m.build_id:
+                taken.add(row[0])
+    name = prefer
+    while name in taken:
+        name += "_"
+    write_module_name(path, name)
+
+
 def rename_template(p, build_id, current, prefer):
     """Smashline's sample project is named smashline_test, so a second moveset built from it
-    would be smashline_test_ and the two would share one name. Name each after its mod."""
-    if not prefer or not (current == "smashline_test" or current.startswith("smashline_test_")):
+    would be smashline_test_ and the two would share one name. Name each after its character,
+    in the file's own identity and in the record."""
+    if not prefer or not template_module(current):
         return current
     bases = os.path.join(p.nro, "bases.txt")
     rows = [l.split() for l in open(bases, encoding="utf-8") if l.strip()]
@@ -135,18 +181,19 @@ def rename_template(p, build_id, current, prefer):
     name = prefer
     while name in taken:
         name += "_"
-    if name == current:
-        return current
     src, dst = os.path.join(p.nro, current + ".nro"), os.path.join(p.nro, name + ".nro")
-    if os.path.isfile(src):
+    if name != current and os.path.isfile(src):
         if os.path.isfile(dst):
             os.remove(dst)
         os.replace(src, dst)
-    for r in rows:
-        if len(r) == 4 and r[3] == build_id:
-            r[0] = name
-    with open(bases, "w", encoding="utf-8", newline="\n") as f:
-        f.writelines(" ".join(r) + "\n" for r in rows)
+    if os.path.isfile(dst):
+        write_module_name(dst, name)
+    if name != current:
+        for r in rows:
+            if len(r) == 4 and r[3] == build_id:
+                r[0] = name
+        with open(bases, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(" ".join(r) + "\n" for r in rows)
     return name
 
 
@@ -154,6 +201,7 @@ def module_of(p, source, record, prefer=None):
     """The module name tools/recomp.py gives the plugin: placed in dump/nro/ if it is new."""
     import recomp as rc
     from nso import Module
+    stamp_identity(source, prefer, p)
     m = Module(source)
     placed = os.path.join(p.nro, record[m.build_id]["module"] + ".nro") if m.build_id in record else None
     if placed and os.path.exists(placed):

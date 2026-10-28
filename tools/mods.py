@@ -63,6 +63,7 @@ import os
 import re
 import shutil
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -187,6 +188,23 @@ class Tree:
         except (OSError, ValueError):
             return False
         return bool(applied.get("arcropolis") and applied.get("mods"))
+
+
+def remove_folder(folder):
+    """Take a mod out of mods/. A symbolic link or a junction is the link only; the folder
+    it points at stays where it is."""
+    try:
+        st = os.lstat(folder)
+    except OSError:
+        return
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    tag = getattr(st, "st_reparse_tag", 0)
+    link = stat.S_ISLNK(st.st_mode) or (
+        reparse and tag in (stat.IO_REPARSE_TAG_SYMLINK, stat.IO_REPARSE_TAG_MOUNT_POINT))
+    if link:
+        os.rmdir(folder)
+        return
+    shutil.rmtree(folder)
 
 
 # ---- a mod's files ---------------------------------------------------------------------------
@@ -2104,7 +2122,7 @@ def main():
             state = tree.load()
             for n in a.args:
                 if n in state["mods"]:
-                    shutil.rmtree(os.path.join(tree.mods, n))
+                    remove_folder(os.path.join(tree.mods, n))
             tree.save(tree.load())
         elif a.command == "order":
             state = tree.load()

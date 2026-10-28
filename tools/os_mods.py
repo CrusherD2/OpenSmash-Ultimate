@@ -228,11 +228,8 @@ def main(argv):
         if cmd == "remove":
             if len(argv) < 3:
                 raise mods.Error("name the mod's folder")
-            import shutil
             for name in argv[2:]:
-                folder = os.path.join(tree.mods, name)
-                if os.path.isdir(folder):
-                    shutil.rmtree(folder)
+                mods.remove_folder(os.path.join(tree.mods, name))
             tree.save(tree.load())
             mods.apply(tree, log)
             return result(True)

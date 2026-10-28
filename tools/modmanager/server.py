@@ -414,8 +414,8 @@ class App:
         if path == "/api/remove":
             for n in body["names"]:
                 folder = os.path.join(t.mods, mods.safe_name(n))
-                if n == mods.safe_name(n) and os.path.isdir(folder):
-                    shutil.rmtree(folder)
+                if n == mods.safe_name(n) and (os.path.isdir(folder) or os.path.islink(folder)):
+                    mods.remove_folder(folder)
             t.save(t.load())
             return self.library()
         if path == "/api/rename":
