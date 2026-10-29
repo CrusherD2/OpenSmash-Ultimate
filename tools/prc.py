@@ -163,6 +163,10 @@ def apply(base, patch):
     are added); any other value replaced."""
     kind, v = base
     pkind, pv = patch
+    if kind != pkind:   # (prc-rs' apply_patch: NotSamePType; replaced, the file would hold a field the game
+        # reads as another type - seen: a mod's ui_series_db.prcx with an sbyte where another mod's whole
+        # ui_series_db.prc has a short)
+        raise Error(f"the patch has a {NAMES.get(pkind, pkind)} where the file has a {NAMES.get(kind, kind)}")
     if kind == STRUCT and pkind == STRUCT:
         out = Struct(v)
         where = {k: i for i, (k, _) in enumerate(out)}

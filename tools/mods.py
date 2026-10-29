@@ -118,8 +118,26 @@ TOP = {"fighter", "ui", "sound", "stream;", "prebuilt;", "effect", "stage", "cam
 PLUGIN_DATA = {"flags"}
 ROOTS = TOP | PLUGIN_DATA
 # ARCropolis' patch files: merged into the game's file of the same name (or a mod's whole one) when
-# mods are applied - .xmsbt into an .msbt (text), .prcx and .prcxml into a .prc (params)
-PATCHES = {".xmsbt": ".msbt", ".prcx": ".prc", ".prcxml": ".prc"}
+# mods are applied - .xmsbt into an .msbt (text), .prcx and .prcxml into a .prc (params), and the stage
+# files' .stdatx / .stdatxml and .stprmx / .stprmxml (param files too, as ARCropolis' prc.rs takes them)
+PATCHES = {".xmsbt": ".msbt", ".prcx": ".prc", ".prcxml": ".prc",
+           ".stdatx": ".stdat", ".stdatxml": ".stdat", ".stprmx": ".stprm", ".stprmxml": ".stprm"}
+# ARCropolis' regions, in the order of a regional file's data entries (the game reads to_data + 1 + its
+# region). A file or a patch named <name>+<region>.<ext> (msg_name+us_en.xmsbt) is that region's only
+# (ARCropolis' strip_regional): for a regional file its region's data entry, for any other file only
+# when the game's region is that one - always us_en here (runtime/hle_env.c: nn::oe::GetDesiredLanguage)
+REGIONS = ("jp_ja", "us_en", "us_fr", "us_es", "eu_en", "eu_fr", "eu_es", "eu_de", "eu_nl", "eu_it", "eu_ru", "kr_ko",
+           "zh_cn", "zh_tw")
+GAME_REGION = "us_en"
+REGION_SUFFIX = re.compile(r"\+([a-z]{2}_[a-z]{2})(?=\.[^./]*$)", re.I)
+
+
+def strip_region(path):
+    """(path without its +<region>, the region or None)."""
+    m = REGION_SUFFIX.search(path)
+    if not m or m.group(1).lower() not in REGIONS:
+        return path, None
+    return path[:m.start()] + path[m.end():], m.group(1).lower()
 SKIP_FILES = {"info.toml", "config.json", "preview.webp", "preview.png", "preview.jpg", "readme.txt", "readme.md"}
 GAMEBANANA = "https://gamebanana.com/apiv11"
 
@@ -642,6 +660,25 @@ class Table:
             folder, data, _ = self.entry("info_to_datas", to_data + r, "<3I")
             out.append((folder, data))
         return sorted(set(out))
+
+    def region_targets(self, path):
+        """[(folder, data, regions)] of a file: for a regional file each data entry with the regions that
+        read it (two regions can share one, the same text), for any other file its one entry with None;
+        [] for a path the game doesn't have."""
+        p = self.path_index(path)
+        if p is None:
+            return []
+        full = self.entry("paths", p, "<Q")[0]
+        info = self.entry("info_indices", full >> 40, "<2I")[1]
+        _, _, to_data, flags = self.entry("infos", info, "<4I")
+        if not flags & 0x8000:
+            folder, data, _ = self.entry("info_to_datas", to_data, "<3I")
+            return [(folder, data, None)]
+        by = {}
+        for r in range(1, self.arc.regions + 1):
+            folder, data, _ = self.entry("info_to_datas", to_data + r, "<3I")
+            by.setdefault((folder, data), set()).add(REGIONS[r - 1] if r - 1 < len(REGIONS) else f"region {r - 1}")
+        return [(f, d, rs) for (f, d), rs in sorted(by.items())]
 
     def original(self, folder, data):
         """A file's bytes as the game has them (its folder and data entries)."""
@@ -1791,20 +1828,24 @@ def _apply(tree, image, lines, state, on, log):
     # in order, by the file they patch
     chosen = {}
     patches = {}
+    regional = {}   # path -> {region: (path, file, mod)}: whole files for one region (a later mod wins)
     for name in on:
         for plugin in plugins(os.path.join(tree.mods, name)):
             log(f"{name}: {plugin} is a Skyline code plugin (a moveset, a new character...): recompiled into the game "
                 "(tools/skyline.py)")
         for path, src in mod_files(os.path.join(tree.mods, name)):
-            stem, ext = os.path.splitext(path)
+            base, region = strip_region(path)
+            stem, ext = os.path.splitext(base)
             if ext.lower() in PATCHES:
-                patches.setdefault((stem + PATCHES[ext.lower()]).lower(), []).append((path, src, name))
+                patches.setdefault((stem + PATCHES[ext.lower()]).lower(), []).append((path, src, name, region))
+            elif region:   # (a whole file for one region: msg_name+us_en.msbt)
+                regional.setdefault(base.lower(), {})[region] = (path, src, name)
             else:
                 chosen[path.lower()] = (path, src, name)
     # the characters plugins add to the select screen (the CSK Collection's API: dump/skyline/csk.json)
     csk_entries = csk.load(tree.root)
     for target in csk.targets(csk_entries):
-        patches.setdefault(target, []).append(("csk.json", None, "Skyline plugins"))
+        patches.setdefault(target, []).append(("csk.json", None, "Skyline plugins", None))
     os.makedirs(tree.work, exist_ok=True)
     overlay_path = os.path.join(tree.work, "overlay.bin")
     tmp_path = overlay_path + ".tmp"
@@ -1907,21 +1948,41 @@ def _apply(tree, image, lines, state, on, log):
             for folder, d in targets:
                 table.replace(folder, d, data)
             changed += 1
-        for key in sorted(patches):
+        # patches, and whole files for one region, by the file they are for: each data entry (a regional
+        # file: each region's own text) gets the patches for every region or for its own, over the mod's
+        # whole file for its region, else the mod's whole file, else the game's own
+        for key in sorted(set(patches) | set(regional)):
+            plist = patches.get(key, [])
             whole = chosen.get(key)
-            targets = table.file_targets(whole[0] if whole else key)
-            targets = [(f, d) for f, d in targets or [] if table.entry("datas", d, "<4I")[2]]
+            mine = regional.get(key, {})
+            targets = [(f, d, rs) for f, d, rs in table.region_targets(whole[0] if whole else key)
+                       if table.entry("datas", d, "<4I")[2]]
             if not targets:
-                for path, _src, name in patches[key]:
+                for path, _src, name, _region in plist:
                     skipped.setdefault(name, []).append(path)
                     log(f"{name}: {path} not merged: the game has no {key}")
+                for path, _src, name in mine.values():
+                    skipped.setdefault(name, []).append(path)
+                    log(f"{name}: {path} left out: the game has no {key}")
                 continue
             if whole:
                 with open(whole[1], "rb") as f:
                     whole_data = f.read()
-            for folder, d in targets:   # (each region's own text, for a regional file)
-                data = whole_data if whole else table.original(folder, d)
-                for path, src, name in patches[key]:
+            used = set()   # (a region's file or a patch that went into some data entry)
+            failed = set()
+            for folder, d, regions in targets:
+                rs = regions or {GAME_REGION}   # (a file with one text for all: the game's region's)
+                own = next((mine[r] for r in sorted(rs) if r in mine), None)
+                todo = [e for e in plist if e[3] is None or e[3] in rs]
+                if not own and not todo:
+                    continue
+                if own:
+                    with open(own[1], "rb") as f:
+                        data = f.read()
+                    used.add(own[0])
+                else:
+                    data = whole_data if whole else table.original(folder, d)
+                for path, src, name, _region in todo:
                     if src is None:   # (csk.json: the plugins' characters)
                         try:
                             data, notes = csk.apply(data, csk_entries, "ui_layout_db" if key == csk.LAYOUT_DB else "ui_chara_db")
@@ -1930,18 +1991,36 @@ def _apply(tree, image, lines, state, on, log):
                         for note in notes:
                             log(f"Skyline plugins: {note}")
                         continue
+                    if path in failed:
+                        continue
                     with open(src, "rb") as f:
                         patch = f.read()
                     try:
                         if path.lower().endswith(".xmsbt"):
                             data = msbt.patch_bytes(data, patch)
                         else:
-                            data = prc.patch_bytes(data, patch, xml=path.lower().endswith(".prcxml"))
+                            data = prc.patch_bytes(data, patch, xml=path.lower().endswith("xml"))
+                        used.add(path)
                     except (msbt.Error, prc.Error, ValueError, struct.error, ET.ParseError) as e:
-                        raise Error(f"{name}: {path} can't be merged into {key}: {e}")
+                        # one patch that can't be merged is left out, the others still go in (as
+                        # ARCropolis leaves out a patch it can't read): before, it stopped the whole apply
+                        # (seen: a mod's ui_series_db.prcx against another mod's whole ui_series_db.prc)
+                        failed.add(path)
+                        skipped.setdefault(name, []).append(path)
+                        log(f"{name}: {path} left out: it can't be merged into {key}: {e}")
                 table.replace(folder, d, data)
-            for path, _src, name in patches[key]:
-                merged.setdefault(name, []).append(path)
+            for path, _src, name, _region in plist:
+                if path in used:
+                    merged.setdefault(name, []).append(path)
+                elif path not in failed and _src is not None:
+                    skipped.setdefault(name, []).append(path)
+                    log(f"{name}: {path} left out: the game reads the {GAME_REGION} text of {key}")
+            for path, _src, name in mine.values():
+                if path in used:
+                    changed += 1
+                else:
+                    skipped.setdefault(name, []).append(path)
+                    log(f"{name}: {path} left out: the game reads the {GAME_REGION} text of {key}")
         plugin_file_callbacks(tree, table, log)
         if table.kept_shared:
             log(f"{len(table.kept_shared)} file{'s' if len(table.kept_shared) > 1 else ''} kept shared with the fighter's other "
