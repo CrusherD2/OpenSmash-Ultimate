@@ -1039,6 +1039,12 @@ static void mod_set_make(void) {
     size_t n = fread(js, 1, sizeof js - 1, f);
     fclose(f);
     js[n] = 0;
+    /* Only what the game reads (mods.py's Tree.is_modded): romfs.cfg the modded layer map, or the real
+     * ARCropolis loading the listed mods. "mods.py vanilla" keeps applied.json's list as it was. */
+    char cfg[4096] = "";
+    snprintf(path, sizeof path, "%s/romfs.cfg", data);
+    if ((f = fopen(path, "rb"))) { cfg[fread(cfg, 1, sizeof cfg - 1, f)] = 0; fclose(f); }
+    if (!strstr(cfg, "romfs_mods.layers") && !strstr(js, "\"arcropolis\": true")) return;
     static char names[4096][256];
     int count = applied_mods(js, names, 4096);
     ModSum *m = count ? calloc((size_t)count, sizeof *m) : NULL;
