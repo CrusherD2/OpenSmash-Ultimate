@@ -56,6 +56,7 @@ namespace OpenSmash.Launcher
             ["gpu"] = "Auto picks the fastest card.",
             ["hide_cursor"] = "Hides the pointer over the game after 2 seconds without moving it.",
             ["overlay"] = "The frame rate in the corner. F1 shows or hides it while playing.",
+            ["volume"] = "How loud the game is. 100 is full. It applies the next time you press Play.",
             ["name"] = "What other players see. Leave it empty and the game picks one.",
             ["lobby"] = "Public: everyone's rooms. Private: only players with the same code. Offline: no network.",
             ["code"] = "A word your friends type too. Capital letters count.",
@@ -1554,6 +1555,7 @@ namespace OpenSmash.Launcher
                 }
             }
 
+            _volTrackValid = false;
             Font valueFont = FM(13 * s);
             float valueSpacing = 13 * s * 0.06f;
             float longestValue = 0;
@@ -1618,23 +1620,40 @@ namespace OpenSmash.Launcher
                     string val = ShownValue(set);
                     if (set.Text && inView)
                         _editRects[set.Key] = new Rectangle((int)ctlX, (int)cy, (int)ctlW, (int)ctlH);
-                    float fh = Hov(id + ":dd", enabled && (_hover == id + ":dd" || isOpen));
-                    using (var p = Theme.Para(ctlX, cy, ctlW, ctlH, 8 * s))
+                    if (set.Slider)
                     {
-                        using (var b = new SolidBrush(A(White(14 + (int)(10 * fh))))) g.FillPath(b, p);
-                        using (var pen = new Pen(A(isOpen ? Theme.Accent : Theme.Mix(Theme.Line, White(150), fh)), Math.Max(1, s))) g.DrawPath(pen, p);
+                        if (inView) PaintVolume(g, ctlX, cy, ctlW, ctlH);
                     }
-                    var valueClip = g.Save();
-                    g.SetClip(new RectangleF(ctlX + 14 * s, cy, Math.Max(1, ctlW - 52 * s), ctlH), CombineMode.Intersect);
-                    Theme.Label(g, set.Text ? val : val.ToUpperInvariant(), valueFont, A(enabled ? Theme.Text : Theme.Dim), ctlX + 20 * s, cy, ctlH, valueSpacing);
-                    g.Restore(valueClip);
-                    float chx = ctlX + ctlW - 32 * s, chy = cy + ctlH / 2, ca = 4.5f * s, dir = isOpen ? -1 : 1;
-                    using (var pen = new Pen(A(isOpen ? Theme.Accent : Theme.Mix(Theme.Muted, Theme.Text, fh)), Math.Max(1.2f, 1.6f * s)))
-                        g.DrawLines(pen, new[] { new PointF(chx - ca, chy - ca * 0.5f * dir), new PointF(chx, chy + ca * 0.5f * dir), new PointF(chx + ca, chy - ca * 0.5f * dir) });
+                    else
+                    {
+                        float fh = Hov(id + ":dd", enabled && (_hover == id + ":dd" || isOpen));
+                        using (var p = Theme.Para(ctlX, cy, ctlW, ctlH, 8 * s))
+                        {
+                            using (var b = new SolidBrush(A(White(14 + (int)(10 * fh))))) g.FillPath(b, p);
+                            bool editingBox = set.Text && _editingKey == set.Key;
+                        using (var pen = new Pen(A(isOpen || editingBox ? Theme.Accent : Theme.Mix(Theme.Line, White(150), fh)), Math.Max(1, s))) g.DrawPath(pen, p);
+                        }
+                        bool editing = set.Text && _editingKey == set.Key;
+                        bool hint = set.Text && string.IsNullOrEmpty(_iniValues.GetValueOrDefault(set.Key, ""));
+                        if (!editing)
+                        {
+                            var valueClip = g.Save();
+                            g.SetClip(new RectangleF(ctlX + 14 * s, cy, Math.Max(1, ctlW - (set.Text ? 28 * s : 52 * s)), ctlH), CombineMode.Intersect);
+                            Theme.Label(g, set.Text ? val : val.ToUpperInvariant(), valueFont, A(!enabled ? Theme.Dim : hint ? Theme.Muted : Theme.Text), ctlX + 20 * s, cy, ctlH, valueSpacing);
+                            g.Restore(valueClip);
+                        }
+                        if (!set.Text)
+                        {
+                            float chx = ctlX + ctlW - 32 * s, chy = cy + ctlH / 2, ca = 4.5f * s, dir = isOpen ? -1 : 1;
+                            using (var pen = new Pen(A(isOpen ? Theme.Accent : Theme.Mix(Theme.Muted, Theme.Text, fh)), Math.Max(1.2f, 1.6f * s)))
+                                g.DrawLines(pen, new[] { new PointF(chx - ca, chy - ca * 0.5f * dir), new PointF(chx, chy + ca * 0.5f * dir), new PointF(chx + ca, chy - ca * 0.5f * dir) });
+                        }
+                    }
                     if (enabled && inView)
                     {
                         AddHit(id, x, Math.Max(ry, listTop), cw, Math.Min(ry + rowH, listTop + viewH) - Math.Max(ry, listTop));
-                        AddHit(id + ":dd", ctlX, cy, ctlW, ctlH);
+                        if (set.Slider) AddHit("vol:" + set.Key, ctlX, cy, ctlW, ctlH);
+                        else AddHit(id + ":dd", ctlX, cy, ctlW, ctlH);
                     }
                     HLine(g, x, x + cw, ry + rowH);
                     PopFade(g, st);
@@ -1655,12 +1674,38 @@ namespace OpenSmash.Launcher
                 AddHit("setscroll", trackX - 10 * s, listTop, 24 * s, viewH);
             }
 
+            if (_editingKey != null && _settingEdit != null && _settingEdit.Visible && _editRects.TryGetValue(_editingKey, out var editAt))
+                FitSettingEdit(editAt);
+
             if (openIdx >= 0)
             {
                 float ry = listTop + (rowTops[openIdx] - _settingsScroll);
                 PaintDropdown(g, H, vis[openIdx], Array.IndexOf(_settings, vis[openIdx]), ctlX, ry + (rowH - ctlH) / 2, ctlW, ctlH);
             }
         }
+        void PaintVolume(Graphics g, float ctlX, float cy, float ctlW, float ctlH)
+        {
+            float s = _s;
+            int vol = 100;
+            int.TryParse(_iniValues.GetValueOrDefault("volume", "100"), out vol);
+            vol = Math.Clamp(vol, 0, 100);
+            float pad = 16 * s, labelW = 52 * s;
+            float trackX = ctlX + pad;
+            float trackW = Math.Max(20 * s, ctlW - pad - labelW - 8 * s);
+            float trackH = Math.Max(3 * s, 4 * s);
+            float mid = cy + ctlH / 2;
+            _volTrackX = trackX;
+            _volTrackW = trackW;
+            _volTrackY = cy;
+            _volTrackH = ctlH;
+            _volTrackValid = true;
+            using (var b = new SolidBrush(A(White(40)))) g.FillRectangle(b, trackX, mid - trackH / 2, trackW, trackH);
+            using (var b = new SolidBrush(A(Theme.Accent))) g.FillRectangle(b, trackX, mid - trackH / 2, trackW * vol / 100f, trackH);
+            float r = 7 * s, tx = trackX + trackW * vol / 100f;
+            using (var b = new SolidBrush(A(Theme.Text))) g.FillEllipse(b, tx - r, mid - r, r * 2, r * 2);
+            Theme.Label(g, vol.ToString(), FM(13 * s), A(Theme.Text), ctlX + ctlW - labelW - 10 * s, cy, ctlH, 13 * s * 0.04f, StringAlignment.Far, labelW);
+        }
+
         void PaintDropdown(Graphics g, int H, Setting set, int idx, float fx, float fy, float fw, float fh)
         {
             float s = _s;

@@ -430,6 +430,8 @@ int skyline_provides(const char *path) {
                                           "skyline/plugins/libarcropolis.nro",
                                           /* (linked into each plugin that uses it) */
                                           "skyline/plugins/libparam_config.nro",
+                                          /* (loaded from plugins.txt; Vegeta and Gogeta stop unless this path exists) */
+                                          "skyline/plugins/libone_slot_eff.nro",
                                           /* (not yet: plugins check for it, Sonic Re-Imagined without using it) */
                                           "skyline/plugins/libthe_csk_collection.nro", 0};
     while (*path == '/') path++;

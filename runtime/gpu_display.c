@@ -53,7 +53,8 @@ static struct {
     char gpu[64];
     float render_scale;   /* 0: auto */
     double speed;         /* SSBU_SPEED (test runs): 1 normal */
-} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, 1.0};
+    float volume;         /* display.ini volume, 0-100: the output's loudness, 100 full */
+} cfg = {MODE_WINDOWED, 1280, 720, 3, 1, 1, PACING_CLOCK, 0, "auto", 1.0f, 1.0, 1.0f};
 
 static const char DEFAULT_INI[] =
     "; display.ini: the game's window and the pacing of its frames. Read when the game starts; the\n"
@@ -118,6 +119,8 @@ static const char DEFAULT_INI[] =
     "hide_cursor = 1\n"
     "; overlay = 1: show the frame rate in the corner from the start (F1 shows or hides it while playing).\n"
     "overlay = 1\n"
+    "; volume = 0-100: how loud the game is. 100 is full. Read when the game starts.\n"
+    "volume = 100\n"
     "; overlay_scale = 0.25-2: the overlay's size (0.5: half as big, out of the way of the game).\n"
     "overlay_scale = 1\n"
     "\n"
@@ -213,6 +216,12 @@ static BOOL CALLBACK load_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         else if (!_stricmp(key, "overlay_scale")) parse_overlay_scale(value);
         else if (!_stricmp(key, "gpu")) snprintf(cfg.gpu, sizeof cfg.gpu, "%s", value);
         else if (!_stricmp(key, "render_scale")) parse_render_scale(value);
+        else if (!_stricmp(key, "volume")) {
+            int n = atoi(value);
+            if (n < 0) n = 0;
+            if (n > 100) n = 100;
+            cfg.volume = n / 100.f;
+        }
         else fprintf(stderr, "[display] %s: unknown setting '%s'\n", path, key);
     }
     if (f) fclose(f);
@@ -240,6 +249,7 @@ int display_latency(void) { load(); return cfg.latency; }
 Pacing display_pacing(void) { load(); return cfg.pacing; }
 const char *display_gpu(void) { load(); return cfg.gpu; }
 float display_render_scale(void) { load(); return cfg.render_scale; }
+float display_volume(void) { load(); return cfg.volume; }
 
 /* (the settings menu) the render scale it saved: shown from now on, the renderer's own counts
  * only at the next start */

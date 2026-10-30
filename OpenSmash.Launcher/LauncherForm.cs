@@ -218,6 +218,8 @@ namespace OpenSmash.Launcher
             KeyDown += OnKeyDown;
             FormClosing += (s, e) => 
             { 
+                CommitEdit();
+                PersistSettings();
                 // Only kill the game if the launcher is closing without having
                 // launched it (Play sets _waitingForGame and lets it run on).
                 if (!_waitingForGame && _gameProcess != null && !_gameProcess.HasExited)
@@ -241,6 +243,7 @@ namespace OpenSmash.Launcher
             {
                 new SettingTab { Name = "Display", SettingKeys = new[] { "window", "window_size", "pacing" } },
                 new SettingTab { Name = "Graphics", SettingKeys = new[] { "render_scale", "gpu", "overlay", "hide_cursor" } },
+                new SettingTab { Name = "Audio", SettingKeys = new[] { "volume" } },
                 new SettingTab { Name = "Online", SettingKeys = new[] { "name", "lobby", "code", "server", "direct" } },
                 new SettingTab { Name = "Controllers", SettingKeys = new[] { "keyboard_player", "background", "pads" } },
             };
@@ -254,6 +257,7 @@ namespace OpenSmash.Launcher
                 new Setting { Key = "gpu", Label = "Graphics card", Values = new[] { "auto", "warp" }, Labels = new[] { "The fastest (auto)", "WARP (Windows itself, no card: slow)" } },
                 new Setting { Key = "hide_cursor", Label = "Hide the mouse pointer", Values = new[] { "1", "0" }, Labels = new[] { "When it stops moving", "Keep it shown" } },
                 new Setting { Key = "overlay", Label = "Frame rate", Values = new[] { "1", "0" }, Labels = new[] { "Show it in the corner", "Hidden" } },
+                new Setting { Key = "volume", Label = "Volume", Slider = true },
                 new Setting { Key = "name", Label = "Your name", Text = true },
                 new Setting { Key = "lobby", Label = "Lobby", Values = new[] { "public", "private", "custom", "offline" }, Labels = new[] { "Public lobby", "Private lobby (a code)", "Your own server", "Offline" } },
                 new Setting { Key = "code", Label = "Lobby code", Text = true },
@@ -266,12 +270,19 @@ namespace OpenSmash.Launcher
             _settingEdit = new TextBox
             {
                 Visible = false,
-                BorderStyle = BorderStyle.FixedSingle,
+                BorderStyle = BorderStyle.None,
+                Multiline = true,
+                WordWrap = false,
+                AcceptsReturn = false,
+                AutoSize = false,
                 Font = new Font("Segoe UI", 15, FontStyle.Regular, GraphicsUnit.Pixel),
-                BackColor = Color.FromArgb(16, 16, 18),
-                ForeColor = Color.FromArgb(236, 236, 236),
+                BackColor = Color.FromArgb(18, 18, 20),
+                ForeColor = Theme.Text,
                 MaxLength = 64,
+                Cursor = Cursors.IBeam,
             };
+            _settingEdit.HandleCreated += (s, e) =>
+                SendMessageStr(_settingEdit.Handle, 0x1501, (IntPtr)1, "type here");
             _settingEdit.Leave += (s, e) => CommitEdit();
             _settingEdit.KeyDown += (s, e) =>
             {
@@ -604,6 +615,13 @@ namespace OpenSmash.Launcher
             }
             string row = key + " = " + value;
             if (keyAt >= 0) lines[keyAt] = row;
+            else if (section == "")
+            {
+                int insertAt = lines.Count;
+                for (int i = 0; i < lines.Count; i++)
+                    if (lines[i].TrimStart().StartsWith("[")) { insertAt = i; break; }
+                lines.Insert(insertAt, row);
+            }
             else if (sectionAt >= 0 && sectionAt < lines.Count) lines.Insert(sectionAt + 1, row);
             else
             {
@@ -646,6 +664,7 @@ namespace OpenSmash.Launcher
             _iniValues["gpu"] = D("gpu", "auto");
             _iniValues["hide_cursor"] = D("hide_cursor", "1");
             _iniValues["overlay"] = D("overlay", "1");
+            _iniValues["volume"] = D("volume", "100");
             _iniValues["keyboard_player"] = IniValue(pads, "general", "keyboard_player") ?? "1";
             _iniValues["background"] = IniValue(pads, "general", "background") ?? "1";
             string server = FirstLine(WindowSmash.ConfigFile(_repo, "online_server.txt"));
@@ -657,6 +676,24 @@ namespace OpenSmash.Launcher
             else if (host.Equals(Public, StringComparison.OrdinalIgnoreCase)) _iniValues["lobby"] = _iniValues["code"] == "" ? "public" : "private";
             else { _iniValues["lobby"] = "custom"; _iniValues["server"] = host; }
             if (!_iniValues.ContainsKey("server")) _iniValues["server"] = "";
+            string launcherIni = WindowSmash.ConfigFile(_repo, "launcher.ini");
+            string savedLobby = IniValue(launcherIni, "opensmash", "lobby");
+            string savedCode = IniValue(launcherIni, "opensmash", "code");
+            string savedServer = IniValue(launcherIni, "opensmash", "server");
+            bool preferSavedLobby = false;
+            if (File.Exists(launcherIni))
+            {
+                DateTime savedAt = File.GetLastWriteTimeUtc(launcherIni);
+                string serverFile = WindowSmash.ConfigFile(_repo, "online_server.txt");
+                DateTime serverAt = File.Exists(serverFile) ? File.GetLastWriteTimeUtc(serverFile) : DateTime.MinValue;
+                preferSavedLobby = savedAt >= serverAt;
+            }
+            if (preferSavedLobby && savedLobby is "public" or "private" or "custom" or "offline")
+                _iniValues["lobby"] = savedLobby;
+            if (string.IsNullOrEmpty(_iniValues["code"]) && savedCode != null)
+                _iniValues["code"] = savedCode;
+            if ((preferSavedLobby || string.IsNullOrEmpty(_iniValues["server"])) && savedServer != null)
+                _iniValues["server"] = savedServer;
             string direct = FirstLine(WindowSmash.ConfigFile(_repo, "online_direct.txt"));
             _iniValues["direct"] = direct.Equals("off", StringComparison.OrdinalIgnoreCase) ? "off" : "on";
             _iniValues["name"] = FirstLine(WindowSmash.ConfigFile(_repo, "online_name.txt"));
@@ -681,15 +718,14 @@ namespace OpenSmash.Launcher
         bool SettingOn(Setting s)
         {
             string lobby = _iniValues.GetValueOrDefault("lobby", "public");
-            if (s.Key == "code") return lobby is "private" or "custom";
-            if (s.Key == "server") return lobby == "custom";
             if (s.Key is "name" or "direct") return lobby != "offline";
             return true;
         }
 
         string ShownValue(Setting s)
         {
-            string v = _iniValues.GetValueOrDefault(s.Key, s.Text ? "" : s.Values[0]);
+            string v = _iniValues.GetValueOrDefault(s.Key, s.Text || s.Slider || s.Values.Length == 0 ? "" : s.Values[0]);
+            if (s.Slider) return v;
             if (s.Text) return v == "" ? "type here" : v;
             if (s.Labels != null)
             {
@@ -706,6 +742,7 @@ namespace OpenSmash.Launcher
             _settingEdit.Visible = false;
             _editingKey = null;
             Invalidate();
+            PersistSettings();
         }
 
         void BeginEdit(Setting s)
@@ -714,14 +751,15 @@ namespace OpenSmash.Launcher
             CommitEdit();
             _editingKey = s.Key;
             _settingEdit.Text = _iniValues.GetValueOrDefault(s.Key, "");
-            _settingEdit.Bounds = r;
+            _editPlaced = Rectangle.Empty;
+            FitSettingEdit(r);
             _settingEdit.Visible = true;
             _settingEdit.BringToFront();
             _settingEdit.Focus();
             _settingEdit.SelectAll();
         }
 
-        // The window keeps changes until Play, which writes the same files Play SSBU.bat writes.
+        // A change is written as soon as it is made, and again when the window closes.
         void WriteSetting(string key, string value)
         {
             _iniValues[key] = value;
@@ -731,6 +769,55 @@ namespace OpenSmash.Launcher
                 _iniValues["width"] = parts[0];
                 _iniValues["height"] = parts[1];
             }
+            PersistSettings();
+        }
+
+        bool _persisting;
+
+        void PersistSettings()
+        {
+            if (!_settingsLoaded || _persisting) return;
+            _persisting = true;
+            try { WriteSettingsFiles(); }
+            catch { }
+            finally { _persisting = false; }
+        }
+
+        void WriteSettingsFiles()
+        {
+            string lobby = _iniValues.GetValueOrDefault("lobby", "public");
+            string code = _iniValues.GetValueOrDefault("code", "").Replace(" ", "");
+            string host = _iniValues.GetValueOrDefault("server", "").Trim();
+            bool serverReady = lobby != "private" || code != "";
+            if (lobby == "custom" && host != "" && !System.Text.RegularExpressions.Regex.IsMatch(host, @"^\S+:\d+$"))
+                serverReady = false;
+            const string Public = "smash.recomps.wtf:39421";
+            string server = lobby switch
+            {
+                "offline" => "off",
+                "private" => Public + " " + code,
+                "custom" => (host == "" ? "127.0.0.1:39420" : host) + (code == "" ? "" : " " + code),
+                _ => Public
+            };
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "window", _iniValues.GetValueOrDefault("window", "windowed"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "width", _iniValues.GetValueOrDefault("width", "1280"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "height", _iniValues.GetValueOrDefault("height", "720"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "pacing", _iniValues.GetValueOrDefault("pacing", "clock"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "render_scale", _iniValues.GetValueOrDefault("render_scale", "1"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "gpu", _iniValues.GetValueOrDefault("gpu", "auto"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "hide_cursor", _iniValues.GetValueOrDefault("hide_cursor", "1"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "overlay", _iniValues.GetValueOrDefault("overlay", "1"));
+            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "volume", _iniValues.GetValueOrDefault("volume", "100"));
+            SetIni(WindowSmash.ConfigFile(_repo, "controllers.ini"), "general", "keyboard_player", _iniValues.GetValueOrDefault("keyboard_player", "1"));
+            SetIni(WindowSmash.ConfigFile(_repo, "controllers.ini"), "general", "background", _iniValues.GetValueOrDefault("background", "1"));
+            if (serverReady)
+                SetFirstLine(WindowSmash.ConfigFile(_repo, "online_server.txt"), server);
+            SetFirstLine(WindowSmash.ConfigFile(_repo, "online_name.txt"), _iniValues.GetValueOrDefault("name", "").Trim());
+            SetFirstLine(WindowSmash.ConfigFile(_repo, "online_direct.txt"), _iniValues.GetValueOrDefault("direct", "on"));
+            string launcherIni = WindowSmash.ConfigFile(_repo, "launcher.ini");
+            SetIni(launcherIni, "opensmash", "lobby", lobby);
+            SetIni(launcherIni, "opensmash", "code", code);
+            SetIni(launcherIni, "opensmash", "server", host);
         }
 
         bool SaveGameSettings()
@@ -750,27 +837,7 @@ namespace OpenSmash.Launcher
                 MessageBox.Show("Your own server is host:port, for example 192.168.1.20:39420.", "OpenSmash");
                 return false;
             }
-            const string Public = "smash.recomps.wtf:39421";
-            string server = lobby switch
-            {
-                "offline" => "off",
-                "private" => Public + " " + code,
-                "custom" => (host == "" ? "127.0.0.1:39420" : host) + (code == "" ? "" : " " + code),
-                _ => Public
-            };
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "window", _iniValues.GetValueOrDefault("window", "windowed"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "width", _iniValues.GetValueOrDefault("width", "1280"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "height", _iniValues.GetValueOrDefault("height", "720"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "pacing", _iniValues.GetValueOrDefault("pacing", "clock"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "render_scale", _iniValues.GetValueOrDefault("render_scale", "1"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "gpu", _iniValues.GetValueOrDefault("gpu", "auto"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "hide_cursor", _iniValues.GetValueOrDefault("hide_cursor", "1"));
-            SetIni(WindowSmash.ConfigFile(_repo, "display.ini"), "", "overlay", _iniValues.GetValueOrDefault("overlay", "1"));
-            SetIni(WindowSmash.ConfigFile(_repo, "controllers.ini"), "general", "keyboard_player", _iniValues.GetValueOrDefault("keyboard_player", "1"));
-            SetIni(WindowSmash.ConfigFile(_repo, "controllers.ini"), "general", "background", _iniValues.GetValueOrDefault("background", "1"));
-            SetFirstLine(WindowSmash.ConfigFile(_repo, "online_server.txt"), server);
-            SetFirstLine(WindowSmash.ConfigFile(_repo, "online_name.txt"), _iniValues.GetValueOrDefault("name", "").Trim());
-            SetFirstLine(WindowSmash.ConfigFile(_repo, "online_direct.txt"), _iniValues.GetValueOrDefault("direct", "on"));
+            WriteSettingsFiles();
             return true;
         }
 
@@ -783,6 +850,7 @@ namespace OpenSmash.Launcher
                 if (name == "home") _navBack.Clear();
                 else _navBack.Push(_view);
             }
+            if (_view == "settings" && name != "settings") CommitEdit();
             _view = name;
             _sel = 0;
             _hover = "";
@@ -882,7 +950,10 @@ namespace OpenSmash.Launcher
             {
                 _hover = id;
                 _keys = false;
-                Cursor = string.IsNullOrEmpty(id) ? Cursors.Default : Cursors.Hand;
+                bool beam = id != null && id.StartsWith("set:") && id.EndsWith(":dd")
+                    && int.TryParse(id.Substring(4, id.Length - 7), out int beamIdx)
+                    && beamIdx >= 0 && beamIdx < _settings.Length && _settings[beamIdx].Text;
+                Cursor = string.IsNullOrEmpty(id) ? Cursors.Default : beam ? Cursors.IBeam : Cursors.Hand;
 
                 // Track dropdown option hover
                 if (id != null && id.StartsWith("set:") && id.Contains(":opt:"))
@@ -996,6 +1067,35 @@ namespace OpenSmash.Launcher
 
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+        static extern IntPtr SendMessageStr(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")]
+        static extern IntPtr SendMessageRect(IntPtr hWnd, int msg, IntPtr wParam, ref RECT lParam);
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+
+        Rectangle _editPlaced;
+        float _editPlacedS;
+
+        // The field is the same slanted box as the other settings. The text sits inside it.
+        void FitSettingEdit(Rectangle r)
+        {
+            if (_settingEdit == null || r.Width < 4 || r.Height < 4) return;
+            var font = FM(13 * _s);
+            if (_settingEdit.Font != font) _settingEdit.Font = font;
+            if (_settingEdit.Bounds != r) _settingEdit.Bounds = r;
+            if (_editPlaced == r && _editPlacedS == _s && _settingEdit.Region != null) return;
+            _editPlaced = r;
+            _editPlacedS = _s;
+            float cut = 8 * _s;
+            float inset = Math.Max(1.5f, 1.5f * _s);
+            _settingEdit.Region?.Dispose();
+            _settingEdit.Region = new Region(Theme.Para(inset, inset, r.Width - inset * 2, r.Height - inset * 2, Math.Max(1, cut - inset)));
+            int pad = (int)Math.Ceiling(cut + 8 * _s);
+            int textH = TextRenderer.MeasureText("Ag", font, Size.Empty, TextFormatFlags.NoPadding).Height;
+            int top = Math.Max(2, (r.Height - textH) / 2);
+            var rc = new RECT { Left = pad, Top = top, Right = r.Width - pad, Bottom = top + textH + 2 };
+            SendMessageRect(_settingEdit.Handle, 0xB4, IntPtr.Zero, ref rc);
+        }
 
         // ---------------------------------------------------------------------------
         // Keyboard
@@ -1070,7 +1170,9 @@ namespace OpenSmash.Launcher
                     }
                     else if (_sel < GetVisibleSettingsCount())
                     {
-                        ToggleDropdown(_sel);
+                        var set = GetVisibleSetting(_sel);
+                        if (set != null && set.Text) BeginEdit(set);
+                        else if (set == null || !set.Slider) ToggleDropdown(_sel);
                     }
                 }
                 if (e.KeyCode == Keys.Escape)
@@ -1227,7 +1329,8 @@ namespace OpenSmash.Launcher
                 {
                     int idx = int.Parse(rest.Substring(0, rest.Length - 3));
                     var set = _settings[idx];
-                    if (set.Text || set.Key == "pads" || !SettingOn(set)) return;
+                    if (set.Text) { BeginEdit(set); return; }
+                    if (set.Slider || set.Key == "pads" || !SettingOn(set)) return;
                     var visibleIdx = GetVisibleSettings().ToList().FindIndex(s => Array.IndexOf(_settings, s) == idx);
                     ToggleDropdown(visibleIdx);
                 }
@@ -1243,6 +1346,7 @@ namespace OpenSmash.Launcher
                         else MessageBox.Show("controllers.ini is written the first time the game starts.", "OpenSmash");
                         return;
                     }
+                    if (set.Slider) return;
                     if (set.Text) { BeginEdit(set); return; }
                     var visibleIdx = GetVisibleSettings().ToList().FindIndex(s => Array.IndexOf(_settings, s) == idx);
                     ToggleDropdown(visibleIdx);
@@ -1337,7 +1441,7 @@ namespace OpenSmash.Launcher
         void ToggleDropdown(int visibleIdx)
         {
             var setting = GetVisibleSetting(visibleIdx);
-            if (setting == null) return;
+            if (setting == null || setting.Text || setting.Slider || setting.Values.Length == 0) return;
             if (_openDropdownKey == setting.Key)
                 CloseDropdown();
             else
@@ -3245,6 +3349,7 @@ namespace OpenSmash.Launcher
         public string[] Values = Array.Empty<string>();
         public string[] Labels;
         public bool Text;
+        public bool Slider;
         public bool IsResolution = false; // when true, value is "WxH" from Values
     }
 
