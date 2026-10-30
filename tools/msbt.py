@@ -12,6 +12,7 @@ names its text by index); ATR1: one attribute (of a fixed size) per text; TXT2: 
 then UTF-16 strings, each ending in a 0). Other sections are kept as they are.
 An .xmsbt (UTF-16 XML): <xmsbt><entry label="..."><text>...</text></entry>...</xmsbt> - each
 label's text replaced, or added with its label when the file hasn't got it."""
+import base64
 import re
 import struct
 import sys
@@ -82,7 +83,8 @@ class Msbt:
         return raw.decode("utf-16-le").rstrip("\0")
 
     def set(self, label, text):
-        raw = text.encode("utf-16-le") + b"\0\0"
+        """A label's text: a str, or the raw UTF-16 bytes with their 0 (an .xmsbt's base64 entry)."""
+        raw = text if isinstance(text, bytes) else text.encode("utf-16-le") + b"\0\0"
         if label in self.labels:
             self.texts[self.labels[label]] = raw
             return
@@ -130,9 +132,13 @@ class Msbt:
 
 
 def read_xmsbt(data):
-    """[(label, text)] of an .xmsbt's bytes (UTF-16 with its byte-order mark, or UTF-8)."""
+    """[(label, text)] of an .xmsbt's bytes (UTF-16 with its byte-order mark or without one, or
+    UTF-8). An entry with base64="true" (ARCropolis' msbt.rs) holds its text's raw bytes, control
+    tags and all: its text is those bytes, with the 0 that ends a text added."""
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
         text = data.decode("utf-16")
+    elif len(data) > 1 and data[1:2] == b"\0":   # (UTF-16 with no byte-order mark: '<' then a 0)
+        text = data.decode("utf-16-le")
     else:
         text = data.decode("utf-8-sig")
     text = re.sub(r"""^\s*<\?xml[^>]*\?>""", "", text)   # (decoded already, whatever it says)
@@ -142,7 +148,13 @@ def read_xmsbt(data):
         label = e.get("label")
         t = e.find("text")
         if label is not None and t is not None:
-            out.append((label, t.text or ""))
+            if (e.get("base64") or "").lower() == "true":
+                try:
+                    out.append((label, base64.b64decode("".join((t.text or "").split()), validate=True) + b"\0\0"))
+                except ValueError as err:
+                    raise Error(f"label {label}: its base64 text can't be read ({err})")
+            else:
+                out.append((label, t.text or ""))
     return out
 
 
