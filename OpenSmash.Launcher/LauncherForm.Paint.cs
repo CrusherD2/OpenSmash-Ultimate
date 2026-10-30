@@ -515,6 +515,7 @@ namespace OpenSmash.Launcher
             if (_loadOn && _view != "mods") PaintLoad(g, W, H);
             PaintStatus(g, W, H);
             if (_view == "mods" && _showSetupPrompt) PaintSetupPrompt(g, W, H);
+            if (_shaderPrompt) PaintShaderPrompt(g, W, H);
             if (_pluginPrompt) PaintPluginPrompt(g, W, H);
         }
 
@@ -611,6 +612,14 @@ namespace OpenSmash.Launcher
             using (var pen = new Pen(A(Theme.Line), Math.Max(1, s)))
                 g.DrawLine(pen, 0, y, W, y);
 
+            if (_shaderUi)
+            {
+                PaintJobStrip(g, W, y, h, s,
+                    string.IsNullOrEmpty(_shaderDetail) ? "Preparing shaders" : _shaderDetail,
+                    _shaderFrac, _shaderEta);
+                PopFade(g, st);
+                return;
+            }
             if (_pluginBuildUi)
             {
                 PaintJobStrip(g, W, y, h, s,
@@ -1057,8 +1066,8 @@ namespace OpenSmash.Launcher
 
         // ---------------------------------------------------------------------------
         // Mods
-        int ModActionCount => _showPluginBuild ? 3 : 2;
-        string ModActionId(int index) => index == 0 ? "act:browse" : index == 1 ? "act:setup" : "act:build";
+        int ModActionCount => 2;
+        string ModActionId(int index) => index == 0 ? "act:browse" : "act:setup";
         float ModListTop => 368 * _s;
         float ModListView => Math.Max(68f, (ClientSize.Height - 118 * _s - ModListTop) / _s);
 
@@ -1087,10 +1096,6 @@ namespace OpenSmash.Launcher
                 "GAMEBANANA", Theme.Text, Theme.Bg, "BROWSE MODS", "Find and install mods from GameBanana.");
             PaintCard(g, "act:setup", x + (cardW + gap), cardY, cardW, cardH, 1, _keys && _sel == 1,
                 "PLUGINS", Theme.Text, Theme.Bg, "SETUP MODDING", "Community plugins movesets and new characters are built on.");
-            if (_showPluginBuild)
-                PaintCard(g, "act:build", x + 2 * (cardW + gap), cardY, cardW, cardH, 2, _keys && _sel == 2,
-                    "NEEDED", Theme.Warn, Theme.Bg, "BUILD PLUGINS",
-                    string.IsNullOrEmpty(_pluginBuildReason) ? "Compile the turned-on mods' code into the game." : _pluginBuildReason);
 
             // List. _modScroll is a pixel offset in unscaled units; rows grow when they carry a description.
             float top = ModListTop;
@@ -1112,7 +1117,7 @@ namespace OpenSmash.Launcher
                 PopFade(g, st);
             }
 
-            if (_mods.Count == 0)
+            if (_mods.Count == 0 && _modsChecked)
             {
                 var st = PushReveal(g, 3);
                 var path = TextPath("NO MODS YET.", 46 * s);
@@ -1314,6 +1319,45 @@ namespace OpenSmash.Launcher
             PopFade(g, st);
         }
 
+        void PaintShaderPrompt(Graphics g, int W, int H)
+        {
+            float s = _s, e = Theme.Ease(Clamp01((float)(Now - _shaderPromptAt) / 0.4f));
+            using (var b = new SolidBrush(Color.FromArgb((int)(200 * e), 5, 5, 5))) g.FillRectangle(b, 0, 0, W, H);
+            AddHit("shader_prompt:block", 0, 0, W, H);
+
+            var st = PushFade(g, e, 24 * s);
+            float mw = 760 * s, mh = 300 * s, mx = (W - mw) / 2, my = (H - mh) / 2;
+            using (var p = Theme.CutCorners(mx, my, mw, mh, 30 * s))
+            {
+                using (var b = new SolidBrush(A(Theme.Bg2))) g.FillPath(b, p);
+                using (var pen = new Pen(A(Theme.Line), Math.Max(1, s))) g.DrawPath(pen, p);
+                var cs = g.Save();
+                g.SetClip(p, CombineMode.Intersect);
+                using (var b = new SolidBrush(A(Theme.Accent))) g.FillRectangle(b, mx, my, mw, 4 * s);
+                g.Restore(cs);
+            }
+            float pad = 32 * s;
+            Theme.Label(g, "FINISH SHADERS", FD(32 * s), A(Theme.Text), mx + pad, my + 34 * s, 30 * s, 0.32f * s);
+            Theme.DrawWrapped(g, "Shader compile has not finished, so a new effect can stutter the first time you see it. Pick how hard this PC should work. The bar along the bottom shows the progress. You can keep playing while it runs.",
+                FB(15 * s), A(Theme.Muted), mx + pad, my + 84 * s, mw - pad * 2, 90 * s);
+
+            float bh = 46 * s, by = my + mh - bh - 28 * s, gap = 10 * s;
+            float wLater = 120 * s, wPri = 140 * s;
+            float xHigh = mx + mw - pad - wPri;
+            float xMed = xHigh - gap - wPri;
+            float xLow = xMed - gap - wPri;
+            float xLater = xLow - gap - wLater;
+            Theme.ButtonAnimated(g, "LATER", xLater, by, wLater, bh, s, false, Hov("shader_prompt:later", _hover == "shader_prompt:later"), true, 13 * s, _alpha);
+            AddHit("shader_prompt:later", xLater, by, wLater, bh);
+            Theme.ButtonAnimated(g, "LOW", xLow, by, wPri, bh, s, false, Hov("shader_prompt:low", _hover == "shader_prompt:low"), true, 13 * s, _alpha);
+            AddHit("shader_prompt:low", xLow, by, wPri, bh);
+            Theme.ButtonAnimated(g, "MEDIUM", xMed, by, wPri, bh, s, false, Hov("shader_prompt:medium", _hover == "shader_prompt:medium"), true, 13 * s, _alpha);
+            AddHit("shader_prompt:medium", xMed, by, wPri, bh);
+            Theme.ButtonAnimated(g, "HIGH", xHigh, by, wPri, bh, s, true, Hov("shader_prompt:high", _hover == "shader_prompt:high"), true, 13 * s, _alpha);
+            AddHit("shader_prompt:high", xHigh, by, wPri, bh);
+            PopFade(g, st);
+        }
+
         void PaintPluginPrompt(Graphics g, int W, int H)
         {
             float s = _s, e = Theme.Ease(Clamp01((float)(Now - _pluginPromptAt) / 0.4f));
@@ -1332,11 +1376,11 @@ namespace OpenSmash.Launcher
                 g.Restore(cs);
             }
             float pad = 32 * s;
-            Theme.Label(g, "PLUGIN ISN'T BUILT", FD(32 * s), A(Theme.Text), mx + pad, my + 34 * s, 30 * s, 0.32f * s);
+            Theme.Label(g, "UPDATE PLUGINS", FD(32 * s), A(Theme.Text), mx + pad, my + 34 * s, 30 * s, 0.32f * s);
             Theme.DrawWrapped(g, _pluginPromptText, FB(15 * s), A(Theme.Muted), mx + pad, my + 84 * s, mw - pad * 2, 130 * s);
 
             float bh = 46 * s, by = my + mh - bh - 28 * s, gap = 12 * s;
-            float wBuild = 210 * s, wPlay = 180 * s, wCancel = 140 * s;
+            float wBuild = 230 * s, wPlay = 160 * s, wCancel = 120 * s;
             float xBuild = mx + mw - pad - wBuild;
             float xPlay = xBuild - gap - wPlay;
             float xCancel = xPlay - gap - wCancel;
@@ -1344,7 +1388,7 @@ namespace OpenSmash.Launcher
             AddHit("plugin_prompt:cancel", xCancel, by, wCancel, bh);
             Theme.ButtonAnimated(g, "PLAY ANYWAY", xPlay, by, wPlay, bh, s, false, Hov("plugin_prompt:play", _hover == "plugin_prompt:play"), true, 13 * s, _alpha);
             AddHit("plugin_prompt:play", xPlay, by, wPlay, bh);
-            Theme.ButtonAnimated(g, "BUILD PLUGIN", xBuild, by, wBuild, bh, s, true, Hov("plugin_prompt:build", _hover == "plugin_prompt:build"), true, 13 * s, _alpha);
+            Theme.ButtonAnimated(g, "UPDATE PLUGINS", xBuild, by, wBuild, bh, s, true, Hov("plugin_prompt:build", _hover == "plugin_prompt:build"), true, 13 * s, _alpha);
             AddHit("plugin_prompt:build", xBuild, by, wBuild, bh);
             PopFade(g, st);
         }
@@ -1389,7 +1433,7 @@ namespace OpenSmash.Launcher
 
             {
                 var st = PushReveal(g, 0);
-                Theme.DrawWrapped(g, "The community plugins movesets and new characters are built on. Downloading them here is the same list WindowSmash Mods keeps under Settings. Build plugins, on the mods page, fetches any that are still missing.",
+                Theme.DrawWrapped(g, "The community plugins movesets and new characters are built on. Downloading them here is the same list WindowSmash Mods keeps under Settings.",
                     FB(16 * s), A(Theme.Muted), x, ContentTop * s - 4 * s, cw, 52 * s);
                 PopFade(g, st);
             }

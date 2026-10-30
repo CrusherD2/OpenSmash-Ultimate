@@ -358,18 +358,26 @@ def built_in(tree, name):
     return False
 
 
+def nro_build_id(path):
+    """The build id in an NRO or NSO header. The mod list only needs this, not the whole module."""
+    with open(path, "rb") as f:
+        head = f.read(0x60)
+    if len(head) < 0x60 or (head[0x10:0x14] != b"NRO0" and head[:4] != b"NSO0"):
+        raise ValueError(path)
+    return head[0x40:0x60].hex().rstrip("0").upper() or "0"
+
+
 def plugin_state(tree, mod, rels):
     """[{"file", "module", "built"}] of a mod's code plugins (`rels`: paths in its folder) the game
     runs: built is whether the game's program has it compiled in (None: never recompiled - the mod
     was not turned on and applied yet). The plugins WindowSmash provides itself are left out."""
-    from nso import Module
     record = load_record(Paths(tree))
     out = []
     for rel in rels:
         if os.path.basename(rel).lower() in NATIVE:
             continue
         try:
-            entry = record.get(Module(os.path.join(tree, "mods", mod, rel)).build_id)
+            entry = record.get(nro_build_id(os.path.join(tree, "mods", mod, rel)))
         except Exception:   # (not an NRO the recompiler reads)
             entry = None
         name = entry and entry["module"]
@@ -412,31 +420,79 @@ def patch_lines(p):
     return out
 
 
+def _hook_sources(tree):
+    """(module, folder of its generated C) for every module with an inline hook or a code patch."""
+    p = Paths(tree)
+    inline, patches = inline_targets(p), patch_lines(p)
+    found = []
+    for mod in sorted(set(inline) | set(patches)):
+        table = os.path.join(tree, "build", mod, "g_module.c") if mod in ("main", "subsdk0", "sdk") else \
+            os.path.join(tree, "build", "nro", mod, "g_module.c")
+        found.append((mod, os.path.dirname(table), inline, patches))
+    return found
+
+
+def _hooks_sig(tree):
+    """Changes when the hook lists or the generated C that carries them change."""
+    p = Paths(tree)
+    parts = []
+    for path in (p.hooks, os.path.join(p.skyline, "patches.txt")):
+        if os.path.exists(path):
+            st = os.stat(path)
+            parts.append(f"{os.path.basename(path)}:{st.st_mtime_ns}:{st.st_size}")
+        else:
+            parts.append(os.path.basename(path) + ":missing")
+    for mod, folder, _inline, _patches in _hook_sources(tree):
+        newest = 0
+        if os.path.isdir(folder):
+            for n in os.listdir(folder):
+                if n.startswith("g") and n.endswith(".c"):
+                    newest = max(newest, os.stat(os.path.join(folder, n)).st_mtime_ns)
+        rec = os.path.join(folder, "plugin_patches.txt")
+        if os.path.exists(rec):
+            newest = max(newest, os.stat(rec).st_mtime_ns)
+        parts.append(f"{mod}:{newest}")
+    return "|".join(parts)
+
+
 def stale_hooks(tree):
-    """The game modules whose generated C lacks hook targets or code patches the runtime listed
-    (hooks.txt, patches.txt)."""
+    """The game modules whose generated C lacks an inline hook or a code patch the runtime listed.
+    A function hook (A64HookFunction) is patched into that function when the game starts, so it
+    is not a reason to rebuild the program. The answer is cached: reading every generated file is
+    what made the mods page wait."""
+    cache = os.path.join(tree, "build", "work", "stale_hooks.json")
+    sig = _hooks_sig(tree)
+    try:
+        with open(cache, encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("sig") == sig and isinstance(saved.get("mods"), list):
+            return saved["mods"]
+    except (OSError, ValueError):
+        pass
+    out = _stale_hooks(tree)
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump({"sig": sig, "mods": out}, f)
+    except OSError:
+        pass
+    return out
+
+
+def _stale_hooks(tree):
     import recomp as rc
     rc.TREE = tree
     out = []
-    p = Paths(tree)
-    hooks, inline, patches = hook_targets(p), inline_targets(p), patch_lines(p)
-    for mod in sorted(set(hooks) | set(inline) | set(patches)):
-        offs = hooks.get(mod, set())
-        table = os.path.join(tree, "build", mod, "g_module.c") if mod in ("main", "subsdk0", "sdk") else \
-            os.path.join(tree, "build", "nro", mod, "g_module.c")
+    for mod, folder, inline, patches in _hook_sources(tree):
+        table = os.path.join(folder, "g_module.c")
         base = rc.MODULES.get(mod) or rc.nro_modules().get(mod) if os.path.exists(table) else None
         if not base:
             continue
-        text = open(table, encoding="utf-8").read()
-        rec = os.path.join(os.path.dirname(table), "plugin_patches.txt")
+        rec = os.path.join(folder, "plugin_patches.txt")
         if patches.get(mod, "") != (open(rec, encoding="utf-8").read() if os.path.exists(rec) else ""):
             out.append(mod)
             continue
-        if any(f"f_{base + o:x}_orig" not in text for o in offs):
-            out.append(mod)
-            continue
         if inline.get(mod):   # (the C files: is each point's rt_inline_hook in one?)
-            folder = os.path.dirname(table)
             have = set()
             for n in os.listdir(folder):
                 if n.startswith("g") and n.endswith(".c") and n != "g_module.c":
@@ -558,7 +614,15 @@ def dll_current(tree, name):
 
 
 _BIND = """\
+#include <windows.h>
 #include "module.h"
+/* A moveset that catches a C++ exception calls this. It lives in the game too; the plugin's
+ * own file needs a copy or the plugin does not link. */
+int rt_eh_filter(struct _EXCEPTION_POINTERS *e, u64 sp, u64 lp) {{
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode != 0xE0E4C5A0u || r->NumberParameters < 2) return 0;
+    return r->ExceptionInformation[0] == lp && (r->ExceptionInformation[1] == sp || sp == ~0ull) ? 1 : 0;
+}}
 extern const RtModule rt_module_{name};
 static GuestFn *(*plugin_lookup)(u64);
 static GuestFn *(*plugin_lookup_cached)(u64, RtCache *);
@@ -574,7 +638,7 @@ __declspec(dllexport) void ssbu_plugin_bind(GuestFn *(*lookup)(u64), GuestFn *(*
 """
 
 
-def cache_mod_plugins(tree, jobs, log=print):
+def cache_mod_plugins(tree, jobs, log=print, quiet=False):
     """Compile each turned-on mod's plugin into build/plugins/<name>.dll and list those files.
     The standard plugins stay in the program. Returns the module names that translated."""
     import cc
@@ -616,7 +680,8 @@ def cache_mod_plugins(tree, jobs, log=print):
                 continue
             log(f"{name}: saved ({os.path.getsize(dll_path(tree, name)):,} bytes)")
         else:
-            log(f"{name}: already translated")
+            if not quiet:
+                log(f"{name}: already translated")
         ready.append(name)
     listed = "".join(f"build/plugins/{n}.dll\n" for n in ready)
     path = os.path.join(p.skyline, "plugin_dlls.txt")
@@ -644,9 +709,9 @@ def game_link_reason(tree):
                 if os.path.getmtime(os.path.join(dp, n)) > built:
                     return f"{rel} is newer than the game"
     p = Paths(tree)
-    for n in (p.hooks, os.path.join(p.skyline, "patches.txt")):
-        if os.path.exists(n) and os.path.getmtime(n) > built:
-            return f"{os.path.relpath(n, tree)} is newer than the game"
+    patches = os.path.join(p.skyline, "patches.txt")
+    if os.path.exists(patches) and os.path.getmtime(patches) > built:
+        return "dump/skyline/patches.txt is newer than the game"
     import std_plugins
     for name, plugin in std_plugins.PLUGINS.items():
         if plugin[5] == "runs" and not os.path.exists(os.path.join(std_plugins.folder(tree), name)):
@@ -663,7 +728,8 @@ def game_link_reason(tree):
 
 def build(tree, jobs, log=print, again=True):
     """Translate each turned-on mod plugin into its own file. Link the game only when a standard
-    plugin is missing, the runtime changed, or a plugin hooks a function the game calls directly."""
+    plugin is missing, the runtime changed, or a plugin's inline hook or code patch is not in it.
+    A function hook is patched into that one function when the game starts."""
     sync(tree, log, jobs)
     cache_mod_plugins(tree, jobs, log)
     reason = game_link_reason(tree)
@@ -697,7 +763,8 @@ def build(tree, jobs, log=print, again=True):
 # app's files are read as it runs; the tools here run as they are)
 NOT_BUILT = ("tools/modmanager/", "tools/dev/", "tools/mods.py", "tools/os_mods.py", "tools/progress.py", "tools/std_plugins.py", "tools/csk.py", "tools/miis.py",
              "tools/unlock_all.py", "tools/install_windowsmash.ps1", "tools/update.py", "tools/arc.py", "tools/prc.py",
-             "tools/msbt.py", "tools/ssbu_online_lobby.py", "tools/ssbu_relay.py", "tools/skyline.py")
+             "tools/msbt.py", "tools/ssbu_online_lobby.py", "tools/ssbu_relay.py", "tools/skyline.py",
+             "tools/shader_aot.py")
 
 
 def needs_build(tree):
@@ -718,9 +785,9 @@ def needs_build(tree):
                 if os.path.getmtime(os.path.join(dp, n)) > built:
                     return f"{rel} is newer than it"
     p = Paths(tree)
-    for n in (p.hooks, os.path.join(p.skyline, "patches.txt")):
-        if os.path.exists(n) and os.path.getmtime(n) > built:
-            return f"{os.path.relpath(n, tree)} is newer than it"
+    patches = os.path.join(p.skyline, "patches.txt")
+    if os.path.exists(patches) and os.path.getmtime(patches) > built:
+        return "dump/skyline/patches.txt is newer than it"
     import std_plugins
     for name, plugin in std_plugins.PLUGINS.items():
         if plugin[5] == "runs" and not os.path.exists(os.path.join(std_plugins.folder(tree), name)):

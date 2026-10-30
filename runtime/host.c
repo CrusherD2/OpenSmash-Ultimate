@@ -668,6 +668,7 @@ void rt_wrap_missing(Cpu *c) { rt_trap(c, 0, "wrapped guest function missing fro
 static struct { volatile u64 key; GuestFn *volatile fn; } lookup_cache[LOOKUP_CACHE];
 #define LOOKUP_MIX(fn) ((u64)(fn) * 0x9E3779B97F4A7C15ull)
 
+u64 rt_moved_in_13_0_5(u64 at);   /* (hle_skyline.c) a 13.0.4 main address that moved in 13.0.5 */
 GuestFn *rt_lookup(u64 addr) {
     char name[96];
     u32 h = (u32)((addr >> 2) * 0xD6E8FEB86659FD93ull >> 51) & (LOOKUP_CACHE - 1);
@@ -680,6 +681,15 @@ GuestFn *rt_lookup(u64 addr) {
         u64 off = addr - modules[m]->base;
         if (off < modules[m]->text_size) {
             GuestFn *fn = off & 3 ? NULL : code[m][off >> 2];
+            /* A moveset built for 13.0.4 calls a main address that moved in 13.0.5. The cache key
+             * stays the address it asked for. */
+            if (!fn && !strcmp(modules[m]->name, "main")) {
+                u64 slid = rt_moved_in_13_0_5(addr);
+                if (slid != addr) {
+                    off = slid - modules[m]->base;
+                    fn = (off & 3) || off >= modules[m]->text_size ? NULL : code[m][off >> 2];
+                }
+            }
             if (fn) {
                 lookup_cache[h].fn = fn;
                 lookup_cache[h].key = addr ^ LOOKUP_MIX(fn);
@@ -1116,11 +1126,14 @@ int rt_is_function(u64 addr) {
     return slot_m && off < modules[slot_m - 1]->text_size && !(off & 3) && code[slot_m - 1][off >> 2] != NULL;
 }
 
-/* Skyline's A64HookFunction, for the calls that go through the dispatch tables: every indirect
- * call to `target` (a function entry of a loaded module) goes to `replace` from now on. Returns
- * the address that still reaches the function as it was (the hook's "original"), 0 if `target`
- * is not a function entry. Direct calls the recompiler made between functions are compiled in
- * and do not see the hook (docs/SKYLINE.md: those need the function wrapped at build time). */
+/* Skyline's A64HookFunction. Indirect calls go through the dispatch table. Direct calls the
+ * recompiler baked in land on the function's first bytes, so those bytes are patched to jump
+ * to the hook (runtime/hle_detour.c) and the replaced bytes stay callable as the original.
+ * A function the build already gave a hook slot (tools/hooks.txt `hookable`) is swapped in
+ * that slot instead. Returns the address that still reaches the function as it was, 0 if
+ * `target` is not a function entry. */
+GuestFn **rt_hook_slot(u64 guest_addr);
+int rt_hook_install(GuestFn **slot, GuestFn *hook, GuestFn **next);
 u64 rt_hook_function(u64 target, u64 replace) {
     static SRWLOCK lock = SRWLOCK_INIT;
     GuestFn *with = rt_lookup(replace);
@@ -1130,7 +1143,32 @@ u64 rt_hook_function(u64 target, u64 replace) {
     u64 off = slot_m ? target - modules[slot_m - 1]->base : ~0ull;
     GuestFn **at = slot_m && off < modules[slot_m - 1]->text_size && !(off & 3) ? &code[slot_m - 1][off >> 2] : NULL;
     if (!at || !*at) { ReleaseSRWLockExclusive(&lock); return 0; }
-    u64 original = rt_native(*at, "original of a hooked function");
+    GuestFn *original_fn = *at;
+    GuestFn **hook_slot = rt_hook_slot(target);
+    if (hook_slot) {
+        GuestFn *next = NULL;
+        rt_hook_install(hook_slot, with, &next);
+        if (next) original_fn = next;
+    } else {
+        /* Identical functions share one copy (the linker's folding). Patching that copy would
+         * send every one of them into this hook. A shared copy is left alone: calls that already
+         * go through the dispatch table still reach the hook, and a folded function's other
+         * callers keep the original. */
+        struct HostFn key = {(u64)*at, 0};
+        struct HostFn *hit = by_host && by_host_count ? bsearch(&key, by_host, by_host_count, sizeof key, by_host_cmp) : NULL;
+        int shared = hit && ((hit > by_host && hit[-1].host == key.host) ||
+                             (hit + 1 < by_host + by_host_count && hit[1].host == key.host));
+        if (!shared) {
+            u32 room = 256;
+            if (hit && hit + 1 < by_host + by_host_count && hit[1].host > (u64)*at) {
+                u64 gap = hit[1].host - (u64)*at;
+                room = gap > 256 ? 256 : (u32)gap;
+            }
+            GuestFn *tramp = rt_detour_entry(*at, with, hit != NULL, room);
+            if (tramp) original_fn = tramp;
+        }
+    }
+    u64 original = rt_native(original_fn, "original of a hooked function");
     __atomic_store_n(at, with, __ATOMIC_RELEASE);
     memset((void *)lookup_cache, 0, sizeof lookup_cache);
     ReleaseSRWLockExclusive(&lock);

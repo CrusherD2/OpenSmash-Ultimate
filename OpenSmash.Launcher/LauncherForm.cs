@@ -60,8 +60,8 @@ namespace OpenSmash.Launcher
         int _plugins = 0;
         List<ModInfo> _mods = new();
         bool _modsModded;
+        bool _modsChecked;
         bool _modsBusy;
-        bool _showPluginBuild;
         string _pluginBuildReason = "";
         readonly Dictionary<string, Image> _modThumbs = new();
         readonly HashSet<string> _openGroups = new();
@@ -103,6 +103,13 @@ namespace OpenSmash.Launcher
         float _pluginFrac = -1;            // 0..1, or -1 before the build has a length
         string _pluginDetail = "";
         string _pluginEta = "";
+        bool _shaderPrompt;
+        double _shaderPromptAt;
+        bool _shaderUi;
+        float _shaderFrac = -1;
+        string _shaderDetail = "";
+        string _shaderEta = "";
+        Process? _shaderProc;
         bool _gameLaunched = false;
         bool _gameReady = false;
         bool _waitingForGame = false;
@@ -144,6 +151,7 @@ namespace OpenSmash.Launcher
             _repo = repo;
             _buildDir = buildDir;
             _modsDir = Path.Combine(repo, "mods");
+            LoadInstantMods();
             _skylineDir = Path.Combine(repo, "sd", "atmosphere", "contents", "01006A800016E000");
             _pluginsDir = Path.Combine(repo, "skyline", "plugins");
         // Migrate legacy subsdk9 location (sd/ultimate/skyline/exefs) to the
@@ -226,9 +234,14 @@ namespace OpenSmash.Launcher
                 {
                     try { _gameProcess.Kill(); } catch { }
                 }
+                if (_shaderProc != null && !_shaderProc.HasExited)
+                {
+                    try { _shaderProc.Kill(entireProcessTree: true); } catch { }
+                }
             };
             Shown += async (s, e) =>
             {
+                AskShadersIfNeeded();
                 UpdateMods();
                 // The marketplace browser is heavy. Let the boot animation finish before it starts.
                 await Task.Delay(1100);
@@ -316,47 +329,118 @@ namespace OpenSmash.Launcher
 
         int _modsGen;
 
-        void UpdateMods()
+        void UpdateMods() { _ = RefreshMods(); }
+
+        Task RefreshMods()
         {
+            var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             int gen = System.Threading.Interlocked.Increment(ref _modsGen);
             Task.Run(() =>
             {
                 int code = 1;
                 string output = "";
                 try { code = RunPython(new[] { Path.Combine(_repo, "tools", "os_mods.py"), "status" }, out output); }
-                catch { return; }
+                catch { done.TrySetResult(false); return; }
                 try
                 {
                     BeginInvoke(() =>
                     {
-                        if (gen != _modsGen || IsDisposed) return;
-                        ApplyModStatus(code, output);
+                        if (gen == _modsGen && !IsDisposed) ApplyModStatus(code, output);
+                        done.TrySetResult(true);
                     });
                 }
-                catch (InvalidOperationException) { }
+                catch (InvalidOperationException) { done.TrySetResult(false); }
             });
+            return done.Task;
         }
 
-        void ApplyModStatus(int code, string output)
+        string ModStatusCachePath() => Path.Combine(_buildDir, "work", "modstatus.json");
+
+        // The full status check walks every mod, so it arrives late. Paint the saved
+        // list (or mods.json) before the window is shown, then let status refresh it.
+        void LoadInstantMods()
+        {
+            string cache = ModStatusCachePath();
+            string index = Path.Combine(_modsDir, "mods.json");
+            try
+            {
+                bool cacheFresh = File.Exists(cache) &&
+                    (!File.Exists(index) || File.GetLastWriteTimeUtc(cache) >= File.GetLastWriteTimeUtc(index));
+                if (cacheFresh)
+                {
+                    ApplyModStatus(0, File.ReadAllText(cache), persist: false);
+                    return;
+                }
+            }
+            catch { }
+            SeedModsFromIndex();
+        }
+
+        void SeedModsFromIndex()
+        {
+            string index = Path.Combine(_modsDir, "mods.json");
+            if (!File.Exists(index)) return;
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(index));
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("mods", out var mods) || mods.ValueKind != JsonValueKind.Object) return;
+                var order = new List<string>();
+                if (root.TryGetProperty("order", out var ord) && ord.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var n in ord.EnumerateArray())
+                        if (n.ValueKind == JsonValueKind.String) order.Add(n.GetString() ?? "");
+                }
+                foreach (var prop in mods.EnumerateObject())
+                    if (!order.Contains(prop.Name)) order.Add(prop.Name);
+                var list = new List<ModInfo>();
+                foreach (string name in order)
+                {
+                    if (name.Length == 0 || !mods.TryGetProperty(name, out var m) || m.ValueKind != JsonValueKind.Object) continue;
+                    string title = GetString(m, "title");
+                    string gb = "";
+                    if (m.TryGetProperty("gamebanana", out var g))
+                        gb = g.ValueKind == JsonValueKind.Number ? g.GetInt64().ToString() : g.GetString() ?? "";
+                    list.Add(new ModInfo
+                    {
+                        Name = name,
+                        Title = title.Length > 0 ? title : name,
+                        Enabled = !m.TryGetProperty("enabled", out var en) || en.ValueKind != JsonValueKind.False,
+                        Author = GetString(m, "author"),
+                        Category = GetString(m, "category"),
+                        GamebananaId = gb,
+                    });
+                }
+                _mods = list;
+                BuildModLines();
+                _modsChecked = true;
+            }
+            catch { }
+        }
+
+        void ApplyModStatus(int code, string output, bool persist = true)
         {
             var list = new List<ModInfo>();
             var keep = new HashSet<string>();
-            _stdPlugins = new();
+            var pluginsSeen = new List<(string name, string version, bool fetched, string status, string source)>();
+            bool parsed = false;
+            bool modded = _modsModded;
+            string reason = _pluginBuildReason;
+            string json = "";
             try
             {
-                string json = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault(l => l.TrimStart().StartsWith("{")) ?? "";
+                json = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).LastOrDefault(l => l.TrimStart().StartsWith("{")) ?? "";
                 if (code == 0 && json.Length > 0)
                 {
                     using var doc = JsonDocument.Parse(json);
                     var root = doc.RootElement;
-                    _modsModded = root.TryGetProperty("modded", out var md) && md.ValueKind == JsonValueKind.True;
-                    _pluginBuildReason = root.TryGetProperty("needs_build", out var nb) ? nb.GetString() ?? "" : "";
-                    _showPluginBuild = _pluginBuildReason.Length > 0;
+                    modded = root.TryGetProperty("modded", out var md) && md.ValueKind == JsonValueKind.True;
+                    reason = root.TryGetProperty("needs_build", out var nb) ? nb.GetString() ?? "" : "";
                     if (root.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var p in plugins.EnumerateArray())
                         {
-                            _stdPlugins.Add((
+                            pluginsSeen.Add((
                                 GetString(p, "name"),
                                 GetString(p, "version"),
                                 p.TryGetProperty("fetched", out var f) && f.ValueKind == JsonValueKind.True,
@@ -366,6 +450,7 @@ namespace OpenSmash.Launcher
                     }
                     if (root.TryGetProperty("mods", out var mods) && mods.ValueKind == JsonValueKind.Array)
                     {
+                        parsed = true;
                         foreach (var m in mods.EnumerateArray())
                         {
                             string name = GetString(m, "name");
@@ -418,7 +503,11 @@ namespace OpenSmash.Launcher
                     }
                 }
             }
-            catch { }
+            catch { parsed = false; }
+            if (!parsed) return;
+            _modsModded = modded;
+            _pluginBuildReason = reason;
+            _stdPlugins = pluginsSeen;
             foreach (string old in _modThumbs.Keys.Where(k => !keep.Contains(k)).ToList())
             {
                 _modThumbs[old].Dispose();
@@ -426,6 +515,16 @@ namespace OpenSmash.Launcher
             }
             _mods = list;
             BuildModLines();
+            _modsChecked = true;
+            if (persist && json.Length > 0)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(ModStatusCachePath())!);
+                    File.WriteAllText(ModStatusCachePath(), json);
+                }
+                catch { }
+            }
             if (_sel > ModActionCount + _modLines.Count - 1) _sel = Math.Max(0, ModActionCount + _modLines.Count - 1);
             Invalidate();
         }
@@ -1104,6 +1203,12 @@ namespace OpenSmash.Launcher
             var nav = new[] { Keys.Up, Keys.Down, Keys.Left, Keys.Right };
             if (nav.Contains(e.KeyCode)) { _keys = true; _hover = ""; }
 
+            if (_shaderPrompt)
+            {
+                if (e.KeyCode == Keys.Escape) { _shaderPrompt = false; Invalidate(); }
+                return;
+            }
+
             if (_pluginPrompt)
             {
                 if (e.KeyCode == Keys.Escape) _pluginPromptWait?.TrySetResult("cancel");
@@ -1261,6 +1366,10 @@ namespace OpenSmash.Launcher
             else if (id == "plugin_prompt:play") _pluginPromptWait?.TrySetResult("play");
             else if (id == "plugin_prompt:cancel") _pluginPromptWait?.TrySetResult("cancel");
             else if (id == "plugin_prompt:block") { }
+            else if (id == "shader_prompt:low") StartShaders("low");
+            else if (id == "shader_prompt:medium") StartShaders("medium");
+            else if (id == "shader_prompt:high") StartShaders("high");
+            else if (id == "shader_prompt:later" || id == "shader_prompt:block") _shaderPrompt = false;
             else if (id == "setup_prompt:setup")
             {
                 _showSetupPrompt = false;
@@ -1848,8 +1957,9 @@ namespace OpenSmash.Launcher
 
         // ---------------------------------------------------------------------------
         // Mod actions
-        void AddMod()
+        async void AddMod()
         {
+            if (_modsBusy) return;
             if (!FolderPicker.Show(this, out string src, out bool asLink)) return;
             string name = Path.GetFileName(src.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
             string dst = Path.Combine(_modsDir, name);
@@ -1863,15 +1973,35 @@ namespace OpenSmash.Launcher
                 Directory.CreateDirectory(_modsDir);
                 if (asLink) Directory.CreateSymbolicLink(dst, src);
                 else CopyDirectory(src, dst);
-                try { OsMods(new[] { "apply" }); } catch (Exception ex) { MessageBox.Show(ex.Message, "OpenSmash"); }
-                UpdateMods();
-                _ = PushInstalledState();
-                Invalidate();
             }
             catch (Exception ex)
             {
                 MessageBox.Show(asLink ? $"Could not add the link: {ex.Message}" : $"Could not copy: {ex.Message}", "OpenSmash-Ultimate");
+                return;
             }
+            _modsBusy = true;
+            _pluginBuildUi = true;
+            _pluginFrac = -1;
+            _pluginDetail = "Building the plugin";
+            _pluginEta = "";
+            Invalidate();
+            string why = "";
+            try
+            {
+                await Task.Run(() => OsMods(new[] { "apply" }, line =>
+                {
+                    if (!line.StartsWith("LOG ")) return;
+                    string text = line.Substring(4).Trim();
+                    BeginInvoke(() => NotePluginBuild(text));
+                }));
+            }
+            catch (Exception ex) { why = ex.Message; }
+            _modsBusy = false;
+            _pluginBuildUi = false;
+            UpdateMods();
+            _ = PushInstalledState();
+            Invalidate();
+            if (why.Length > 0) MessageBox.Show(why, "OpenSmash");
         }
 
         void RemoveMod()
@@ -2044,15 +2174,14 @@ namespace OpenSmash.Launcher
         async Task<string> UnbuiltPluginChoice()
         {
             if (_launchMode == "vanilla") return "play";
+            await RefreshMods();
             var waiting = _mods.Where(m => m.Enabled && m.Code == "waiting")
                 .Select(m => string.IsNullOrEmpty(m.Title) ? m.Name : m.Title)
                 .Distinct()
                 .ToList();
-            if (waiting.Count == 0) return "play";
-            string listed = string.Join("\n", waiting.Take(8).Select(n => n));
-            _pluginPromptText = waiting.Count == 1
-                ? waiting[0] + " has a plugin that isn't compiled into the game. It can show on the select screen, but a match loads the vanilla fighter until you build it."
-                : "These mods have plugins that aren't compiled into the game. They can show on the select screen, but a match loads the vanilla fighter until you build them.\n\n" + listed;
+            string why = PluginUpdateWhy(waiting, _pluginBuildReason);
+            if (why.Length == 0) return "play";
+            _pluginPromptText = why;
             _pluginPrompt = true;
             _pluginPromptWait = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             Invalidate();
@@ -2060,6 +2189,140 @@ namespace OpenSmash.Launcher
             _pluginPrompt = false;
             Invalidate();
             return choice;
+        }
+
+        static string PluginUpdateWhy(List<string> waiting, string reason)
+        {
+            var parts = new List<string>();
+            if (waiting.Count == 1)
+                parts.Add(waiting[0] + " has a plugin that isn't ready yet. A match loads the vanilla fighter until it is updated.");
+            else if (waiting.Count > 1)
+                parts.Add("These mods have plugins that aren't ready yet. A match loads the vanilla fighter until they are updated.\n\n" +
+                    string.Join("\n", waiting.Take(8)));
+            bool sameAsWaiting = reason.Contains("isn't translated") || reason.Contains("isn't recompiled");
+            if (!string.IsNullOrEmpty(reason) && !(waiting.Count > 0 && sameAsWaiting))
+            {
+                if (reason.Contains("hooks a function"))
+                    parts.Add("A mod hooks the middle of a function. The game has to be updated once so that hook can run.");
+                else if (reason.Contains("isn't in the game") || reason.Contains("isn't fetched"))
+                    parts.Add("A community plugin the mods rely on isn't in the game yet.");
+                else if (reason.Contains("patches.txt"))
+                    parts.Add("A mod patches the game's code. The game has to be updated once so that patch is in it.");
+                else if (reason.Contains("newer than"))
+                    parts.Add("The game itself changed. It has to be linked once so Play uses the current code.");
+                else if (sameAsWaiting)
+                    parts.Add("A moveset's plugin still has to be turned into a DLL.");
+                else if (reason.Contains("isn't built"))
+                    parts.Add("The game isn't built yet.");
+                else
+                    parts.Add(reason);
+            }
+            return string.Join("\n\n", parts);
+        }
+
+        void AskShadersIfNeeded()
+        {
+            if (!_built || ShadersDone()) return;
+            _shaderPrompt = true;
+            _shaderPromptAt = Now;
+            Invalidate();
+        }
+
+        bool ShadersDone()
+        {
+            string marker = Path.Combine(_repo, "dump", "shadercache", "complete.txt");
+            if (!File.Exists(marker)) return false;
+            var ver = Regex.Match(File.ReadAllText(Path.Combine(_repo, "runtime", "gpu_shader_cache.h")), @"#define SHADER_CACHE_VERSION (\d+)");
+            if (!ver.Success) return false;
+            return File.ReadAllText(marker).Contains("version " + ver.Groups[1].Value);
+        }
+
+        void StartShaders(string priority)
+        {
+            _shaderPrompt = false;
+            if (_shaderProc != null && !_shaderProc.HasExited) return;
+            _shaderUi = true;
+            _shaderFrac = 0;
+            _shaderDetail = "Listing shader files";
+            _shaderEta = "";
+            var psi = new ProcessStartInfo
+            {
+                FileName = _pythonExe,
+                WorkingDirectory = _repo,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+            };
+            psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            psi.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
+            psi.ArgumentList.Add(Path.Combine(_repo, "tools", "shader_aot.py"));
+            psi.ArgumentList.Add("--priority");
+            psi.ArgumentList.Add(priority);
+            var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            proc.OutputDataReceived += (_, e) => { if (e.Data != null) try { BeginInvoke(() => NoteShaderLine(e.Data)); } catch (InvalidOperationException) { } };
+            proc.ErrorDataReceived += (_, e) => { if (e.Data != null) try { BeginInvoke(() => NoteShaderLine(e.Data)); } catch (InvalidOperationException) { } };
+            proc.Exited += (_, _) =>
+            {
+                try { BeginInvoke(() => { _shaderUi = false; Invalidate(); }); } catch (InvalidOperationException) { }
+            };
+            try
+            {
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                _shaderProc = proc;
+            }
+            catch (Exception ex)
+            {
+                _shaderUi = true;
+                _shaderFrac = 0;
+                _shaderDetail = "Could not start the shader compile: " + ex.Message;
+            }
+            Invalidate();
+        }
+
+        void NoteShaderLine(string line)
+        {
+            var files = Regex.Match(line, @"(listing|reading) shader files:\s*([\d,]+)\s+of\s+([\d,]+)", RegexOptions.IgnoreCase);
+            if (files.Success
+                && double.TryParse(files.Groups[2].Value.Replace(",", ""), out double read)
+                && double.TryParse(files.Groups[3].Value.Replace(",", ""), out double filesTotal)
+                && filesTotal > 0)
+            {
+                _shaderFrac = (float)(read / filesTotal);
+                string phase = files.Groups[1].Value.Equals("listing", StringComparison.OrdinalIgnoreCase)
+                    ? "Listing shader files" : "Reading shader files";
+                _shaderDetail = $"{phase}  {read:N0} / {filesTotal:N0}";
+                _shaderEta = "";
+                Invalidate();
+                return;
+            }
+            var count = Regex.Match(line, @"([\d,]+)\s+of\s+([\d,]+)\s+shaders(?:,\s*(.+))?$", RegexOptions.IgnoreCase);
+            if (count.Success
+                && double.TryParse(count.Groups[1].Value.Replace(",", ""), out double done)
+                && double.TryParse(count.Groups[2].Value.Replace(",", ""), out double total)
+                && total > 0)
+            {
+                _shaderFrac = (float)(done / total);
+                _shaderDetail = $"Compiling shaders  {done:N0} / {total:N0}";
+                _shaderEta = count.Groups[3].Success ? count.Groups[3].Value.Trim() : "";
+            }
+            else if (line.StartsWith("getting ready", StringComparison.OrdinalIgnoreCase))
+            {
+                _shaderFrac = 0;
+                _shaderDetail = "Translating vertex programs";
+                _shaderEta = "";
+            }
+            else if (line.StartsWith("compiling with", StringComparison.OrdinalIgnoreCase))
+            {
+                _shaderFrac = 0;
+                _shaderDetail = "Compiling shaders";
+                _shaderEta = "";
+            }
+            Invalidate();
         }
 
         async void StartPlay()
@@ -2699,6 +2962,8 @@ namespace OpenSmash.Launcher
                             var pct = Regex.Match(msg, @"^percent (\d+)$");
                             if (pct.Success && int.TryParse(pct.Groups[1].Value, out int n))
                                 _ = SendStatus(modId, n >= 100 ? "installing" : "downloading", "Installing " + name, Math.Clamp(n, 0, 100));
+                            else if (msg.Length > 0 && msg.Length < 180)
+                                _ = SendStatus(modId, "installing", msg, 92);
                         });
                     }
                     catch (Exception ex) { why = ex.Message; }

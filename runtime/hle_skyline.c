@@ -91,7 +91,7 @@ static const struct { u64 from, to; i64 by; } MOVED_IN_13_0_5[] = {
     {0x3097000, 0x39c9000, 0x5b0},
 };
 int rt_is_function(u64 addr);   /* (host.c) */
-static u64 moved_in_13_0_5(u64 at) {
+u64 rt_moved_in_13_0_5(u64 at) {
     for (u32 i = 0; i < sizeof MOVED_IN_13_0_5 / sizeof *MOVED_IN_13_0_5; i++)
         if (at >= MAIN_BASE + MOVED_IN_13_0_5[i].from && at < MAIN_BASE + MOVED_IN_13_0_5[i].to &&
             !rt_is_function(at) && rt_is_function(at + MOVED_IN_13_0_5[i].by))
@@ -102,7 +102,7 @@ static u64 moved_in_13_0_5(u64 at) {
 /* A64HookFunction(symbol, replace, result): calls to `symbol` go to `replace`; *result reaches
  * the function as it was. */
 HLE(A64HookFunction) {
-    u64 asked = c->x[0], target = moved_in_13_0_5(asked), replace = c->x[1], result = c->x[2];
+    u64 asked = c->x[0], target = rt_moved_in_13_0_5(asked), replace = c->x[1], result = c->x[2];
     char a[96], b[96], m[96];
     note_hook_target(target);
     u64 original = rt_hook_function(target, replace);

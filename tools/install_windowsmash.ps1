@@ -45,7 +45,7 @@ Steps, each skipped when it is already done, so running it again carries on wher
                build\ssbu.exe (asks for administrator rights once).
   9. build     tools\build_game.py with those folders: the game's program, fonts, data, DLC,
                fighters, then the build itself (30 minutes to a few hours; minutes after an update).
- 10. shaders   if ticked, launchers\Prepare Shaders.bat in a window of its own, at low priority.
+ 10. shaders   if ticked, compiled in this same window. The setup window asks low, medium, or high.
 Everything is written to install.log next to this folder's launchers.
 
 Why the embeddable Python and not `winget install Python.Python.3.14`: the embeddable zip goes
@@ -1222,7 +1222,7 @@ function Show-Wizard {
     foreach ($spec in @(
         @{ Key = 'Shortcut'; Text = 'Make a desktop shortcut'; On = $true },
         @{ Key = 'Firewall'; Text = 'Allow the game through Windows Firewall now (asks for administrator rights once; needed for playing online)'; On = $true },
-        @{ Key = 'Shaders'; Text = 'After the build, prepare the shaders in the background (minutes to two hours at low priority; stops the first-time stutter of effects)'; On = $true }
+        @{ Key = 'Shaders'; Text = 'After the build, prepare the shaders in this window (you pick low, medium, or high; stops the first-time stutter of effects)'; On = $true }
     )) {
         $cb = New-Object Windows.Forms.CheckBox
         $cb.Text = $spec.Text
@@ -1339,7 +1339,7 @@ function Read-Answers {
     $answers['OnlineName'] = $n
     $answers['Shortcut'] = ((Read-Host 'Put a shortcut on the desktop? [Y/n]').Trim() -notmatch '^n')
     $answers['Firewall'] = ((Read-Host 'Allow the game through Windows Firewall (asks for administrator rights)? [Y/n]').Trim() -notmatch '^n')
-    $answers['Shaders'] = ((Read-Host 'Prepare the shaders after the build (minutes to two hours, low priority)? [Y/n]').Trim() -notmatch '^n')
+    $answers['Shaders'] = ((Read-Host 'Prepare the shaders after the build, in this window? [Y/n]').Trim() -notmatch '^n')
     return $answers
 }
 
@@ -1483,9 +1483,20 @@ function Step-Shaders {
     param([hashtable]$Answers, [bool]$Built)
     Write-Step '[10/10] Shaders'
     if (-not $Answers.Shaders) { Write-Info 'not wanted (launchers\Prepare Shaders.bat does it any time)'; return }
-    if ($DryRun -or -not $Built) { Write-Would 'start launchers\Prepare Shaders.bat in a window of its own'; return }
-    Start-Process -FilePath (Join-Path $Root 'launchers\Prepare Shaders.bat') -WorkingDirectory $Root
-    Write-Info 'launchers\Prepare Shaders.bat runs in its own window at low priority; you can play meanwhile, and close it any time'
+    if ($DryRun -or -not $Built) { Write-Would 'ask low, medium, or high, then compile the shaders in this window'; return }
+    Write-Host ''
+    Write-Host 'How hard should this PC work on the shaders? low keeps it usable, high finishes sooner.'
+    Write-Host 'SHADER_PRIORITY?'
+    $choice = ''
+    try { $choice = [Console]::In.ReadLine() } catch { $choice = '' }
+    if ($null -eq $choice) { $choice = '' }
+    $choice = $choice.Trim().ToLower()
+    if ($choice -notin @('low', 'medium', 'high')) { $choice = 'low' }
+    Write-Info "shader priority: $choice"
+    $py = @((Join-Path $Root 'tools\shader_aot.py'), '--priority', $choice)
+    if ((Invoke-Python $py) -ne 0) {
+        Write-Warn 'the shader compile stopped (see above). What finished is kept; launchers\Prepare Shaders.bat runs the rest.'
+    }
 }
 
 function Main {

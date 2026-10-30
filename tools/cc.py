@@ -219,8 +219,8 @@ def link(objs, exe, options=()):
     for inputs in ([*objs, res], objs):   # (a linker that takes no .res still links: without the manifest)
         with open(rsp, "w") as f:
             f.write("\n".join(f'"{o}"' for o in inputs))
-        r = subprocess.run(link_command(rsp, exe, ["/HIGHENTROPYVA:NO", "/MANIFEST:NO", "/MAP:" + exe[:-4] + ".map",
-                                                   *options], EXTRA_LIBS),
+        r = subprocess.run(link_command(rsp, exe, ["/HIGHENTROPYVA:NO", "/MANIFEST:NO", "/OPT:REF", "/OPT:NOICF",
+                                                   "/MAP:" + exe[:-4] + ".map", *options], EXTRA_LIBS),
                            capture_output=True, text=True)
         if not r.returncode:
             break

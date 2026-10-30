@@ -113,7 +113,7 @@ namespace OpenSmash.Launcher
         readonly List<(string Id, RectangleF R)> _hits = new();
         readonly Dictionary<string, string> _tips = new();
         string _hover = "", _pressed = "";
-        sealed class Prompt { public string Title = "", Body = "", Yes = "OK", No = ""; public Action? OnYes, OnNo; }
+        sealed class Prompt { public string Title = "", Body = "", Yes = "OK", Mid = "", No = ""; public Action? OnYes, OnMid, OnNo; }
         bool _licenseAsked;
         Prompt? _modal;
 
@@ -801,6 +801,18 @@ namespace OpenSmash.Launcher
                 NoteGen(run, _genModules.Count);
                 return;
             }
+            var reading = Regex.Match(line, @"(listing|reading) shader files:\s*([\d,]+)\s+of\s+([\d,]+)", RegexOptions.IgnoreCase);
+            if (reading.Success && TryCount(reading.Groups[2].Value, out double rd) && TryCount(reading.Groups[3].Value, out double rt) && rt > 0)
+            {
+                run.Done = rd; run.Total = rt; run.Msg = reading.Groups[1].Value.ToLowerInvariant() + " shader files";
+                return;
+            }
+            var shaders = Regex.Match(line, @"([\d,]+)\s+of\s+([\d,]+)\s+shaders", RegexOptions.IgnoreCase);
+            if (shaders.Success && TryCount(shaders.Groups[1].Value, out double sd) && TryCount(shaders.Groups[2].Value, out double stotal) && stotal > 0)
+            {
+                run.Done = sd; run.Total = stotal; run.Msg = "compiling shaders";
+                return;
+            }
             var blocks = Regex.Match(line, @"([\d,]+)\s+of\s+([\d,]+)\s+blocks", RegexOptions.IgnoreCase);
             if (blocks.Success && TryCount(blocks.Groups[1].Value, out double d) && TryCount(blocks.Groups[2].Value, out double t) && t > 0)
             {
@@ -818,6 +830,24 @@ namespace OpenSmash.Launcher
 
         void HandleLine(string line)
         {
+            if (line.Trim() == "SHADER_PRIORITY?")
+            {
+                Log("Choose how hard this PC works on the shaders.");
+                SetStatus("Choose a shader priority.", Theme.Warn);
+                _modal = new Prompt
+                {
+                    Title = "SHADER COMPILE",
+                    Body = "Shaders compile in this window, and the bar shows how far along they are. Low keeps the PC easy to use. Medium is in between. High finishes sooner, and the PC feels slower until it is done.",
+                    Yes = "HIGH",
+                    Mid = "MEDIUM",
+                    No = "LOW",
+                    OnYes = () => _job?.WriteLine("high"),
+                    OnMid = () => _job?.WriteLine("medium"),
+                    OnNo = () => _job?.WriteLine("low"),
+                };
+                _dirty = true;
+                return;
+            }
             if (line.StartsWith("##ssbu "))
             {
                 string json = line[7..];
@@ -1489,7 +1519,7 @@ namespace OpenSmash.Launcher
             oy += 10 * s;
             PaintOption(g, "opt:shortcuts", "Make a desktop shortcut", _optShortcuts, rx, oy, rightW, 36 * s, "A desktop shortcut that starts OpenSmash."); oy += 36 * s;
             PaintOption(g, "opt:firewall", "Allow the game through Windows Firewall now (asks for administrator rights once; needed for playing online)", _optFirewall, rx, oy, rightW, oh, "Needed for playing online. Asks for administrator rights once."); oy += oh;
-            PaintOption(g, "opt:shaders", "After the build, prepare the shaders in the background (minutes to two hours at low priority; stops the first-time stutter)", _optShaders, rx, oy, rightW, oh, "Stops the first-time stutter of effects."); oy += oh + 4 * s;
+            PaintOption(g, "opt:shaders", "After the build, prepare the shaders in this window (you pick low, medium, or high; stops the first-time stutter)", _optShaders, rx, oy, rightW, oh, "Stops the first-time stutter of effects. Progress shows in this window."); oy += oh + 4 * s;
             using (var f = Theme.Body(12 * s))
                 Theme.DrawWrapped(g, "Then the game is built, which takes 30 minutes to a few hours. If it stops, run it again: it carries on where it stopped.", f, Theme.Dim, rx + 16 * s, oy, rightW - 32 * s, 48 * s);
             oy += 54 * s;
@@ -1829,7 +1859,7 @@ namespace OpenSmash.Launcher
             _hits.Clear();
             using (var b = new SolidBrush(Color.FromArgb(180, 0, 0, 0))) g.FillRectangle(b, 0, 0, W, H);
 
-            float mw = 540 * s, pad = 26 * s;
+            float mw = (m.Mid != "" ? 720 : 540) * s, pad = 26 * s;
             float bodyH;
             using (var f = Theme.Body(13.5f * s))
                 bodyH = Math.Min(260 * s, g.MeasureString(m.Body, f, (int)(mw - 2 * pad)).Height + 4 * s);
@@ -1850,15 +1880,24 @@ namespace OpenSmash.Launcher
             using (var f = Theme.Body(13.5f * s))
                 Theme.DrawWrapped(g, m.Body, f, Theme.Muted, mx + pad, my + pad + 46 * s, mw - 2 * pad, bodyH);
 
-            float bw = 190 * s, bh = 44 * s, by = my + mh - pad - bh;
+            float gap = 12 * s, bh = 44 * s, by = my + mh - pad - bh;
+            int nBtn = 1 + (m.Mid != "" ? 1 : 0) + (m.No != "" ? 1 : 0);
+            float bw = Math.Min(190 * s, (mw - 2 * pad - gap * (nBtn - 1)) / nBtn);
             float yesX = mx + mw - pad - bw;
             Theme.Button(g, m.Yes, yesX, by, bw, bh, s, primary: true, hot: _hover == "modal:yes");
             Hit("modal:yes", yesX, by, bw, bh);
+            float left = yesX;
+            if (m.Mid != "")
+            {
+                left -= gap + bw;
+                Theme.Button(g, m.Mid, left, by, bw, bh, s, primary: false, hot: _hover == "modal:mid");
+                Hit("modal:mid", left, by, bw, bh);
+            }
             if (m.No != "")
             {
-                float noX = yesX - bw - 14 * s;
-                Theme.Button(g, m.No, noX, by, bw, bh, s, primary: false, hot: _hover == "modal:no");
-                Hit("modal:no", noX, by, bw, bh);
+                left -= gap + bw;
+                Theme.Button(g, m.No, left, by, bw, bh, s, primary: false, hot: _hover == "modal:no");
+                Hit("modal:no", left, by, bw, bh);
             }
         }
 
@@ -1918,7 +1957,7 @@ namespace OpenSmash.Launcher
         {
             if (_modal != null)
             {
-                if (e.KeyCode == Keys.Escape) Activate("modal:no");
+                if (e.KeyCode == Keys.Escape) Activate(_modal.No != "" ? "modal:no" : "modal:yes");
                 else if (e.KeyCode == Keys.Enter) Activate("modal:yes");
                 return;
             }
@@ -1931,11 +1970,12 @@ namespace OpenSmash.Launcher
 
         void Activate(string id)
         {
-            if (_modal != null && id != "modal:yes" && id != "modal:no") return;
+            if (_modal != null && id != "modal:yes" && id != "modal:mid" && id != "modal:no") return;
             switch (id)
             {
                 case "close": Close(); break;
                 case "modal:yes": { var m = _modal; _modal = null; m?.OnYes?.Invoke(); break; }
+                case "modal:mid": { var m = _modal; _modal = null; m?.OnMid?.Invoke(); break; }
                 case "modal:no": { var m = _modal; _modal = null; m?.OnNo?.Invoke(); break; }
 
                 case "pick:base:file": BrowseFile("base", "Base game (.xci, .nsp, .nsz, .nca)", "Switch game files|*.xci;*.xcz;*.nsp;*.nsz;*.nca|All files|*.*"); break;

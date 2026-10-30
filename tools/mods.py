@@ -1866,10 +1866,13 @@ def missing_shares(tree, on, log):
 
 
 def sync_plugins(tree, log):
-    """The turned-on mods' Skyline plugins, recompiled and listed for the game to load (tools/skyline.py)."""
+    """The turned-on mods' Skyline plugins, recompiled and listed for the game to load (tools/skyline.py).
+    Each plugin.nro is also compiled into build/plugins/<name>.dll here, so adding a mod or
+    downloading one makes the DLL. The game is not linked."""
     try:
         import skyline
         skyline.sync(tree.root, log)
+        skyline.cache_mod_plugins(tree.root, skyline.build_jobs(), log, quiet=True)
     except (Exception, SystemExit) as e:   # (the mods' files are applied either way)
         log(f"Skyline plugins: not updated: {e}")
 
