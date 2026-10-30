@@ -606,6 +606,7 @@ class Table:
         self.folder_readers = None   # folder -> (up to 2 of) the directories that read files from it
         self.kept_shared = []   # paths a mod changes that stayed shared (unshare: they'd stop matches loading)
         self.crowded = set()    # files (info index indices) one mod has different versions of for 2+ costumes
+        self.reshare_left = []  # hash40s of paths reshare left on a mod's shared sound bank (they can't be made their own)
         self.dir_names = {}     # the game's directory a new one is made like -> its path
         self.dir_names_new = {}  # a new directory -> its path, from config.json
         self.slots = {}         # a new costume slot's directory (made like the game's c00..c07 one) -> its slot ("08")
@@ -711,8 +712,10 @@ class Table:
         directory's folder (commit_files: the directory's run of infos copied to the end, the new
         file after it, its data after the folder's files, as an added file's) - so the other paths
         read the game's file still. The directory's entry for the shared file stays as it was (the
-        game reads the files of a folder its directory has in their order). Returns False where it
-        can't be (a regional file, a path in no directory): the shared file is changed then."""
+        game reads the files of a folder its directory has in their order). A regional file (flag
+        0x8000: a fighter's voice bank, which the costumes of a fighter share as they share a model)
+        gets one data entry for every region (commit_files). Returns False where it can't be (the
+        other regional kind, 0x10000; a path in no directory): the shared file is changed then."""
         if self.path_infos is None:
             self.path_infos = {}
             info_path = [e[0] for e in struct.iter_unpack("<4I", self.tabs["infos"])]
@@ -727,7 +730,7 @@ class Table:
         d, i = self.path_infos[p]
         _p, ii, _to_data, fflags = self.entry("infos", i, "<4I")
         full = self.entry("paths", p, "<Q")[0]
-        if fflags & (REGIONAL_INFO | 0x8000) or ii != full >> 40:
+        if fflags & 0x10000 or ii != full >> 40:
             return False
         # Where unsharing makes matches never finish loading, the file stays shared - the mod's file
         # for every costume that shares it, as before unsharing - and is listed (self.kept_shared):
@@ -743,17 +746,70 @@ class Table:
         if self.unshare_risk(path) is not None:
             self.kept_shared.append(path)
             return False
+        self._unshare_at(p, d, fflags, raw)
+        return True
+
+    def _unshare_at(self, p, d, fflags, raw):
+        """Path index p, in directory d, made a file of its own (unshare's, checked there): raw is its
+        bytes, or for a regional file a list of them, one for each entry of its run."""
+        full = self.entry("paths", p, "<Q")[0]
+        ii = full >> 40
         new_ii = self.append("info_indices", "<2I", d, 0)
         self.unshared.setdefault(d, []).append((p, new_ii, raw, fflags & ~SHARED_INFO))
         self.put("paths", p, "<Q", (full & LOW40) | new_ii << 40)
         self.vanilla_ii[p] = ii
         self.ii_paths[ii].remove(full & LOW40)
         self.ii_paths[new_ii] = [full & LOW40]
-        return True
+
+    def reshare(self, path, wanted):
+        """The other way round, for a sound bank unshare keeps shared (its costume's folder is one the
+        other costumes read: a fighter's c00): each other path that shares it and that no mod gives a
+        file of its own is made its own with the game's bytes (each region's, for a regional voice
+        bank), so the shared file can take the mod's for `path` alone - as ARCropolis'
+        reshare_dependent_files leaves the other costumes the game's. Kept shared, the c00 mod's voice
+        and sounds were every costume's that shares them (seen: Bowser's c04-c06, with no mod, spoke
+        with c00's). Only sound banks: they are read one by one, not with their directory's folder,
+        and the copies go into the other costumes' own folders. Models made so hung the match (in a
+        folder no directory read yet). A path that can't be (unshare's rules and risks for it: the
+        bank's own path without a costume, vc_koopa.nus3audio, is in the shared sound folder) keeps the
+        shared one, and is in self.reshare_left. Returns how many paths were made their own, or None."""
+        own = hash40(path)
+        others = [h for h in self.sharers(path) or [] if h != own and h not in wanted]
+        if not others:
+            return None
+        plan = []
+        for h in others:
+            p = self.path_index_of(h)
+            ok = p is not None and h not in self.keep_shared and p in self.path_infos
+            if ok:
+                d, i = self.path_infos[p]
+                _p, ii, _td, fflags = self.entry("infos", i, "<4I")
+                ok = not (fflags & 0x10000 or ii != self.entry("paths", p, "<Q")[0] >> 40 or self.unshare_risk_index(p) is not None)
+            if ok:
+                plan.append((p, d, fflags))
+            else:
+                self.reshare_left.append(h)
+        if not plan:
+            return None
+        sp = self.path_index(path)
+        info = self.entry("info_indices", self.entry("paths", sp, "<Q")[0] >> 40, "<2I")[1]
+        _p, _ii, td, sflags = self.entry("infos", info, "<4I")
+        run = [self.entry("info_to_datas", td + r, "<3I")[:2] for r in range(self.arc.regions + 1 if sflags & 0x8000 else 1)]
+        got = {}
+        for fd in run:   # (a regional run's first entry is an empty one: no bytes to read)
+            if fd not in got:
+                got[fd] = self.original(*fd) if self.entry("datas", fd[1], "<4I")[2] else b""
+        raws = [got[fd] for fd in run]
+        raw = raws if sflags & 0x8000 else raws[0]
+        for p, d, fflags in plan:
+            self._unshare_at(p, d, fflags | (sflags & 0x8000), raw)
+        return len(plan)
 
     def unshare_risk(self, path):
         """Why unsharing `path` would stop matches loading ("folder", "crowded"), or None (see unshare)."""
-        p = self.path_index(path)
+        return self.unshare_risk_index(self.path_index(path))
+
+    def unshare_risk_index(self, p):
         if p is None or p not in (self.path_infos or {}):
             return None
         d, i = self.path_infos[p]
@@ -1140,12 +1196,22 @@ class Table:
             first = None
             for kind, h in plan:
                 if kind == "unshared":
+                    # (a regional file: its run as the game's are, an entry before the regions' - the game
+                    # reads to_data + 1 + its region - and one for each region: the mod's one file, or
+                    # with reshare the game's own bytes of each, one data entry for each distinct one)
                     p, _ii, raw, fflags = h
-                    stored = game_compress(raw)
-                    data = self.append("datas", "<4I", 0, len(stored), len(raw), 3)
-                    first = data if first is None else first
-                    self.added.setdefault(folder, []).append((data, stored, len(raw), 3))
-                    place[("unshared", p)] = (folder, data, self.append("info_to_datas", "<3I", folder, data, OWN_FILE), fflags)
+                    raws = raw if isinstance(raw, list) else [raw] * (regions + 1 if fflags & 0x8000 else 1)
+                    datas = {}
+                    to_data = None
+                    for r in raws:
+                        if id(r) not in datas:
+                            stored = game_compress(r)
+                            datas[id(r)] = self.append("datas", "<4I", 0, len(stored), len(r), 3)
+                            first = datas[id(r)] if first is None else first
+                            self.added.setdefault(folder, []).append((datas[id(r)], stored, len(r), 3))
+                        e = self.append("info_to_datas", "<3I", folder, datas[id(r)], OWN_FILE)
+                        to_data = e if to_data is None else to_data
+                    place[("unshared", p)] = (folder, datas[id(raws[0])], to_data, fflags)
                     continue
                 if kind != "own":
                     if fresh:
@@ -1854,6 +1920,7 @@ def _apply(tree, image, lines, state, on, log):
     merged = {}
     changed = 0
     unshared = 0
+    reshared = 0   # sound banks kept the mod's for one costume by giving the others the game's (Table.reshare)
     kept_shared = {}   # mod -> paths it changes for every costume sharing them (Table.unshare)
     wanted = {hash40(path): src for path, src, _name in chosen.values()}
 
@@ -1943,6 +2010,13 @@ def _apply(tree, image, lines, state, on, log):
                 unshared += 1
                 changed += 1
                 continue
+            if len(table.kept_shared) > kept and path.lower().startswith("sound/"):
+                n = table.reshare(path, wanted)
+                if n:   # (the other costumes keep the game's sounds; the shared bank takes the mod's, below)
+                    table.kept_shared.pop()
+                    reshared += 1
+                    log(f"{name}: {path}: {n} other costume{'s' if n > 1 else ''} sharing it made {'their' if n > 1 else 'its'} own "
+                        "with the game's file, so the mod's is this costume's only")
             if len(table.kept_shared) > kept:
                 kept_shared.setdefault(name, []).append(path)
             for folder, d in targets:
@@ -2111,7 +2185,7 @@ def _apply(tree, image, lines, state, on, log):
                "bytes": written}
     with open(os.path.join(tree.work, "applied.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1)
-    log(f"{len(on)} mod(s), {changed} files changed ({unshared} unshared), {sum(len(v) for v in added.values())} added, "
+    log(f"{len(on)} mod(s), {changed} files changed ({unshared} unshared, {reshared} reshared), {sum(len(v) for v in added.values())} added, "
         f"{sum(len(v) for v in merged.values())} merged, "
         f"{sum(len(v) for v in skipped.values())} skipped, {written / 1048576:.1f} MB written, in {time.time() - t0:.0f} s")
     return summary
