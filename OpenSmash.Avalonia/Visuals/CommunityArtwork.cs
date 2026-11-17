@@ -14,6 +14,7 @@ public sealed class CommunityView
     public string Error = "";
     public DiscordToken? Account;
     public byte[]? Avatar;
+    public Dictionary<string, byte[]> BoardAvatars = new(StringComparer.Ordinal);
     public int Rank, Ranked;
     public Dictionary<int, int> FighterRanks = new();
     public List<FighterGsp> Records = new();
@@ -44,6 +45,12 @@ public sealed partial class ClassicSurface
     public CommunityView Community { get; } = new();
     byte[]? _avatarBytes;
     Bitmap? _avatar;
+    readonly Dictionary<string, Bitmap> _boardImages = new(StringComparer.Ordinal);
+    internal void ReleaseBoardAvatars()
+    {
+        foreach (var image in _boardImages.Values) image.Dispose();
+        _boardImages.Clear();
+    }
 
     Bitmap? AvatarImage()
     {
@@ -58,6 +65,11 @@ public sealed partial class ClassicSurface
     void PaintCommunity(Graphics g, int W, int H)
     {
         var c = Community;
+        foreach (string url in _boardImages.Keys.Where(url => !c.BoardAvatars.ContainsKey(url)).ToArray())
+        { _boardImages[url].Dispose(); _boardImages.Remove(url); }
+        foreach (var entry in c.BoardAvatars)
+            if (!_boardImages.ContainsKey(entry.Key) && SKBitmap.Decode(entry.Value) is {} decoded)
+                _boardImages[entry.Key] = new Bitmap(decoded);
         if (!c.Enabled) return;
         float s = _s, t = (float)(Now - _heroAt);
         float w = Math.Min(300 * s, W - 1032 * s), x = W - 32 * s - w, y = 128 * s;
@@ -174,7 +186,17 @@ public sealed partial class ClassicSurface
             {
                 bool me = c.Mine != null && r.Id == c.Mine.Id;
                 ArtworkTheme.Label(g, r.Rank.ToString(CultureInfo.InvariantCulture), FM(12 * s, true), A(r.Rank <= 3 ? ArtworkTheme.Accent : ArtworkTheme.Dim), ix, ry, rowH, 0, StringAlignment.Far, 20 * s);
-                ArtworkTheme.Label(g, Fit(g, CommunityFeed.Who(r), FB(12 * s, me), iw - 96 * s), FB(12 * s, me), A(me ? ArtworkTheme.Accent : ArtworkTheme.Text), ix + 28 * s, ry, rowH);
+
+                float avatarX = ix + 27 * s, avatarSize = 16 * s;
+                using (var clip = new GraphicsPath())
+                {
+                    clip.AddEllipse(new RectangleF(avatarX, ry + s, avatarSize, avatarSize));
+                    using var fill = new SolidBrush(A(ArtworkTheme.Bg3)); g.FillPath(fill, clip);
+                    if (r.Avatar != "" && _boardImages.TryGetValue(r.Avatar, out var picture))
+                    { var saved = g.Save(); g.SetClip(clip, CombineMode.Intersect); g.DrawImage(picture, avatarX, ry + s, avatarSize, avatarSize); g.Restore(saved); }
+                    else ArtworkTheme.Label(g, CommunityFeed.Initials(CommunityFeed.Who(r)), FM(8 * s, true), A(ArtworkTheme.Muted), avatarX, ry, rowH, 0, StringAlignment.Center, avatarSize);
+                }
+                ArtworkTheme.Label(g, Fit(g, CommunityFeed.Who(r), FB(12 * s, me), iw - 117 * s), FB(12 * s, me), A(me ? ArtworkTheme.Accent : ArtworkTheme.Text), ix + 49 * s, ry, rowH);
                 ArtworkTheme.Label(g, N(r.Gsp), FM(12 * s, true), A(me ? ArtworkTheme.Accent : ArtworkTheme.Muted), ix, ry, rowH, 0, StringAlignment.Far, iw);
                 ry += rowH;
             }

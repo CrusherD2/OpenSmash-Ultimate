@@ -29,6 +29,21 @@ static class SettingsChecks
         FreshFolder(temporary);
         GameChangesKept(temporary);
         Language(temporary);
+        SharedSettings(temporary);
+    }
+
+    static void SharedSettings(string temporary)
+    {
+        string root = Root(temporary, "shared-settings", true), file = Path.Combine(root, "config", "display.ini");
+        File.WriteAllText(file, string.Join(Environment.NewLine, "renderer = d3d11", "renderer_menu = vulkan", "volume = 100", ""));
+        var window = new MainWindow([], root, enableBackgroundActions: false);
+        Check(window.Surface.GetSetting("renderer") == "vulkan", "legacy d3d11 respects the game menu's renderer");
+        File.WriteAllText(file, string.Join(Environment.NewLine, "renderer = d3d11", "renderer_menu = auto", "volume = 20", ""));
+        window.Surface.ReloadSharedSettings();
+        Check(window.Surface.GetSetting("renderer") == "auto" && window.Surface.GetSetting("volume") == "20", "open launcher reloads the game's settings without reopening");
+        window.Surface.ChangeSetting("renderer", "direct3d11");
+        Check(File.ReadAllText(file).Contains("renderer_menu = direct3d11"), "explicit renderer selection writes both shared renderer keys");
+        window.Close();
     }
 
     static void Lobby()

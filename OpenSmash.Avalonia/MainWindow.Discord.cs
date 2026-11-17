@@ -46,6 +46,7 @@ public sealed partial class MainWindow
     void CommunityStop()
     {
         _communityOn = false;
+        Surface.ReleaseBoardAvatars();
         _communityTimer?.Stop(); _communityTimer = null;
         _discordCancel?.Cancel();
         PresenceStop();
@@ -60,6 +61,7 @@ public sealed partial class MainWindow
             var (status, board) = await CommunityFeed.Fetch(Http, CancellationToken.None);
             var account = Surface.Community.Account;
             Surface.Community.Apply(status, board, account?.UserId is { Length: > 0 } id ? DiscordAccount.AccountHash(id) : "");
+            await LoadBoardAvatars();
         }
         finally { _communityBusy = false; }
         Surface.InvalidateVisual();

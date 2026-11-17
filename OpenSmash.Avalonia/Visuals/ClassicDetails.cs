@@ -71,7 +71,8 @@ public sealed partial class ClassicSurface
     public string GetSetting(string key)=>_iniValues.GetValueOrDefault(key,"");
     public bool ValidateSettingsForPlay()
     {
-        CommitEdit();if(!_settingsLoaded)LoadSettings();
+
+        CommitEdit();if(!_settingsLoaded)LoadSettings();ReloadSharedSettings();
         string lobby=GetSetting("lobby"),code=GetSetting("code").Replace(" ",""),host=GetSetting("server").Trim();
         if(lobby=="private"&&code==""){Alert("TYPE A LOBBY CODE","Type a lobby code: a word your friends type too.");return false;}
         if(lobby=="custom"&&host!=""&&!System.Text.RegularExpressions.Regex.IsMatch(host,@"^\S+:\d+$")){Alert("CHECK YOUR SERVER","Your own server is host:port, for example 192.168.1.20:39420.");return false;}
@@ -81,6 +82,7 @@ public sealed partial class ClassicSurface
     {
         if(Project==null)return;
         if(!_settingsLoaded)LoadSettings();
+        ReloadSharedSettings();
         if(key=="theme_preset") { ApplyThemePreset(value); return; }
         if(key.StartsWith("theme_")) { ChangeThemeColor(key,value); return; }
         if(GameRunning) { Alert("CLOSE THE GAME","Close the game before changing its settings.");return; }

@@ -323,6 +323,8 @@ try
     SettingsChecks.Run(root);
     RemapChecks.Run(root);
     CommunityChecks.Run(root);
+    // File/network tests do not need the headless UI synchronization context.
+    Task.Run(ParityChecks.Run).GetAwaiter().GetResult();
     CommunityChecks.Render(root,screenshot==null?null:Path.GetDirectoryName(screenshot));
     RoomsChecks.Run(root);
     Console.WriteLine("All desktop launcher checks passed.");

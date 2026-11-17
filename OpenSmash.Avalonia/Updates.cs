@@ -7,6 +7,7 @@ public sealed partial class MainWindow
 {
     bool _updateBusy;
     string _updateStatus="";
+    string _updateHead="";
     const string UpdateApi="https://api.github.com/repos/OpenSmash-Ultimate/OpenSmash-Ultimate";
     async Task<JsonDocument> GitHub(string path)
     {
@@ -25,10 +26,12 @@ public sealed partial class MainWindow
             local=await LocalSourceCommit();
             if(!Regex.IsMatch(local,@"^[0-9a-fA-F]{40}$"))throw new InvalidOperationException("This copy does not name its source commit. Updates cannot be checked.");
             using var latest=await GitHub("/commits/"+await UpdateRef());head=latest.RootElement.GetProperty("sha").GetString()??"";
+            _updateHead=head;
             if(local.Equals(head,StringComparison.OrdinalIgnoreCase)){_updateStatus="uptodate";message="OpenSmash is up to date.";}
             else
             {
-                using var comparison=await GitHub("/compare/"+local+"..."+head);
+
+                using var comparison=await GitHub("/compare/"+UpdateCompatibility.ResolveForeignCommit(local)+"..."+head);
                 string status=comparison.RootElement.GetProperty("status").GetString()??"";
                 behind=comparison.RootElement.TryGetProperty("ahead_by",out var count)?count.GetInt32():0;
                 _updateStatus=status=="ahead"?"available":status is "identical" or "behind"?"uptodate":"error";
@@ -50,7 +53,8 @@ public sealed partial class MainWindow
         string channel=Environment.GetEnvironmentVariable("OPENSMASH_UPDATE_CHANNEL")??"",file=RequireProject().PathIn("tools","update_channel.txt");
         if(channel.Length==0&&File.Exists(file))channel=File.ReadAllText(file).Trim();
         if(channel.Equals("main",StringComparison.OrdinalIgnoreCase))return "main";
-        try{using var release=await GitHub("/releases/latest");string tag=release.RootElement.TryGetProperty("tag_name",out var name)?name.GetString()?.Trim()??"":"";if(tag.Length>0)return Uri.EscapeDataString(tag);}
+
+        try{using var release=await GitHub("/releases/latest");string tag=release.RootElement.TryGetProperty("tag_name",out var name)?name.GetString()?.Trim()??"":"";if(UpdateCompatibility.IsStableRelease(tag))return Uri.EscapeDataString(tag);}
         catch(Exception error) when(error is HttpRequestException or JsonException or TaskCanceledException){}
         return "main";
     }
@@ -72,6 +76,8 @@ public sealed partial class MainWindow
         {
             string before=await LocalSourceCommit(),fingerprint=UpdateState.LauncherFingerprint(p);
             if(!Regex.IsMatch(before,@"^[0-9a-fA-F]{40}$"))throw new InvalidOperationException("This copy does not identify its source version.");
+
+            if(p.Platform==DesktopPlatform.Windows)await EnsureCompatibleInstaller();
             Command command=p.Platform==DesktopPlatform.Windows
                 ?new("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-File",p.PathIn("tools","install_windowsmash.ps1"),"-UpdateOnly"],p.Root)
                 :new("/bin/bash",[p.PathIn("tools",p.Platform==DesktopPlatform.MacOS?"mac":"linux","install.sh"),"--update-only","--yes"],p.Root);

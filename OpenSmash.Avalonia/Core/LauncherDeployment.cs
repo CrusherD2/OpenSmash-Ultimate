@@ -10,7 +10,8 @@ public sealed record LauncherDeployment(string Executable, DesktopPlatform Platf
         {
             var dir = new DirectoryInfo(Path.GetDirectoryName(Executable)!);
             while (dir != null && !dir.Name.EndsWith(".app", StringComparison.OrdinalIgnoreCase)) dir = dir.Parent;
-            if (dir == null) throw new IOException("Run the published OpenSmash.app to set up a new project.");
+
+            if (dir == null) throw new IOException("Run the published OpenSmash.Avalonia.app to set up a new project.");
             string destination = Path.Combine(project, "OpenSmash.Avalonia.app");
             CopyApp(dir.FullName, destination);
             return Path.Combine(destination, "Contents", "MacOS", Path.GetFileName(Executable));

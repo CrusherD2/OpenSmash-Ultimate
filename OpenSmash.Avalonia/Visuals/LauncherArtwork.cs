@@ -287,7 +287,15 @@ public sealed partial class ClassicSurface
                 "settings" => "\u2190 \u2192  TABS     ENTER  CHANGE     ESC  BACK",
                 _ => "ESC  BACK",
             };
-            ArtworkTheme.Label(g, hint, FM(11 * s), A(ArtworkTheme.Dim), 0, y, h, sp, StringAlignment.Far, W - 40 * s);
+            float hintRight = W - 40 * s;
+            if (Community.Enabled)
+            {
+                float reportWidth = 166 * s, reportX = hintRight - reportWidth;
+                ArtworkTheme.Label(g, "REPORT A PROBLEM", FM(11 * s, true), A(ArtworkTheme.Accent), reportX, y, h, sp, StringAlignment.Far, reportWidth);
+                AddHit("report", reportX, y, reportWidth, h);
+                hintRight = reportX - 24 * s;
+            }
+            ArtworkTheme.Label(g, hint, FM(11 * s), A(ArtworkTheme.Dim), 0, y, h, sp, StringAlignment.Far, hintRight);
 
             PopFade(g, st);
         }

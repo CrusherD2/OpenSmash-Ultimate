@@ -141,6 +141,8 @@ public sealed partial class MainWindow : Window
             if((_checkingChanges||_playPreflight)&&id is not ("close" or "min"))return;
             switch(id)
             {
+
+                case "report":ReportProblem();break;
                 case "close":Close();break;
                 case var community when community.StartsWith("community:"):await CommunityAction(community);break;   // (MainWindow.Discord.cs)
                 case "min":MinimizeWindow();break;

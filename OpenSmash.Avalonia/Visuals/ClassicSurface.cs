@@ -151,6 +151,8 @@ public sealed partial class ClassicSurface : Control
     void NextFrame()=>TopLevel.GetTopLevel(this)?.RequestAnimationFrame(_=>{if(!_animating)return;Tick();NextFrame();});
     void Tick()
     {
+
+        if (Now - _settingsCheckedAt >= 1) { _settingsCheckedAt = Now; ReloadSharedSettings(); }
         UpdateNativeControls();
         _loadOn=StartingGame||OperationRunning||GameRunning||ModsRunning;_loadLabel=StartingGame?"STARTING THE GAME":OperationRunning?_operationLabel:GameRunning?"Game running":"Mod manager open";
         double now=Now;

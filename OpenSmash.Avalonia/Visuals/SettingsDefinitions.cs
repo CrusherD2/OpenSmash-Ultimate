@@ -279,7 +279,8 @@ void InitializeSettings() {
             foreach (string key in new[] { "window", "width", "height", "pacing", "render_scale", "gpu", "hide_cursor", "overlay", "volume" })
                 _iniValues[key] = D(key);
             _iniValues["window_size"] = _iniValues["width"] + "x" + _iniValues["height"];
-            _iniValues["renderer"] = SettingDefaults.Renderer(D("renderer"));
+
+            _iniValues["renderer"] = SettingDefaults.RendererShown(D("renderer"), IniValue(display, "", "renderer_menu"));
             foreach (string key in new[] { "keyboard_player", "background" })
                 _iniValues[key] = IniValue(pads, "general", key) ?? SettingDefaults.Of(key);
             // online_server.txt is the truth (the game's settings menu writes it too); launcher.ini only remembers the
@@ -323,6 +324,8 @@ void InitializeSettings() {
                 scale.Values = scale.Values.Append(_iniValues["render_scale"]).ToArray();
                 scale.Labels = scale.Labels.Append(_iniValues["render_scale"]).ToArray();
             }
+
+            _settingsSnapshot = SettingsSnapshot();
         }
 
         void WriteSettingsFiles()
@@ -338,6 +341,8 @@ void InitializeSettings() {
             string display = Project.ConfigFile("display.ini"), pads = Project.ConfigFile("controllers.ini");
             foreach (string key in new[] { "window", "width", "height", "pacing", "render_scale", "gpu", "renderer", "hide_cursor", "overlay", "volume" })
                 if (_changedSettings.Contains(key)) SetIni(display, "", key, _iniValues.GetValueOrDefault(key, SettingDefaults.Of(key)));
+
+            if (_changedSettings.Contains("renderer")) SetIni(display, "", "renderer_menu", _iniValues["renderer"]);
             foreach (string key in new[] { "keyboard_player", "background" })
                 if (_changedSettings.Contains(key)) SetIni(pads, "general", key, _iniValues.GetValueOrDefault(key, SettingDefaults.Of(key)));
             bool serverChanged = _changedSettings.Overlaps(["lobby", "code", "server"]);

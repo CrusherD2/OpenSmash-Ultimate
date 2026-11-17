@@ -73,10 +73,13 @@ static class CommunityChecks
             if(screenshotDir!=null)frame!.Save(Path.Combine(screenshotDir,$"community-{w}.png"));
             var board=hits.FirstOrDefault(x=>x.Id=="community:board");var signin=hits.FirstOrDefault(x=>x.Id=="community:signin");
             var play=hits.First(x=>x.Id=="menu:3");
+            var report = hits.Single(x=>x.Id=="report");
+            Check(report.R.Left >= 0 && report.R.Right <= frame!.PixelSize.Width && report.R.Top >= 0 && report.R.Bottom <= frame.PixelSize.Height, "problem-report button stays visible in the bottom bar");
             Check(board.Id!=null&&signin.Id!=null&&board.R.Right<=frame!.PixelSize.Width&&signin.R.Left>play.R.Right,$"home right column fits beside the buttons at {w}x{h}");
         }
         c.Account=new DiscordToken{Access="x",UserId="1",DisplayName="Player"};c.Open=true;c.Records=[new FighterGsp{Fighter=29,Gsp=500000}];
         surface.InvalidateVisual();using(var frame=window.CaptureRenderedFrame()){if(screenshotDir!=null)frame!.Save(Path.Combine(screenshotDir,"community-card.png"));}
+        Check(hits.Any(x=>x.Id=="report"), "problem reporting remains available with the account panel open");
         Check(hits.Any(x=>x.Id=="community:signout")&&hits.Any(x=>x.Id=="community:shown"),"the account card offers the leaderboard name choice and sign out");
         window.Close();
     }
